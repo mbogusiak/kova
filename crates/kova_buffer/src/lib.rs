@@ -4,15 +4,28 @@
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
 
 pub mod buffer;
+pub mod edit;
 pub mod error;
+pub mod grapheme;
 pub mod line_ending;
+pub mod motion;
 pub mod position;
+pub mod selection;
 pub mod snapshot;
 
 pub use buffer::Buffer;
+pub use edit::{
+    apply_delete_backward, apply_delete_forward, apply_insert_all, apply_insert_per_cursor,
+};
 pub use error::BufferError;
+pub use grapheme::{
+    BoundaryAffinity, next_grapheme_boundary, next_word_boundary, prev_grapheme_boundary,
+    prev_word_boundary, snap_byte_to_grapheme_boundary,
+};
 pub use line_ending::LineEnding;
+pub use motion::{Motion, MotionConfig, byte_at_visual_column, visual_column_at};
 pub use position::{BufferId, BufferVersion, Point, PointRange, TextEdit, Utf16Point, Utf16Range};
+pub use selection::{Direction, Selection, SelectionSet};
 pub use snapshot::BufferSnapshot;
 
 /// Name of this crate as declared in its `Cargo.toml`.
@@ -38,6 +51,7 @@ mod tests {
     fn snapshot_is_send_and_sync() {
         assert_send_sync::<BufferSnapshot>();
         assert_send_sync::<Buffer>();
+        assert_send_sync::<SelectionSet>();
     }
 
     #[test]
@@ -61,9 +75,6 @@ mod tests {
 
     #[test]
     fn multibyte_polish_cjk_and_utf16_surrogate_conversions() {
-        // "zażółć\n日本🚀!\n"
-        // Line 0: "zażółć" -> z(1) a(1) ż(2) ó(2) ł(2) ć(2) = 10 bytes, 6 chars, 6 UTF-16 CU, + '\n' (1) = 11 bytes
-        // Line 1: "日本🚀!" -> 日(3) 本(3) 🚀(4, 2 UTF-16 CU) !(1) = 11 bytes, 4 chars, 5 UTF-16 CU, + '\n' (1) = 12 bytes
         let text = "zażółć\n日本🚀!\n";
         let buf = Buffer::from_text(text);
         let snap = buf.snapshot();
@@ -79,7 +90,6 @@ mod tests {
         assert_eq!(snap.line_len_utf16(1).unwrap(), 5);
         assert_eq!(snap.line_len_bytes(2).unwrap(), 0);
 
-        // Start of 🚀: byte 11 + 6 = 17, char 7 + 2 = 9, utf16 7 + 2 = 9
         let rocket_byte = 17;
         assert_eq!(snap.char_at(rocket_byte).unwrap(), '🚀');
         assert_eq!(snap.byte_to_char(rocket_byte).unwrap(), 9);
@@ -105,19 +115,16 @@ mod tests {
             Point::new(1, 6)
         );
 
-        // Trailing surrogate index inside 🚀 snaps down to start of 🚀
         assert_eq!(snap.utf16_to_byte(10).unwrap(), rocket_byte);
         assert_eq!(
             snap.utf16_point_to_byte(Utf16Point::new(1, 3)).unwrap(),
             rocket_byte
         );
 
-        // '!' right after 🚀: byte 21, utf16 11, point (1, 10), utf16_point (1, 4)
         assert_eq!(snap.utf16_to_byte(11).unwrap(), 21);
         assert_eq!(snap.char_at(21).unwrap(), '!');
         assert_eq!(snap.byte_to_utf16_point(21).unwrap(), Utf16Point::new(1, 4));
 
-        // Inside multi-byte UTF-8 character returns NotCharBoundary
         assert_eq!(
             snap.byte_to_point(18),
             Err(BufferError::NotCharBoundary { byte: 18 })
@@ -131,7 +138,6 @@ mod tests {
 
     #[test]
     fn zwj_emoji_sequence_utf16_mapping() {
-        // 👨‍👩‍👧‍👦 = 4 code points (4 * 2 UTF-16 CU = 8) + 3 ZWJ (3 * 1 UTF-16 CU = 3) = 11 UTF-16 CU, 25 UTF-8 bytes
         let family = "👨‍👩‍👧‍👦";
         let text = format!("a{family}b");
         let buf = Buffer::from_text(&text);
@@ -165,9 +171,7 @@ mod tests {
             "ab\r\n"
         );
 
-        // Offset 2 is right before \r\n (valid)
         assert_eq!(snap.byte_to_point(2).unwrap(), Point::new(0, 2));
-        // Offset 3 is strictly between \r and \n (invalid in strict methods)
         assert_eq!(
             snap.byte_to_point(3),
             Err(BufferError::SplitsCrLf { byte: 3 })
@@ -197,11 +201,9 @@ mod tests {
             Err(BufferError::SplitsCrLf { byte: 3 })
         );
 
-        // Clamping backs out of \r|\n to offset 2
         assert_eq!(snap.clamp_byte_to_char_boundary(3), 2);
         assert_eq!(snap.clamp_point(Point::new(0, 99)), Point::new(0, 2));
 
-        // ColumnOutOfBounds prevents stepping into \r or \n
         assert_eq!(
             snap.point_to_byte(Point::new(0, 3)),
             Err(BufferError::ColumnOutOfBounds {
@@ -219,7 +221,6 @@ mod tests {
             })
         );
 
-        // Offset 4 starts line 1 ("cd")
         assert_eq!(snap.byte_to_point(4).unwrap(), Point::new(1, 0));
         assert_eq!(snap.char_at(4).unwrap(), 'c');
     }
@@ -247,7 +248,6 @@ mod tests {
         );
         assert_eq!(buf.snapshot().text(), "foo\r\nbar");
 
-        // Deleting the entire \r\n (bytes 3..5) succeeds
         buf.apply_edit(3..5, "\n").unwrap();
         assert_eq!(buf.snapshot().text(), "foo\nbar");
     }
@@ -255,14 +255,12 @@ mod tests {
     #[test]
     fn apply_edits_supports_adjacent_non_empty_and_rejects_overlaps_atomically() {
         let mut buf = Buffer::from_text("abcdef");
-        // Adjacent ranges [0..3) and [3..6) must succeed
         let v1 = buf
             .apply_edits(&[TextEdit::new(3..6, "XYZ"), TextEdit::new(0..3, "12")])
             .unwrap();
         assert_eq!(v1, BufferVersion::new(1));
         assert_eq!(buf.snapshot().text(), "12XYZ");
 
-        // Overlapping edits must fail atomically without mutating buffer or version
         let err = buf
             .apply_edits(&[TextEdit::new(0..3, "A"), TextEdit::new(2..4, "B")])
             .unwrap_err();
@@ -276,7 +274,6 @@ mod tests {
         assert_eq!(buf.version(), BufferVersion::new(1));
         assert_eq!(buf.snapshot().text(), "12XYZ");
 
-        // Duplicate empty insertions at the same offset fail atomically
         let err_dup = buf
             .apply_edits(&[TextEdit::insert(2, "a"), TextEdit::insert(2, "b")])
             .unwrap_err();
@@ -304,5 +301,237 @@ mod tests {
         assert_eq!(v, BufferVersion::new(0));
         let v_empty_batch = buf.apply_edits(&[]).unwrap();
         assert_eq!(v_empty_batch, BufferVersion::new(0));
+    }
+
+    #[test]
+    fn selection_set_merging_rules_and_primary_tracking() {
+        let buf = Buffer::from_text("0123456789");
+        let snap = buf.snapshot();
+
+        // Empty fallback becomes caret(0)
+        let empty = SelectionSet::from_selections([], 5, &snap);
+        assert_eq!(empty.len(), 1);
+        assert_eq!(*empty.primary(), Selection::caret(0));
+
+        // Duplicate carets merge; distinct adjacent carets stay separate
+        let carets = SelectionSet::from_selections(
+            [
+                Selection::caret(4),
+                Selection::caret(3),
+                Selection::caret(4),
+            ],
+            2,
+            &snap,
+        );
+        assert_eq!(
+            carets.as_slice(),
+            &[Selection::caret(3), Selection::caret(4)]
+        );
+        assert_eq!(carets.primary_index(), 1);
+
+        // Adjacent non-empty ranges [0..3) and [3..6) must NOT merge
+        let adjacent =
+            SelectionSet::from_selections([Selection::new(3, 6), Selection::new(0, 3)], 0, &snap);
+        assert_eq!(
+            adjacent.as_slice(),
+            &[Selection::new(0, 3), Selection::new(3, 6)]
+        );
+        assert_eq!(adjacent.primary_index(), 1);
+
+        // Caret touching a non-empty selection's boundary merges and preserves primary direction
+        let touching =
+            SelectionSet::from_selections([Selection::new(3, 0), Selection::caret(3)], 0, &snap);
+        assert_eq!(touching.as_slice(), &[Selection::new(3, 0)]);
+        assert_eq!(touching.primary().direction(), Direction::Backward);
+
+        // Overlapping ranges [1..5) and [7..4) merge into [1..7) keeping primary's direction
+        let overlap =
+            SelectionSet::from_selections([Selection::new(1, 5), Selection::new(7, 4)], 1, &snap);
+        assert_eq!(overlap.as_slice(), &[Selection::new(7, 1)]);
+        assert_eq!(overlap.primary().direction(), Direction::Backward);
+    }
+
+    #[test]
+    fn goal_column_preserved_across_short_lines_with_tabs_and_cleared_horizontally() {
+        let buf = Buffer::from_text("\tabcdef\nhi\n\t1234567\n");
+        let snap = buf.snapshot();
+        let cfg = MotionConfig::new(4);
+
+        // Start on line 0 after "\tabcd" -> byte 5, visual column 4 + 4 = 8
+        let mut sels = SelectionSet::caret(5);
+        assert_eq!(visual_column_at(&snap, 5, cfg), 8);
+
+        // Move down to short line "hi" -> snaps to end of "hi", keeps goal_column = Some(8)
+        sels.move_by(&snap, Motion::Down, false, cfg);
+        assert_eq!(sels.primary().head(), 10); // "\tabcdef\nhi"
+        assert_eq!(sels.primary().goal_column(), Some(8));
+
+        // Move down to "\t1234567" -> returns to visual column 8 ("\t1234" = 4 + 4 = byte 5 on line 2)
+        sels.move_by(&snap, Motion::Down, false, cfg);
+        let line2_start = snap.rope().line_to_byte(2);
+        assert_eq!(sels.primary().head(), line2_start + 5);
+        assert_eq!(sels.primary().goal_column(), Some(8));
+
+        // Move down on last empty line -> jumps to EOF and clears goal_column
+        sels.move_by(&snap, Motion::Down, false, cfg);
+        sels.move_by(&snap, Motion::Down, false, cfg);
+        assert_eq!(sels.primary().head(), snap.len_bytes());
+        assert_eq!(sels.primary().goal_column(), None);
+
+        // Horizontal movement clears goal_column
+        sels = SelectionSet::caret(5);
+        sels.move_by(&snap, Motion::Down, false, cfg);
+        assert_eq!(sels.primary().goal_column(), Some(8));
+        sels.move_by(&snap, Motion::Left, false, cfg);
+        assert_eq!(sels.primary().goal_column(), None);
+    }
+
+    #[test]
+    fn multicursor_insert_delete_and_next_occurrence() {
+        let mut buf = Buffer::from_text("int alpha = 1;\nint alpha = 2;\nint alpha = 3;\n");
+        let snap = buf.snapshot();
+
+        // Caret inside first "alpha" (byte 5)
+        let mut sels = SelectionSet::caret(5);
+        assert!(sels.add_next_occurrence(&snap)); // selects "alpha" on line 0
+        assert_eq!(sels.len(), 1);
+        assert_eq!(sels.primary().range(), 4..9);
+
+        assert!(sels.add_next_occurrence(&snap)); // line 1
+        assert!(sels.add_next_occurrence(&snap)); // line 2
+        assert!(!sels.add_next_occurrence(&snap)); // no more occurrences
+        assert_eq!(sels.len(), 3);
+
+        // Replace all three "alpha" selections with "beta_x"
+        apply_insert_all(&mut buf, &mut sels, "beta_x").unwrap();
+        assert_eq!(
+            buf.snapshot().text(),
+            "int beta_x = 1;\nint beta_x = 2;\nint beta_x = 3;\n"
+        );
+        assert_eq!(sels.len(), 3);
+        assert!(sels.as_slice().iter().all(Selection::is_empty));
+
+        // Backspace at all 3 cursors deletes "_x" -> "beta"
+        apply_delete_backward(&mut buf, &mut sels).unwrap();
+        apply_delete_backward(&mut buf, &mut sels).unwrap();
+        assert_eq!(
+            buf.snapshot().text(),
+            "int beta = 1;\nint beta = 2;\nint beta = 3;\n"
+        );
+
+        // Per-cursor insert with mismatched count fails cleanly without mutating buffer
+        let err = apply_insert_per_cursor(&mut buf, &mut sels, &["one", "two"]).unwrap_err();
+        assert_eq!(
+            err,
+            BufferError::CursorCountMismatch {
+                expected: 3,
+                actual: 2,
+            }
+        );
+
+        // Per-cursor insert with matching count updates all 3 cursors independently
+        apply_insert_per_cursor(&mut buf, &mut sels, &["1", "2", "3"]).unwrap();
+        assert_eq!(
+            buf.snapshot().text(),
+            "int beta1 = 1;\nint beta2 = 2;\nint beta3 = 3;\n"
+        );
+    }
+
+    #[test]
+    fn multicursor_delete_graphemes_and_adjacent_cursors() {
+        let mut buf = Buffer::from_text("e\u{0301}👨‍👩‍👧‍👦🇵🇱");
+        let snap = buf.snapshot();
+        // Caret right after 'e\u{0301}' (3) and after flag (end)
+        let mut sels =
+            SelectionSet::from_selections([Selection::caret(3), Selection::caret(36)], 0, &snap);
+
+        apply_delete_backward(&mut buf, &mut sels).unwrap();
+        assert_eq!(buf.snapshot().text(), "👨‍👩‍👧‍👦");
+        assert_eq!(
+            sels.as_slice(),
+            &[Selection::caret(0), Selection::caret(25)]
+        );
+
+        // Second Backspace: cursor at 0 is no-op, cursor at 25 deletes the family emoji -> merged at 0
+        apply_delete_backward(&mut buf, &mut sels).unwrap();
+        assert_eq!(buf.snapshot().text(), "");
+        assert_eq!(sels.as_slice(), &[Selection::caret(0)]);
+    }
+
+    #[test]
+    fn smart_home_and_extend_selection_collapse() {
+        let buf = Buffer::from_text("    hello\n");
+        let snap = buf.snapshot();
+        let cfg = MotionConfig::default();
+
+        let mut sels = SelectionSet::caret(7); // inside "hello"
+        sels.move_by(&snap, Motion::LineFirstNonWhitespace, false, cfg);
+        assert_eq!(sels.primary().head(), 4);
+        sels.move_by(&snap, Motion::LineFirstNonWhitespace, false, cfg);
+        assert_eq!(sels.primary().head(), 0);
+
+        // Non-extending Left on [2..6) collapses to 2 without moving further left
+        sels = SelectionSet::single(Selection::new(2, 6));
+        sels.move_by(&snap, Motion::Left, false, cfg);
+        assert_eq!(*sels.primary(), Selection::caret(2));
+
+        // Extending Right from 2 -> [2..3)
+        sels.move_by(&snap, Motion::Right, true, cfg);
+        assert_eq!(*sels.primary(), Selection::new(2, 3));
+    }
+
+    #[test]
+    fn map_through_edits_shifts_selections_accurately() {
+        let mut buf = Buffer::from_text("alpha beta gamma");
+        let mut sels = SelectionSet::from_selections(
+            [Selection::new(6, 10), Selection::new(11, 16)],
+            0,
+            &buf.snapshot(),
+        );
+        let edits = vec![TextEdit::new(0..5, "ALPHA_LONG")]; // +5 bytes before both selections
+        buf.apply_edits(&edits).unwrap();
+        sels.map_through_edits(&edits, &buf.snapshot());
+
+        assert_eq!(
+            sels.as_slice(),
+            &[Selection::new(11, 15), Selection::new(16, 21)]
+        );
+    }
+
+    #[test]
+    fn add_cursor_above_below_collapse_select_all_and_delete_forward() {
+        let buf = Buffer::from_text("row0_abcdef\r\nrow1\r\nrow2_123456");
+        let snap = buf.snapshot();
+        let cfg = MotionConfig::default();
+
+        let mut sels = SelectionSet::caret(8); // row 0, col 8
+        sels.add_cursor_below(&snap, cfg); // row 1 clamped to col 4, keeps goal_column = Some(8)
+        assert_eq!(sels.len(), 2);
+        assert_eq!(sels.primary().goal_column(), Some(8));
+
+        sels.add_cursor_below(&snap, cfg); // row 2, returns to col 8
+        assert_eq!(sels.len(), 3);
+        let row2_start = snap.rope().line_to_byte(2);
+        assert_eq!(sels.primary().head(), row2_start + 8);
+
+        // Above from row 2 hits row 1 and merges with existing cursor on row 1
+        sels.add_cursor_above(&snap, cfg);
+        assert_eq!(sels.len(), 3);
+
+        sels.collapse_to_primary();
+        assert_eq!(sels.len(), 1);
+
+        sels.select_all(&snap);
+        assert_eq!(sels.primary().range(), 0..snap.len_bytes());
+
+        // Delete forward across CRLF and emoji
+        let mut del_buf = Buffer::from_text("a\r\n🚀b");
+        let mut del_sels = SelectionSet::from_selections(
+            [Selection::caret(1), Selection::caret(3)],
+            0,
+            &del_buf.snapshot(),
+        );
+        apply_delete_forward(&mut del_buf, &mut del_sels).unwrap();
+        assert_eq!(del_buf.snapshot().text(), "ab");
     }
 }

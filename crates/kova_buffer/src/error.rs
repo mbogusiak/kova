@@ -87,4 +87,13 @@ pub enum BufferError {
         /// Start byte of the following edit in sorted order.
         second_start: usize,
     },
+
+    /// The number of per-cursor replacement texts does not match the number of active cursors.
+    #[error("cursor count mismatch: expected {expected} texts, got {actual}")]
+    CursorCountMismatch {
+        /// Number of selections in the [`SelectionSet`](crate::SelectionSet).
+        expected: usize,
+        /// Number of replacement strings supplied.
+        actual: usize,
+    },
 }
