@@ -378,8 +378,14 @@ name = "kova_core"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "kova_config",
  "memory-stats",
+ "serde",
  "serde_json",
+ "smallvec",
+ "tempfile",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

@@ -11,9 +11,15 @@
 )]
 
 use std::hint::black_box;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use kova_core::action::ActionId;
+use kova_core::context::{ContextExpr, ContextState, FocusContext, FocusStack};
+use kova_core::keymap::{
+    BindingRule, BindingTarget, KeyChord, KeyCode, KeyStep, KeyStroke, KeymapLayer,
+    KeymapLayerKind, KeymapPresetMode, KeymapResolver, Modifiers, Platform,
+};
 use kova_core::perf::{
     BudgetKind, budgets, check_duration_budget, check_rss_budget, current_process_rss_bytes,
     sample_process_memory,
@@ -90,10 +96,65 @@ fn bench_go_to_class_skeleton(c: &mut Criterion) {
     });
 }
 
+fn bench_input_latency_keymap_resolver(c: &mut Criterion) {
+    let mut rules = Vec::with_capacity(250);
+    for i in 0..250 {
+        let ch = char::from(b'a' + u8::try_from(i % 26).unwrap_or(0));
+        let modifiers = Modifiers {
+            ctrl: (i / 26) % 2 == 1,
+            alt: (i / 52) % 2 == 1,
+            shift: (i / 104) % 2 == 1,
+            meta: true,
+        };
+        rules.push(BindingRule {
+            id: i,
+            layer: KeymapLayerKind::DefaultPreset,
+            platform: Some(Platform::MacOs),
+            root_context: Some(if i % 2 == 0 {
+                FocusContext::EditorText
+            } else {
+                FocusContext::Workspace
+            }),
+            when: Some(
+                ContextExpr::parse("!vim_enabled")
+                    .unwrap_or_else(|_| ContextExpr::focus(FocusContext::Global)),
+            ),
+            chord: KeyChord::single(KeyStroke::new(modifiers, KeyCode::Char(ch))),
+            target: BindingTarget::Action(ActionId::from_static("editor.duplicate_line")),
+        });
+    }
+
+    let mut resolver = KeymapResolver::new(Platform::MacOs);
+    resolver.add_layer(KeymapLayer::new(
+        KeymapLayerKind::DefaultPreset,
+        KeymapPresetMode::JetBrains,
+        rules,
+    ));
+
+    let stack = FocusStack::from_leaf(FocusContext::EditorText);
+    let state = ContextState::new();
+    let probe = KeyStep::Stroke(KeyStroke::new(Modifiers::META, KeyCode::Char('d')));
+
+    c.bench_function("budget_input_latency_keymap_resolver", |b| {
+        b.iter(|| {
+            let started = Instant::now();
+            let dispatch =
+                resolver.resolve_step(black_box(probe), black_box(&stack), black_box(&state));
+            let report = check_duration_budget(
+                BudgetKind::InputLatency,
+                started.elapsed(),
+                budgets::INPUT_LATENCY_MAX,
+            );
+            black_box((dispatch, report.is_within_budget()))
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_rss_probe_and_baseline,
     bench_input_latency_skeleton,
+    bench_input_latency_keymap_resolver,
     bench_cold_start_skeleton,
     bench_go_to_class_skeleton,
 );

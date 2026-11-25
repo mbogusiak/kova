@@ -3,7 +3,21 @@
 //! This crate belongs to the **Headless Core**: it must compile and pass its
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
 
+pub mod action;
+pub mod context;
+pub mod keymap;
 pub mod perf;
+
+pub use action::{
+    ActionCategory, ActionDescriptor, ActionError, ActionId, ActionRegistry, ActionSource,
+};
+pub use context::{ContextExpr, ContextExprError, ContextState, FocusContext, FocusStack};
+pub use keymap::{
+    BindingRule, BindingTarget, KeyChord, KeyCode, KeyDispatch, KeyStep, KeyStroke,
+    KeymapDiagnostic, KeymapDiagnosticKind, KeymapLayer, KeymapLayerKind, KeymapParseError,
+    KeymapPresetMode, KeymapResolver, KeymapSession, ModifierTap, ModifierTapDetector, Modifiers,
+    Platform,
+};
 
 /// Name of this crate as declared in its `Cargo.toml`.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
