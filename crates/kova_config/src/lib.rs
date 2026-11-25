@@ -1,11 +1,24 @@
-//! `kova_config` — Omarchy path resolution and configuration management.
+//! `kova_config` — Omarchy path resolution and lossless `toml_edit`
+//! configuration management for `settings.toml` and `kova.toml`.
 //!
 //! This crate belongs to the **Headless Core**: it must compile and pass its
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
 
+pub mod document;
+pub mod model;
 pub mod paths;
+pub mod project;
 
+pub use document::SettingsDocument;
+pub use model::{
+    ConfigError, EditorSettings, JvmSettings, KeymapPreset, KovaSettings, SettingUpdate,
+    TerminalSettings, UiSettings,
+};
 pub use paths::{KovaPaths, PathsError};
+pub use project::{
+    EffectiveConfig, ProjectBuildTool, ProjectConfig, ProjectConfigDocument,
+    ProjectEditorOverrides, ProjectJvmOverrides, RunConfigKind, RunConfiguration,
+};
 
 /// Name of this crate as declared in its `Cargo.toml`.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
