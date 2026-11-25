@@ -4,6 +4,7 @@
 //! allowed to depend on GPU windowing (`kova_ui` and `kova_app`).
 
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -60,6 +61,15 @@ impl AppLaunchOptions {
     }
 }
 
+/// Returns the first non-flag CLI argument naming an existing directory: the project root
+/// shown in the *Project* dock (scanned off-thread after the first frame).
+fn project_root_arg(args: impl IntoIterator<Item = String>) -> Option<PathBuf> {
+    args.into_iter()
+        .find(|arg| !arg.starts_with("--"))
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+}
+
 fn env_flag_enabled(key: &str) -> bool {
     std::env::var(key).is_ok_and(|value| {
         let trimmed = value.trim();
@@ -83,6 +93,8 @@ pub fn run_with_options(process_start: Instant, options: AppLaunchOptions) -> Ex
     let open_failed = Arc::new(AtomicBool::new(false));
     let open_failed_for_app = Arc::clone(&open_failed);
 
+    let project_root = project_root_arg(std::env::args().skip(1));
+
     Application::new().run(move |cx: &mut App| {
         cx.set_global(KovaTheme::islands_dark());
         kova_ui::editor::actions::bind_default_keys(cx);
@@ -97,7 +109,7 @@ pub fn run_with_options(process_start: Instant, options: AppLaunchOptions) -> Ex
         let open_result = cx.open_window(default_window_options(cx), move |_, cx| {
             cx.activate(true);
             cx.new(move |cx| {
-                WorkspaceShell::with_probe(
+                let shell = WorkspaceShell::with_probe(
                     process_start,
                     options.exit_after_first_frame,
                     Some(Box::new(move |metrics| {
@@ -109,7 +121,11 @@ pub fn run_with_options(process_start: Instant, options: AppLaunchOptions) -> Ex
                         );
                     })),
                     cx,
-                )
+                );
+                match project_root {
+                    Some(root) => shell.with_project_root(root),
+                    None => shell,
+                }
             })
         });
 
@@ -237,7 +253,7 @@ mod tests {
 
     use kova_ui::StartupMetrics;
 
-    use super::{AppLaunchOptions, CRATE_NAME, finalize_launch};
+    use super::{AppLaunchOptions, CRATE_NAME, finalize_launch, project_root_arg};
 
     #[test]
     fn crate_name_matches_manifest() {
@@ -247,6 +263,18 @@ mod tests {
     #[test]
     fn inherits_workspace_license() {
         assert_eq!(env!("CARGO_PKG_LICENSE"), "MIT OR Apache-2.0");
+    }
+
+    #[test]
+    fn project_root_arg_skips_flags_and_requires_a_directory() {
+        let dir = env!("CARGO_MANIFEST_DIR").to_owned();
+        let args = vec!["--probe-startup".to_owned(), dir.clone()];
+        assert_eq!(project_root_arg(args), Some(dir.into()));
+        assert_eq!(project_root_arg(vec!["--probe-startup".to_owned()]), None);
+        assert_eq!(
+            project_root_arg(vec!["/definitely/not/a/kova/dir".to_owned()]),
+            None
+        );
     }
 
     #[test]

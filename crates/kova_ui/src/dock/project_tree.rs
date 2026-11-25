@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn adapts_kova_core_project_tree_snapshot() {
         let root = std::env::temp_dir().join(format!("kova-ui-tree-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        drop(std::fs::remove_dir_all(&root));
         std::fs::create_dir_all(root.join("src/main/java")).unwrap();
         std::fs::create_dir_all(root.join("build/classes")).unwrap();
         std::fs::write(
@@ -610,6 +610,6 @@ mod tests {
         assert!(!names.iter().any(|n| n == "classes"));
         assert!(names.iter().any(|n| n == "OrderApp.java"));
         assert!(tree.visible_rows().iter().any(|n| n.is_kova_config));
-        let _ = std::fs::remove_dir_all(&root);
+        drop(std::fs::remove_dir_all(&root));
     }
 }

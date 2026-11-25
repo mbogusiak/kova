@@ -6,6 +6,7 @@ pub mod element;
 pub mod ime;
 pub mod input;
 pub mod line_cache;
+pub mod shared;
 pub mod state;
 pub mod viewport;
 
@@ -14,12 +15,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, FocusHandle, Font, FontFallbacks, FontFeatures, FontStyle,
-    FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render, ScrollWheelEvent,
-    ShapedLine, SharedString, Styled as _, Window, div, px,
+    App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Font, FontFallbacks,
+    FontFeatures, FontStyle, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point,
+    Render, ScrollWheelEvent, ShapedLine, SharedString, Styled as _, Window, div, px,
 };
-use kova_buffer::{Buffer, BufferSnapshot, Motion, SelectionSet};
+use kova_buffer::{Buffer, BufferSnapshot, BufferVersion, Motion, SelectionSet};
 use smallvec::SmallVec;
 
 use crate::editor::element::EditorCanvasElement;
@@ -27,6 +28,7 @@ use crate::editor::input::{
     CursorShape, EditorKeyCommand, InputLatencyStats, KeyMods, map_editor_key,
 };
 use crate::editor::line_cache::ShapedLineCache;
+pub use crate::editor::shared::SharedBuffer;
 use crate::editor::state::EditorState;
 use crate::editor::viewport::{
     DEFAULT_EDITOR_FONT_SIZE_PX, SCROLLBAR_RIGHT_MARGIN_PX, ViewportMetrics,
@@ -86,10 +88,28 @@ enum DragMode {
 /// A visible line cached from the last prepaint: `(row, shaped, window_byte_start, x_offset)`.
 pub(crate) type VisibleShapedLine = (usize, ShapedLine, usize, f32);
 
+/// Whether an [`EditorView`] belongs to the active split pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneRole {
+    Active,
+    Inactive,
+}
+
+/// Events emitted by [`EditorView`] to its owner (the workspace shell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorEvent {
+    /// The shared document was edited through this view.
+    Edited,
+    /// The view was clicked and took keyboard focus.
+    Focused,
+}
+
 /// Virtualized GPUI code editor view operating strictly on $O(1)$ [`BufferSnapshot`]s.
 #[derive(Debug)]
 pub struct EditorView {
     state: EditorState,
+    pane_role: PaneRole,
+    last_emitted_version: BufferVersion,
     scroll_offset: Point<f32>,
     max_scroll_x: f32,
     last_viewport: ViewportMetrics,
@@ -116,9 +136,18 @@ impl EditorView {
     /// Creates a new [`EditorView`] backed by `buffer`.
     #[must_use]
     pub fn new(buffer: Buffer, cx: &mut Context<'_, Self>) -> Self {
+        Self::with_shared_buffer(SharedBuffer::new(buffer), cx)
+    }
+
+    /// Creates an [`EditorView`] over an existing [`SharedBuffer`] (the same file in another
+    /// split). The new view has its own caret at the top and an independent scroll offset.
+    #[must_use]
+    pub fn with_shared_buffer(buffer: SharedBuffer, cx: &mut Context<'_, Self>) -> Self {
         let line_height = ViewportMetrics::quantized_line_height(DEFAULT_EDITOR_FONT_SIZE_PX);
         Self {
-            state: EditorState::new(buffer),
+            last_emitted_version: buffer.version(),
+            state: EditorState::with_shared_buffer(buffer),
+            pane_role: PaneRole::Active,
             scroll_offset: Point::new(0.0, 0.0),
             max_scroll_x: 0.0,
             last_viewport: ViewportMetrics::new(line_height, 7.8, 800.0, 600.0),
@@ -164,6 +193,40 @@ impl EditorView {
     #[must_use]
     pub const fn state(&self) -> &EditorState {
         &self.state
+    }
+
+    /// Returns a clone of the [`SharedBuffer`] handle backing this view.
+    #[must_use]
+    pub fn shared_buffer(&self) -> SharedBuffer {
+        self.state.shared_buffer()
+    }
+
+    /// Returns whether this view belongs to the active split pane.
+    #[must_use]
+    pub const fn is_active_pane(&self) -> bool {
+        matches!(self.pane_role, PaneRole::Active)
+    }
+
+    /// Marks this view as belonging to the active (or an inactive) split pane.
+    pub fn set_active_pane(&mut self, active: bool, cx: &mut Context<'_, Self>) {
+        let role = if active {
+            PaneRole::Active
+        } else {
+            PaneRole::Inactive
+        };
+        if self.pane_role != role {
+            self.pane_role = role;
+            cx.notify();
+        }
+    }
+
+    /// Moves the primary caret to the 1-based `(line, col)` and scrolls it into view.
+    ///
+    /// Used by *Structure* and *Problems* navigation; out-of-range positions are clamped.
+    pub fn set_cursor_position(&mut self, line: usize, col: usize, cx: &mut Context<'_, Self>) {
+        self.state.set_line_col(line, col);
+        self.ensure_primary_cursor_visible();
+        cx.notify();
     }
 
     /// Returns the total line count of the active buffer (`>= 1`).
@@ -302,7 +365,9 @@ impl EditorView {
         self.scroll_offset.y = clamped_scroll_y;
     }
 
-    pub(crate) const fn focus_handle(&self) -> &FocusHandle {
+    /// Returns the GPUI focus handle of this editor.
+    #[must_use]
+    pub const fn focus_handle(&self) -> &FocusHandle {
         &self.focus_handle
     }
 
@@ -507,7 +572,18 @@ impl EditorView {
             self.ensure_primary_cursor_visible();
         }
         self.input_latency.record(started.elapsed());
+        self.emit_if_edited(cx);
         cx.notify();
+    }
+
+    /// Emits [`EditorEvent::Edited`] once per document version change made through this view,
+    /// so sibling splits sharing the buffer (and the tab dirty badge) refresh immediately.
+    fn emit_if_edited(&mut self, cx: &mut Context<'_, Self>) {
+        let version = self.state.snapshot().version();
+        if version != self.last_emitted_version {
+            self.last_emitted_version = version;
+            cx.emit(EditorEvent::Edited);
+        }
     }
 
     fn run_edit(
@@ -518,6 +594,7 @@ impl EditorView {
     ) {
         let started = Instant::now();
         self.reset_cursor_blink(window, cx);
+        self.state.sync_external_edits();
         let changed = edit(&mut self.state, cx);
         self.finish_input(started, changed, cx);
     }
@@ -681,6 +758,8 @@ impl EditorView {
         let started = Instant::now();
         window.focus(&self.focus_handle);
         self.reset_cursor_blink(window, cx);
+        self.state.sync_external_edits();
+        cx.emit(EditorEvent::Focused);
 
         let local_x = f32::from(event.position.x) - f32::from(self.last_canvas_bounds.origin.x);
         let total_lines = self.line_count();
@@ -859,8 +938,14 @@ impl EditorView {
     }
 }
 
+impl EventEmitter<EditorEvent> for EditorView {}
+
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        // A sibling split may have edited the shared document since the last frame.
+        if self.state.sync_external_edits() {
+            self.last_emitted_version = self.state.snapshot().version();
+        }
         div()
             .size_full()
             .relative()
