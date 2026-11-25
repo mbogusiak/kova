@@ -4,7 +4,12 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ropey::Rope;
+use smallvec::{SmallVec, smallvec};
 
+use crate::edit_log::{
+    EditLog, EditLogConfig, LspTextChange, TreeSitterEdit, VersionChanges, VersionDelta,
+    apply_single_rope_edit,
+};
 use crate::error::BufferError;
 use crate::line_ending::LineEnding;
 use crate::position::{BufferId, BufferVersion, TextEdit};
@@ -22,6 +27,7 @@ pub struct Buffer {
     version: BufferVersion,
     rope: Arc<Rope>,
     line_ending: LineEnding,
+    edit_log: EditLog,
 }
 
 impl Default for Buffer {
@@ -39,6 +45,7 @@ impl Buffer {
             version: BufferVersion::new(0),
             rope: Arc::new(Rope::new()),
             line_ending: LineEnding::Lf,
+            edit_log: EditLog::default(),
         }
     }
 
@@ -58,6 +65,7 @@ impl Buffer {
             version: BufferVersion::new(0),
             rope: Arc::new(rope),
             line_ending,
+            edit_log: EditLog::default(),
         }
     }
 
@@ -71,6 +79,21 @@ impl Buffer {
             version: BufferVersion::new(0),
             rope: Arc::new(Rope::from_str(&normalized)),
             line_ending,
+            edit_log: EditLog::default(),
+        }
+    }
+
+    /// Creates a buffer initialized with `text` and a custom [`EditLogConfig`].
+    #[must_use]
+    pub fn with_edit_log_config(id: BufferId, text: &str, edit_log_config: EditLogConfig) -> Self {
+        let rope = Rope::from_str(text);
+        let line_ending = LineEnding::detect_rope(&rope);
+        Self {
+            id,
+            version: BufferVersion::new(0),
+            rope: Arc::new(rope),
+            line_ending,
+            edit_log: EditLog::new(edit_log_config),
         }
     }
 
@@ -97,6 +120,36 @@ impl Buffer {
         self.line_ending = line_ending;
     }
 
+    /// Returns a reference to the buffer's incremental [`EditLog`].
+    #[must_use]
+    pub const fn edit_log(&self) -> &EditLog {
+        &self.edit_log
+    }
+
+    /// Returns the number of [`VersionDelta`] transitions currently retained in the [`EditLog`].
+    #[must_use]
+    pub fn edit_log_len(&self) -> usize {
+        self.edit_log.len()
+    }
+
+    /// Queries all incremental version transitions since `since`.
+    #[must_use]
+    pub fn changes_since(&self, since: BufferVersion) -> VersionChanges<'_> {
+        self.edit_log.changes_since(since)
+    }
+
+    /// Collects sequential [`TreeSitterEdit`]s since `since`, or `None` if a full re-parse is required.
+    #[must_use]
+    pub fn tree_sitter_edits_since(&self, since: BufferVersion) -> Option<Vec<TreeSitterEdit>> {
+        self.edit_log.collect_tree_sitter_edits(since)
+    }
+
+    /// Collects sequential [`LspTextChange`]s since `since`, or `None` if full sync is required.
+    #[must_use]
+    pub fn lsp_changes_since(&self, since: BufferVersion) -> Option<Vec<LspTextChange>> {
+        self.edit_log.collect_lsp_changes(since)
+    }
+
     /// Returns an immutable [`BufferSnapshot`] in $O(1)$ time.
     #[must_use]
     pub fn snapshot(&self) -> BufferSnapshot {
@@ -112,7 +165,7 @@ impl Buffer {
     ///
     /// Returns the resulting [`BufferVersion`]. A pure no-op (`range.is_empty()` and
     /// `replacement.is_empty()`) validates bounds and returns the current version
-    /// without incrementing it.
+    /// without incrementing it or pushing to [`EditLog`].
     ///
     /// # Errors
     ///
@@ -123,22 +176,18 @@ impl Buffer {
         range: Range<usize>,
         replacement: &str,
     ) -> Result<BufferVersion, BufferError> {
-        let snapshot = self.snapshot();
-        validate_edit_range(&snapshot, &range)?;
+        {
+            let snapshot = self.snapshot();
+            validate_edit_range(&snapshot, &range)?;
+        }
         if range.is_empty() && replacement.is_empty() {
             return Ok(self.version);
         }
 
-        let start_char = snapshot.rope().byte_to_char(range.start);
-        let end_char = snapshot.rope().byte_to_char(range.end);
-
         let rope = Arc::make_mut(&mut self.rope);
-        if start_char != end_char {
-            rope.remove(start_char..end_char);
-        }
-        if !replacement.is_empty() {
-            rope.insert(start_char, replacement);
-        }
+        let delta = apply_single_rope_edit(rope, &range, replacement);
+        self.edit_log
+            .push(VersionDelta::new(self.version, smallvec![delta]));
 
         self.version = self.version.next();
         Ok(self.version)
@@ -151,6 +200,9 @@ impl Buffer {
     /// insertions at the exact same offset or overlapping spans fail with
     /// [`BufferError::OverlappingEdits`] without modifying the buffer.
     ///
+    /// Recorded [`EditDelta`](crate::edit_log::EditDelta)s are ordered from back to front so sequential consumers
+    /// (Tree-sitter and LSP) never observe coordinate shifts from earlier cursors.
+    ///
     /// # Errors
     ///
     /// Returns [`BufferError`] if any edit range is invalid or any two edits collide.
@@ -159,11 +211,12 @@ impl Buffer {
             return Ok(self.version);
         }
 
-        let snapshot = self.snapshot();
         let mut indexed: Vec<(usize, &TextEdit)> = edits.iter().enumerate().collect();
-
-        for &(_, edit) in &indexed {
-            validate_edit_range(&snapshot, &edit.range)?;
+        {
+            let snapshot = self.snapshot();
+            for &(_, edit) in &indexed {
+                validate_edit_range(&snapshot, &edit.range)?;
+            }
         }
 
         indexed.sort_by(|a, b| {
@@ -186,35 +239,30 @@ impl Buffer {
             }
         }
 
-        let has_effective_change = indexed
+        let effective_count = indexed
             .iter()
-            .any(|(_, edit)| !edit.range.is_empty() || !edit.replacement.is_empty());
-        if !has_effective_change {
+            .filter(|(_, edit)| !edit.range.is_empty() || !edit.replacement.is_empty())
+            .count();
+        if effective_count == 0 {
             return Ok(self.version);
         }
 
-        // Convert all byte bounds to char indices before mutating the rope, then apply
-        // from back to front so earlier indices stay invariant.
-        let mut char_edits: Vec<(usize, usize, &str)> = Vec::with_capacity(indexed.len());
-        for (_, edit) in indexed {
+        // Apply and log in descending document order (back-to-front) so every earlier
+        // edit's pre-edit byte, Point, and Utf16Point coordinates remain exact.
+        let rope = Arc::make_mut(&mut self.rope);
+        let mut deltas: SmallVec<[_; 1]> = SmallVec::with_capacity(effective_count);
+        for (_, edit) in indexed.into_iter().rev() {
             if edit.range.is_empty() && edit.replacement.is_empty() {
                 continue;
             }
-            let start_char = snapshot.rope().byte_to_char(edit.range.start);
-            let end_char = snapshot.rope().byte_to_char(edit.range.end);
-            char_edits.push((start_char, end_char, edit.replacement.as_str()));
+            deltas.push(apply_single_rope_edit(
+                rope,
+                &edit.range,
+                edit.replacement.as_str(),
+            ));
         }
 
-        let rope = Arc::make_mut(&mut self.rope);
-        for (start_char, end_char, replacement) in char_edits.into_iter().rev() {
-            if start_char != end_char {
-                rope.remove(start_char..end_char);
-            }
-            if !replacement.is_empty() {
-                rope.insert(start_char, replacement);
-            }
-        }
-
+        self.edit_log.push(VersionDelta::new(self.version, deltas));
         self.version = self.version.next();
         Ok(self.version)
     }
