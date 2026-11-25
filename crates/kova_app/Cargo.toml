@@ -22,9 +22,6 @@ kova_core.workspace  = true
 kova_theme.workspace = true
 kova_ui.workspace    = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
-gpui = { workspace = true, features = ["runtime_shaders"] }
-
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { workspace = true, features = ["wayland", "x11"] }
 
