@@ -1,0 +1,24 @@
+[package]
+name                   = "kova_app"
+description            = "Startup binary, GPUI initialization and event loop for Kova IDE."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+publish.workspace      = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "kova"
+path = "src/main.rs"
+doc  = false
+
+[dependencies]
+kova_core.workspace = true
+kova_ui.workspace   = true
+
+[lints]
+workspace = true

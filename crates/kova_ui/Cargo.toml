@@ -1,0 +1,16 @@
+[package]
+name                   = "kova_ui"
+description            = "GPUI presentation components: IntelliJ New UI dock, Focus/Tiling layout, editor and settings."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+publish.workspace      = true
+
+[dependencies]
+kova_core.workspace  = true
+kova_theme.workspace = true
+
+[lints]
+workspace = true
