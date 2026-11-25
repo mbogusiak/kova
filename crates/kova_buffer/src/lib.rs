@@ -7,6 +7,7 @@ pub mod buffer;
 pub mod edit;
 pub mod error;
 pub mod grapheme;
+pub mod history;
 pub mod line_ending;
 pub mod motion;
 pub mod position;
@@ -17,10 +18,14 @@ pub use buffer::Buffer;
 pub use edit::{
     apply_delete_backward, apply_delete_forward, apply_insert_all, apply_insert_per_cursor,
 };
-pub use error::BufferError;
+pub use error::{BufferError, HistoryError};
 pub use grapheme::{
     BoundaryAffinity, next_grapheme_boundary, next_word_boundary, prev_grapheme_boundary,
     prev_word_boundary, snap_byte_to_grapheme_boundary,
+};
+pub use history::{
+    EditBatch, EditOrigin, History, HistoryConfig, HistoryNode, NodeId, ReversibleEdit,
+    TransactionId,
 };
 pub use line_ending::LineEnding;
 pub use motion::{Motion, MotionConfig, byte_at_visual_column, visual_column_at};
