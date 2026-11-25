@@ -191,6 +191,8 @@ impl WorkspaceShell {
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let editor = cx.new(EditorView::welcome_demo);
+        // Repaint the status bar (`Ln X, Col Y`, cursor count) whenever the editor changes.
+        cx.observe(&editor, |_, _, cx| cx.notify()).detach();
         Self {
             process_start,
             metrics: StartupMetrics::new(),
@@ -338,7 +340,8 @@ impl WorkspaceShell {
         let editor = self.editor.read(cx);
         let (cursor_line, cursor_col) = editor.primary_cursor_position();
         let total_lines = editor.line_count();
-        let cursor_summary = format!("Ln {cursor_line}, Col {cursor_col} · {total_lines} lines");
+        let cursor_summary =
+            format_cursor_summary(cursor_line, cursor_col, editor.cursor_count(), total_lines);
 
         let start_color = match self.metrics.cold_start_within_budget {
             Some(true) => run_icon,
@@ -398,6 +401,22 @@ impl WorkspaceShell {
     }
 }
 
+/// Formats the status-bar cursor summary, e.g. `"Ln 3, Col 7 · 120 lines"` or
+/// `"Ln 3, Col 7 · 3 cursors · 120 lines"` when several cursors are active.
+#[must_use]
+pub fn format_cursor_summary(
+    line: usize,
+    col: usize,
+    cursors: usize,
+    total_lines: usize,
+) -> String {
+    if cursors > 1 {
+        format!("Ln {line}, Col {col} · {cursors} cursors · {total_lines} lines")
+    } else {
+        format!("Ln {line}, Col {col} · {total_lines} lines")
+    }
+}
+
 impl Render for WorkspaceShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         if !self.first_frame_scheduled {
@@ -435,6 +454,18 @@ impl Render for WorkspaceShell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_summary_shows_count_only_for_multi_cursor() {
+        assert_eq!(
+            format_cursor_summary(3, 7, 1, 120),
+            "Ln 3, Col 7 · 120 lines"
+        );
+        assert_eq!(
+            format_cursor_summary(3, 7, 3, 120),
+            "Ln 3, Col 7 · 3 cursors · 120 lines"
+        );
+    }
 
     #[test]
     fn startup_metrics_formats_summary_and_evaluates_budgets() {

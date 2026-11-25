@@ -85,6 +85,7 @@ pub fn run_with_options(process_start: Instant, options: AppLaunchOptions) -> Ex
 
     Application::new().run(move |cx: &mut App| {
         cx.set_global(KovaTheme::islands_dark());
+        kova_ui::editor::actions::bind_default_keys(cx);
 
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
