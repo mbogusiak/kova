@@ -8,6 +8,7 @@ pub mod builtin_actions;
 pub mod context;
 pub mod keymap;
 pub mod perf;
+pub mod project;
 
 pub use action::{
     ActionCategory, ActionDescriptor, ActionError, ActionId, ActionRegistry, ActionSource,
@@ -22,6 +23,14 @@ pub use keymap::{
     KeymapDiagnostic, KeymapDiagnosticKind, KeymapLayer, KeymapLayerKind, KeymapParseError,
     KeymapPresetMode, KeymapResolver, KeymapSession, ModifierTap, ModifierTapDetector, Modifiers,
     Platform, build_effective_keymap, jetbrains_keymap_layer, jetbrains_keymap_layer_ref, presets,
+};
+pub use project::{
+    BuildSystemKind, DEFAULT_MAX_ENTRIES, MAX_RECENT_FILES, MAX_RECENT_WORKSPACES, OpenTabState,
+    Project, ProjectError, ProjectFileEntry, ProjectMetadata, ProjectNode, ProjectNodeId,
+    ProjectNodeKind, ProjectScanOptions, ProjectTree, RecentWorkspaceEntry, RecentWorkspaces,
+    SESSION_SCHEMA_VERSION, SessionLayoutState, WorkspaceSession, load_recent_workspaces,
+    load_workspace_session, load_workspace_session_or_default, record_recent_workspace,
+    save_recent_workspaces, save_workspace_session, scan_project,
 };
 
 /// Name of this crate as declared in its `Cargo.toml`.
