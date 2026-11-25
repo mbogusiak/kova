@@ -193,4 +193,21 @@ fn registry_manages_builtin_and_custom_themes() {
     assert_eq!(custom_id, "omarchy-custom");
     assert_eq!(registry.len(), 3);
     assert!(registry.get("omarchy-custom").is_some());
+
+    registry
+        .set_active("omarchy-custom")
+        .expect("custom theme should activate");
+    assert_eq!(registry.active_arc().metadata.id, "omarchy-custom");
+
+    // Built-in themes cannot be unregistered.
+    assert!(!registry.unregister("kova-islands-dark"));
+    assert!(!registry.unregister("kova-light"));
+
+    // Unregistering the active custom theme safely falls back to kova-islands-dark.
+    let fallback = registry.unregister_custom("omarchy-custom");
+    assert_eq!(fallback.as_deref(), Some("kova-islands-dark"));
+    assert_eq!(registry.active_id(), "kova-islands-dark");
+    assert_eq!(registry.active_arc().metadata.id, "kova-islands-dark");
+    assert!(registry.get("omarchy-custom").is_none());
+    assert_eq!(registry.len(), 2);
 }
