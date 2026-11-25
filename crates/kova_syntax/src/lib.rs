@@ -5,6 +5,7 @@
 
 pub mod engine;
 pub mod error;
+pub mod highlight;
 pub mod input;
 pub mod registry;
 pub mod tree;
@@ -14,8 +15,9 @@ pub use engine::{
     SyntaxTreeStore,
 };
 pub use error::SyntaxError;
+pub use highlight::{HighlightSpan, Highlighter};
 pub use input::{RopeBytesIter, RopeTextProvider, from_ts_point, parse_rope_with, to_ts_point};
-pub use registry::{LanguageEntry, LanguageRegistry, detect_language};
+pub use registry::{HighlightQuery, LanguageEntry, LanguageRegistry, detect_language};
 pub use tree::{SyntaxEdit, SyntaxTree};
 
 /// Name of this crate as declared in its `Cargo.toml`.

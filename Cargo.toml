@@ -54,8 +54,12 @@ thiserror            = "2"
 tokio                = { version = "1", features = ["fs", "macros", "rt", "sync", "time"] }
 toml                 = "0.8"
 toml_edit            = { version = "0.22", features = ["serde"] }
-tree-sitter          = "0.25"
-tree-sitter-json     = "0.24"
+tree-sitter           = "0.26"
+tree-sitter-http      = "0.1"
+tree-sitter-java      = "0.23"
+tree-sitter-json      = "0.24"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-toml-ng   = "0.7"
 unicode-segmentation = "1"
 unicode-width        = "0.2"
 
