@@ -40,6 +40,7 @@ kova_ui          = { path = "crates/kova_ui" }
 kova_plugin_rs   = { path = "sdk/kova_plugin_rs" }
 
 # External dependencies
+cafebabe     = "0.8"
 criterion    = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 ignore       = "0.4"
 memory-stats = "1.2"
@@ -63,6 +64,7 @@ tree-sitter-kotlin-ng = "1.1"
 tree-sitter-toml-ng   = "0.7"
 unicode-segmentation = "1"
 unicode-width        = "0.2"
+zip                  = { version = "2", default-features = false, features = ["deflate"] }
 
 [workspace.lints.cargo]
 unused_workspace_dependencies = "allow" # 12 library crates are pre-declared in E0 for upcoming epics
