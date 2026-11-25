@@ -309,9 +309,11 @@ dependencies = [
 name = "kova_config"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "sha2",
  "tempfile",
  "thiserror",
+ "toml_edit",
 ]
 
 [[package]]

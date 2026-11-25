@@ -50,6 +50,7 @@ smallvec             = "1"
 tempfile             = "3"
 thiserror            = "2"
 toml                 = "0.8"
+toml_edit            = { version = "0.22", features = ["serde"] }
 unicode-segmentation = "1"
 unicode-width        = "0.2"
 
