@@ -9,14 +9,21 @@ license.workspace      = true
 publish.workspace      = true
 
 [dependencies]
-ropey.workspace     = true
-thiserror.workspace = true
+ropey.workspace                = true
+smallvec.workspace             = true
+thiserror.workspace            = true
+unicode-segmentation.workspace = true
+unicode-width.workspace        = true
 
 [dev-dependencies]
 criterion.workspace = true
 
 [[bench]]
 name    = "buffer_ops"
+harness = false
+
+[[bench]]
+name    = "multicursor_ops"
 harness = false
 
 [lints]
