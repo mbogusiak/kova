@@ -1,7 +1,11 @@
-//! `kova_config` — comment-preserving TOML parser and serializer for `settings.toml` and `kova.toml`.
+//! `kova_config` — Omarchy path resolution and configuration management.
 //!
 //! This crate belongs to the **Headless Core**: it must compile and pass its
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
+
+pub mod paths;
+
+pub use paths::{KovaPaths, PathsError};
 
 /// Name of this crate as declared in its `Cargo.toml`.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
