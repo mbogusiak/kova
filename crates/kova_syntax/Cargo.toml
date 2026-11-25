@@ -9,19 +9,27 @@ license.workspace      = true
 publish.workspace      = true
 
 [dependencies]
-kova_buffer.workspace = true
-kova_theme.workspace  = true
-rayon.workspace       = true
-ropey.workspace       = true
-thiserror.workspace   = true
-tree-sitter.workspace = true
+kova_buffer.workspace           = true
+kova_theme.workspace            = true
+rayon.workspace                 = true
+ropey.workspace                 = true
+thiserror.workspace             = true
+tree-sitter.workspace           = true
+tree-sitter-http.workspace      = true
+tree-sitter-java.workspace      = true
+tree-sitter-json.workspace      = true
+tree-sitter-kotlin-ng.workspace = true
+tree-sitter-toml-ng.workspace   = true
 
 [dev-dependencies]
-criterion.workspace        = true
-tree-sitter-json.workspace = true
+criterion.workspace = true
 
 [[bench]]
 name    = "syntax_engine"
+harness = false
+
+[[bench]]
+name    = "highlight_viewport"
 harness = false
 
 [lints]

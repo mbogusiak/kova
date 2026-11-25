@@ -41,10 +41,7 @@ pub fn parse_rope_with(
         chunk.as_bytes().get(rel_offset..).unwrap_or(&[])
     };
 
-    let mut ts_progress = |state: &tree_sitter::ParseState| -> bool {
-        matches!(progress(state), ControlFlow::Break(()))
-    };
-
+    let mut ts_progress = |state: &tree_sitter::ParseState| progress(state);
     let options = tree_sitter::ParseOptions::new().progress_callback(&mut ts_progress);
     parser.parse_with_options(&mut input_callback, old_tree, Some(options))
 }
