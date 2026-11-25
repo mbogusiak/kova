@@ -213,13 +213,13 @@ impl WorkspaceShell {
             callback(&self.metrics);
         }
 
-        cx.notify();
-
         if self.exit_after_first_frame {
             // Defer quitting until after the current frame cycle finishes cleanly.
             window.defer(cx, |_, cx| {
                 cx.quit();
             });
+        } else {
+            cx.notify();
         }
     }
 
@@ -397,7 +397,7 @@ impl Render for WorkspaceShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         if !self.first_frame_scheduled {
             self.first_frame_scheduled = true;
-            cx.on_next_frame(window, Self::complete_first_frame);
+            cx.defer_in(window, Self::complete_first_frame);
         }
 
         let theme = cx.global::<KovaTheme>();

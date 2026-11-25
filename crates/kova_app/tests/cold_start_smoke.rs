@@ -1,23 +1,35 @@
 //! Cold-start and first-frame GPUI smoke test (requires an active GPU display server).
 //!
+//! Launches the compiled `kova` binary as a child process so `NSApplication` / GPUI
+//! initializes on the OS main thread rather than a `libtest` worker thread.
+//!
 //! Run locally on a macOS Metal or Linux Vulkan host with:
-//! `cargo test -p kova_app --test cold_start_smoke -- --ignored --nocapture`
+//! `cargo test --release -p kova_app --test cold_start_smoke -- --ignored --nocapture`
 
-use std::process::ExitCode;
-use std::time::Instant;
-
-use kova_app::{AppLaunchOptions, run_with_options};
+use std::process::Command;
 
 #[test]
 #[ignore = "requires active GPU display server"]
 fn opens_gpui_window_and_closes_within_budgets() {
-    let start = Instant::now();
-    let code = run_with_options(
-        start,
-        AppLaunchOptions {
-            exit_after_first_frame: true,
-            assert_budgets: true,
-        },
+    let bin = env!("CARGO_BIN_EXE_kova");
+    let Ok(output) = Command::new(bin)
+        .env("KOVA_STARTUP_PROBE", "1")
+        .env("KOVA_ASSERT_BUDGETS", "1")
+        .output()
+    else {
+        panic!("failed to execute kova binary at {bin}");
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "kova startup probe failed (status={:?})\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code()
     );
-    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(
+        stdout.contains("within_budget=true"),
+        "expected within_budget=true in probe output\nstdout: {stdout}\nstderr: {stderr}"
+    );
 }
