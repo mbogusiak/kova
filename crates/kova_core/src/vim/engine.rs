@@ -12,8 +12,10 @@ use std::ops::Range;
 use kova_buffer::{Buffer, BufferError, BufferSnapshot, Point};
 
 use super::motion::{
-    Lines, Motion, MotionKind, bracket_object, change_word_target, char_at, find_char, next_char,
-    on_word, operator_range, paragraph, prev_char, quote_object, word_backward, word_end_backward,
+    Motion, MotionKind, bracket_object, change_word_target, char_at, clamp_normal, col_chars,
+    ends_with_crlf_before, find_char, first_nonblank, last_row, line_end, line_end_incl,
+    line_start, line_str, match_bracket, next_char, on_word, operator_range, paragraph, pos_at_col,
+    prev_char, quote_object, row_of, starts_with_crlf_at, word_backward, word_end_backward,
     word_end_forward, word_forward, word_object,
 };
 use super::{KeyConflictPolicy, PolicyTable, VimCursorShape, VimKey, VimMode, VimOutcome};
@@ -122,16 +124,24 @@ struct InsertState {
 }
 
 #[derive(Debug, Clone)]
-struct Snap {
-    snapshot: BufferSnapshot,
-    cursor: usize,
+struct UndoEdit {
+    forward_range: Range<usize>,
+    forward_text: String,
+    inverse_range: Range<usize>,
+    inverse_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct UndoEntry {
+    edits: Vec<UndoEdit>,
+    cursor_before: usize,
+    cursor_after: usize,
 }
 
 /// Headless modal Vim engine bound to a [`Buffer`].
 #[derive(Debug)]
 pub struct VimEngine {
     buffer: Buffer,
-    text: String,
     mode: VimMode,
     cursor: usize,
     anchor: usize,
@@ -141,9 +151,10 @@ pub struct VimEngine {
     policy: PolicyTable,
     registers: HashMap<char, Register>,
     last_find: Option<(char, char)>,
-    undo: Vec<Snap>,
-    redo: Vec<Snap>,
-    checkpoint: Option<Snap>,
+    undo: Vec<UndoEntry>,
+    redo: Vec<UndoEntry>,
+    tx_cursor_before: Option<usize>,
+    tx_edits: Vec<UndoEdit>,
     dirty: bool,
     change_flag: bool,
     last_change: Vec<VimKey>,
@@ -157,10 +168,8 @@ impl VimEngine {
     /// Creates an engine editing `buffer`, starting in Normal mode at offset 0.
     #[must_use]
     pub fn new(buffer: Buffer) -> Self {
-        let text = buffer.snapshot().text();
         Self {
             buffer,
-            text,
             mode: VimMode::Normal,
             cursor: 0,
             anchor: 0,
@@ -172,7 +181,8 @@ impl VimEngine {
             last_find: None,
             undo: Vec::new(),
             redo: Vec::new(),
-            checkpoint: None,
+            tx_cursor_before: None,
+            tx_edits: Vec::new(),
             dirty: false,
             change_flag: false,
             last_change: Vec::new(),
@@ -203,8 +213,8 @@ impl VimEngine {
 
     /// Full buffer text.
     #[must_use]
-    pub fn text(&self) -> &str {
-        &self.text
+    pub fn text(&self) -> String {
+        self.buffer.snapshot().text()
     }
 
     /// Current mode.
@@ -227,14 +237,12 @@ impl VimEngine {
 
     /// Moves the cursor (e.g. after a mouse click), clamping it for the mode.
     pub fn set_cursor(&mut self, offset: usize) {
-        let mut o = offset.min(self.text.len());
-        while !self.text.is_char_boundary(o) {
-            o -= 1;
-        }
+        let snap = self.buffer.snapshot();
+        let o = snap.clamp_byte_to_char_boundary(offset);
         self.cursor = if self.mode == VimMode::Insert {
             o
         } else {
-            Lines::new(&self.text).clamp_normal(o)
+            clamp_normal(&snap, o)
         };
         self.want_col = None;
     }
@@ -335,19 +343,57 @@ impl VimEngine {
         VimOutcome::Handled
     }
 
+    /// Feeds committed text from an IME or keyboard layout (including multi-byte
+    /// UTF-8 sequences such as Polish diacritics or emoji).
+    ///
+    /// In [`VimMode::Insert`], inserts `text` at the cursor and records it for
+    /// dot-repeat. In [`VimMode::Normal`] or Visual modes, if the engine is
+    /// awaiting a character (e.g. `f{char}`, `r{char}`, `"{reg}`), consumes the
+    /// first character of `text`.
+    pub fn handle_text_input(&mut self, text: &str) -> VimOutcome {
+        if text.is_empty() {
+            return VimOutcome::Handled;
+        }
+        if self.mode == VimMode::Insert {
+            self.insert_str(text);
+            for c in text.chars() {
+                self.cmd_keys.push(VimKey::Char(c));
+            }
+            return VimOutcome::Handled;
+        }
+        if self.pending.awaiting.is_some()
+            && let Some(c) = text.chars().next()
+        {
+            return self.handle_vim_key(VimKey::Char(c));
+        }
+        VimOutcome::PassThrough
+    }
+
     // ---------------------------------------------------------------- plumbing
 
-    fn snap(&self) -> Snap {
-        Snap {
-            snapshot: self.buffer.snapshot(),
-            cursor: self.cursor,
-        }
+    fn snap(&self) -> BufferSnapshot {
+        self.buffer.snapshot()
+    }
+
+    fn slice_string(&self, range: Range<usize>) -> String {
+        self.buffer
+            .snapshot()
+            .slice_bytes(range)
+            .map(|s| s.to_string())
+            .unwrap_or_default()
     }
 
     fn replace(&mut self, range: Range<usize>, with: &str) -> bool {
+        let old_text = self.slice_string(range.clone());
         match self.buffer.apply_edit(range.clone(), with) {
             Ok(_) => {
-                self.text.replace_range(range, with);
+                let inverse_range = range.start..(range.start + with.len());
+                self.tx_edits.push(UndoEdit {
+                    forward_range: range,
+                    forward_text: with.to_string(),
+                    inverse_range,
+                    inverse_text: old_text,
+                });
                 self.dirty = true;
                 true
             }
@@ -359,14 +405,14 @@ impl VimEngine {
     }
 
     fn eol(&self) -> &'static str {
-        match self.text.find('\n') {
-            Some(i) if i > 0 && self.text.as_bytes()[i - 1] == b'\r' => "\r\n",
-            _ => "\n",
-        }
+        let snap = self.snap();
+        let e = line_end(&snap, 0);
+        let ei = line_end_incl(&snap, 0);
+        if ei >= e + 2 { "\r\n" } else { "\n" }
     }
 
     fn clamp(&self, pos: usize) -> usize {
-        Lines::new(&self.text).clamp_normal(pos)
+        clamp_normal(&self.snap(), pos)
     }
 
     fn counts(&self) -> (usize, bool) {
@@ -381,17 +427,25 @@ impl VimEngine {
 
     fn commit(&mut self) {
         if self.dirty {
-            if let Some(cp) = self.checkpoint.take() {
-                self.undo.push(cp);
-                self.redo.clear();
+            if let Some(cursor_before) = self.tx_cursor_before.take() {
+                let edits = std::mem::take(&mut self.tx_edits);
+                if !edits.is_empty() {
+                    self.undo.push(UndoEntry {
+                        edits,
+                        cursor_before,
+                        cursor_after: self.cursor,
+                    });
+                    self.redo.clear();
+                }
             }
             if self.change_flag && !self.replaying {
                 self.last_change = self.cmd_keys.clone();
             }
         }
+        self.tx_cursor_before = None;
+        self.tx_edits.clear();
         self.dirty = false;
         self.change_flag = false;
-        self.checkpoint = None;
         self.cmd_keys.clear();
         self.pending = Pending::default();
     }
@@ -399,7 +453,8 @@ impl VimEngine {
     fn cancel(&mut self) {
         self.pending = Pending::default();
         self.cmd_keys.clear();
-        self.checkpoint = None;
+        self.tx_cursor_before = None;
+        self.tx_edits.clear();
         self.change_flag = false;
     }
 
@@ -430,7 +485,8 @@ impl VimEngine {
             return;
         }
         if self.cmd_keys.is_empty() {
-            self.checkpoint = Some(self.snap());
+            self.tx_cursor_before = Some(self.cursor);
+            self.tx_edits.clear();
         }
         self.cmd_keys.push(key);
         if self.process(key) && self.mode != VimMode::Insert {
@@ -591,7 +647,7 @@ impl VimEngine {
             }
             'v' if self.mode == VimMode::Normal && self.pending.op.is_none() => {
                 if let Some((a, c, m)) = self.last_visual {
-                    let len = self.text.len();
+                    let len = self.snap().len_bytes();
                     self.anchor = a.min(len);
                     self.cursor = self.clamp(c);
                     self.mode = m;
@@ -619,11 +675,11 @@ impl VimEngine {
 
     fn linewise_op(&mut self, op: Op) -> bool {
         let (n, _) = self.counts();
-        let lines = Lines::new(&self.text);
-        let ra = lines.row_of(self.cursor);
-        let rb = (ra + n - 1).min(lines.last_row());
-        let range = lines.start(ra)..lines.end_incl(rb);
-        drop(lines);
+        let snap = self.snap();
+        let ra = row_of(&snap, self.cursor);
+        let rb = (ra + n - 1).min(last_row(&snap));
+        let range = line_start(&snap, ra)..line_end_incl(&snap, rb);
+        drop(snap);
         self.mark_change(op);
         self.apply_op(op, range, true, 1);
         true
@@ -638,19 +694,18 @@ impl VimEngine {
     // ---------------------------------------------------------------- motions
 
     fn resolve_motion(&self, name: &str, n: usize, has_count: bool) -> Option<Motion> {
-        let lines = Lines::new(&self.text);
-        let t = self.text.as_str();
+        let snap = self.snap();
         let c = self.cursor;
-        let row = lines.row_of(c);
+        let row = row_of(&snap, c);
         let big = name.chars().last().is_some_and(|x| x.is_ascii_uppercase()) && name.len() == 1;
         let excl = |target: usize| Some(Motion::new(target, MotionKind::Exclusive));
         let incl = |target: usize| Some(Motion::new(target, MotionKind::Inclusive));
         match name {
             "h" => {
-                let s = lines.start(row);
+                let s = line_start(&snap, row);
                 let mut i = c;
                 for _ in 0..n {
-                    match prev_char(t, i) {
+                    match prev_char(&snap, i) {
                         Some(p) if p >= s => i = p,
                         _ => break,
                     }
@@ -659,10 +714,10 @@ impl VimEngine {
                 excl(i)
             }
             "l" => {
-                let e = lines.end(row);
+                let e = line_end(&snap, row);
                 let mut i = c;
                 for _ in 0..n {
-                    match next_char(t, i) {
+                    match next_char(&snap, i) {
                         Some(nx) if i < e => i = nx.min(e),
                         _ => break,
                     }
@@ -672,34 +727,35 @@ impl VimEngine {
             }
             "j" | "k" => {
                 let new_row = if name == "j" {
-                    (row + n).min(lines.last_row())
+                    (row + n).min(last_row(&snap))
                 } else {
                     row.saturating_sub(n)
                 };
                 (new_row != row).then_some(())?;
-                let col = self.want_col.unwrap_or_else(|| lines.col_chars(c));
-                let mut m = Motion::new(lines.pos_at_col(new_row, col), MotionKind::Linewise);
+                let col = self.want_col.unwrap_or_else(|| col_chars(&snap, c));
+                let mut m = Motion::new(pos_at_col(&snap, new_row, col), MotionKind::Linewise);
                 m.vertical = true;
                 Some(m)
             }
-            "0" => excl(lines.start(row)),
-            "^" => excl(lines.first_nonblank(row)),
+            "0" => excl(line_start(&snap, row)),
+            "^" => excl(first_nonblank(&snap, row)),
             "$" => {
-                let r2 = (row + n - 1).min(lines.last_row());
-                let e = lines.end(r2);
-                incl(if e > lines.start(r2) {
-                    prev_char(t, e).unwrap_or(e)
+                let r2 = (row + n - 1).min(last_row(&snap));
+                let e = line_end(&snap, r2);
+                incl(if e > line_start(&snap, r2) {
+                    prev_char(&snap, e).unwrap_or(e)
                 } else {
                     e
                 })
             }
+            "%" => incl(match_bracket(&snap, c)?),
             "w" | "W" => {
-                if self.pending.op == Some(Op::Change) && on_word(t, c) {
-                    return incl(change_word_target(t, c, n, big));
+                if self.pending.op == Some(Op::Change) && on_word(&snap, c) {
+                    return incl(change_word_target(&snap, c, n, big));
                 }
                 let mut i = c;
                 for _ in 0..n {
-                    i = word_forward(t, i, big);
+                    i = word_forward(&snap, i, big);
                 }
                 let mut m = Motion::new(i, MotionKind::Exclusive);
                 m.word = true;
@@ -708,7 +764,7 @@ impl VimEngine {
             "b" | "B" => {
                 let mut i = c;
                 for _ in 0..n {
-                    i = word_backward(t, i, big);
+                    i = word_backward(&snap, i, big);
                 }
                 (i != c).then_some(())?;
                 excl(i)
@@ -716,28 +772,28 @@ impl VimEngine {
             "e" | "E" => {
                 let mut i = c;
                 for _ in 0..n {
-                    i = word_end_forward(t, i, big);
+                    i = word_end_forward(&snap, i, big);
                 }
                 incl(i)
             }
             "ge" | "gE" => {
                 let mut i = c;
                 for _ in 0..n {
-                    i = word_end_backward(t, i, name == "gE");
+                    i = word_end_backward(&snap, i, name == "gE");
                 }
                 (i != c).then_some(())?;
                 incl(i)
             }
             "gg" | "G" => {
                 let r = match (has_count, name) {
-                    (true, _) => (n - 1).min(lines.last_row()),
+                    (true, _) => (n - 1).min(last_row(&snap)),
                     (false, "gg") => 0,
-                    _ => lines.last_row(),
+                    _ => last_row(&snap),
                 };
-                Some(Motion::new(lines.first_nonblank(r), MotionKind::Linewise))
+                Some(Motion::new(first_nonblank(&snap, r), MotionKind::Linewise))
             }
             "}" | "{" => {
-                let i = paragraph(&lines, c, name == "}", n);
+                let i = paragraph(&snap, c, name == "}", n);
                 (i != c).then_some(())?;
                 let mut m = Motion::new(i, MotionKind::Exclusive);
                 m.paragraph = true;
@@ -760,14 +816,14 @@ impl VimEngine {
 
     fn apply_motion(&mut self, m: Motion) {
         if let Some(op) = self.pending.op {
-            let lines = Lines::new(&self.text);
-            let r = operator_range(&lines, self.cursor, m);
-            drop(lines);
+            let snap = self.snap();
+            let r = operator_range(&snap, self.cursor, m);
+            drop(snap);
             self.mark_change(op);
             self.apply_op(op, r.range, r.linewise, 1);
         } else {
             if m.vertical && self.want_col.is_none() {
-                self.want_col = Some(Lines::new(&self.text).col_chars(self.cursor));
+                self.want_col = Some(col_chars(&self.snap(), self.cursor));
             }
             self.cursor = self.clamp(m.target);
             if !m.vertical {
@@ -779,8 +835,11 @@ impl VimEngine {
     fn handle_await(&mut self, aw: Await, c: char) -> bool {
         match aw {
             Await::Register => {
-                if c.is_ascii_alphabetic() || c == '"' || c == '_' {
-                    self.pending.register = Some(c.to_ascii_lowercase());
+                if c.is_ascii_alphabetic()
+                    || c.is_ascii_digit()
+                    || matches!(c, '"' | '_' | '+' | '*')
+                {
+                    self.pending.register = Some(c);
                     return false;
                 }
                 true
@@ -816,9 +875,9 @@ impl VimEngine {
 
     fn find(&mut self, kind: char, ch: char, repeat: bool) -> bool {
         let (n, _) = self.counts();
-        let lines = Lines::new(&self.text);
-        let target = find_char(&lines, self.cursor, kind, ch, n, repeat);
-        drop(lines);
+        let snap = self.snap();
+        let target = find_char(&snap, self.cursor, kind, ch, n, repeat);
+        drop(snap);
         if let Some(t) = target {
             let mk = if matches!(kind, 'f' | 't') {
                 MotionKind::Inclusive
@@ -832,29 +891,31 @@ impl VimEngine {
 
     fn text_object(&mut self, inner: bool, c: char) -> bool {
         let around = !inner;
-        let t = self.text.as_str();
+        let (n, _) = self.counts();
+        let snap = self.snap();
         let pos = self.cursor;
         let range = match c {
-            'w' => word_object(t, pos, around, false),
-            'W' => word_object(t, pos, around, true),
-            '"' | '\'' | '`' => quote_object(t, pos, c, around),
-            '(' | ')' | 'b' => bracket_object(t, pos, '(', ')', around),
-            '{' | '}' | 'B' => bracket_object(t, pos, '{', '}', around),
-            '[' | ']' => bracket_object(t, pos, '[', ']', around),
-            '<' | '>' => bracket_object(t, pos, '<', '>', around),
+            'w' => word_object(&snap, pos, around, false),
+            'W' => word_object(&snap, pos, around, true),
+            '"' | '\'' | '`' => quote_object(&snap, pos, c, around),
+            '(' | ')' | 'b' => bracket_object(&snap, pos, '(', ')', n, around),
+            '{' | '}' | 'B' => bracket_object(&snap, pos, '{', '}', n, around),
+            '[' | ']' => bracket_object(&snap, pos, '[', ']', n, around),
+            '<' | '>' => bracket_object(&snap, pos, '<', '>', n, around),
             _ => None,
         };
         let Some(range) = range else {
             return true;
         };
         if self.mode.is_visual() {
-            if let Some(last) = prev_char(&self.text, range.end).filter(|l| *l >= range.start) {
+            if let Some(last) = prev_char(&snap, range.end).filter(|l| *l >= range.start) {
                 self.anchor = range.start;
                 self.cursor = last;
                 self.mode = VimMode::Visual;
             }
             return true;
         }
+        drop(snap);
         if let Some(op) = self.pending.op {
             self.mark_change(op);
             self.apply_op(op, range, false, 1);
@@ -864,7 +925,7 @@ impl VimEngine {
 
     // -------------------------------------------------------------- operators
 
-    fn store(&mut self, text: &str, linewise: bool) {
+    fn store(&mut self, text: &str, linewise: bool, is_yank: bool) {
         let mut t = text.replace("\r\n", "\n");
         if linewise && !t.ends_with('\n') {
             t.push('\n');
@@ -872,12 +933,43 @@ impl VimEngine {
         let reg = Register { text: t, linewise };
         match self.pending.register {
             Some('_') => return,
+            Some(c) if c.is_ascii_uppercase() => {
+                let lower = c.to_ascii_lowercase();
+                let combined = if let Some(existing) = self.registers.get_mut(&lower) {
+                    if linewise && !existing.text.ends_with('\n') && !existing.text.is_empty() {
+                        existing.text.push('\n');
+                    }
+                    existing.text.push_str(&reg.text);
+                    existing.linewise |= linewise;
+                    existing.clone()
+                } else {
+                    self.registers.insert(lower, reg.clone());
+                    reg
+                };
+                self.registers.insert('"', combined);
+                return;
+            }
             Some(n) if n != '"' => {
                 self.registers.insert(n, reg.clone());
+                self.registers.insert('"', reg);
+                return;
             }
             _ => {}
         }
-        self.registers.insert('"', reg);
+        self.registers.insert('"', reg.clone());
+        if is_yank {
+            self.registers.insert('0', reg);
+        } else {
+            for d in ('1'..='8').rev() {
+                let next = char::from(d as u8 + 1);
+                if let Some(prev) = self.registers.remove(&d) {
+                    self.registers.insert(next, prev);
+                } else {
+                    self.registers.remove(&next);
+                }
+            }
+            self.registers.insert('1', reg);
+        }
     }
 
     fn apply_op(&mut self, op: Op, range: Range<usize>, linewise: bool, times: usize) {
@@ -887,8 +979,8 @@ impl VimEngine {
                 if linewise {
                     self.delete_lines(range);
                 } else if !range.is_empty() {
-                    let s = self.text[range.clone()].to_string();
-                    self.store(&s, false);
+                    let s = self.slice_string(range.clone());
+                    self.store(&s, false, false);
                     let start = range.start;
                     self.replace(range, "");
                     self.cursor = self.clamp(start);
@@ -902,35 +994,35 @@ impl VimEngine {
     }
 
     fn op_yank(&mut self, range: &Range<usize>, linewise: bool) {
-        let s = self.text[range.clone()].to_string();
-        self.store(&s, linewise);
-        let lines = Lines::new(&self.text);
-        let ra = lines.row_of(range.start);
+        let s = self.slice_string(range.clone());
+        self.store(&s, linewise, true);
+        let snap = self.snap();
+        let ra = row_of(&snap, range.start);
         let new_cursor = if linewise {
-            if lines.row_of(self.cursor) == ra {
+            if row_of(&snap, self.cursor) == ra {
                 self.cursor
             } else {
-                lines.pos_at_col(ra, lines.col_chars(self.cursor))
+                pos_at_col(&snap, ra, col_chars(&snap, self.cursor))
             }
         } else {
             range.start.min(self.cursor)
         };
-        drop(lines);
+        drop(snap);
         self.cursor = self.clamp(new_cursor);
     }
 
     fn op_change(&mut self, range: Range<usize>, linewise: bool) {
         let start = range.start;
         let kill = if linewise {
-            let lines = Lines::new(&self.text);
-            let rb = lines.row_of(range.end.saturating_sub(1).max(range.start));
-            range.start..lines.end(rb)
+            let snap = self.snap();
+            let rb = row_of(&snap, range.end.saturating_sub(1).max(range.start));
+            range.start..line_end(&snap, rb)
         } else {
             range.clone()
         };
         if !range.is_empty() {
-            let s = self.text[range.clone()].to_string();
-            self.store(&s, linewise);
+            let s = self.slice_string(range);
+            self.store(&s, linewise, false);
         }
         if !kill.is_empty() {
             self.replace(kill, "");
@@ -940,31 +1032,35 @@ impl VimEngine {
     }
 
     fn delete_lines(&mut self, range: Range<usize>) {
-        let s = self.text[range.clone()].to_string();
-        self.store(&s, true);
-        let len = self.text.len();
+        let s = self.slice_string(range.clone());
+        self.store(&s, true, false);
+        let snap = self.snap();
+        let len = snap.len_bytes();
         let mut del = range.clone();
         if range.end == len && range.start > 0 && !s.ends_with('\n') {
-            let sep = if self.text[..range.start].ends_with("\r\n") {
+            let sep = if ends_with_crlf_before(&snap, range.start) {
                 2
             } else {
                 1
             };
             del = range.start - sep..len;
         }
+        drop(snap);
         let start = del.start;
         self.replace(del, "");
-        let lines = Lines::new(&self.text);
-        let row = lines.row_of(start).min(lines.last_row());
-        self.cursor = lines.first_nonblank(row);
+        let snap = self.snap();
+        let row = row_of(&snap, start).min(last_row(&snap));
+        self.cursor = first_nonblank(&snap, row);
     }
 
     fn shift_range(&mut self, range: &Range<usize>, indent: bool, times: usize) {
-        let lines = Lines::new(&self.text);
-        let ra = lines.row_of(range.start);
-        let rb = lines.row_of(range.end.saturating_sub(1).max(range.start));
-        let rows: Vec<(usize, usize)> = (ra..=rb).map(|r| (lines.start(r), lines.end(r))).collect();
-        drop(lines);
+        let snap = self.snap();
+        let ra = row_of(&snap, range.start);
+        let rb = row_of(&snap, range.end.saturating_sub(1).max(range.start));
+        let rows: Vec<(usize, usize)> = (ra..=rb)
+            .map(|r| (line_start(&snap, r), line_end(&snap, r)))
+            .collect();
+        drop(snap);
         let amount = SHIFT_WIDTH * times.max(1);
         for (s, e) in rows.into_iter().rev() {
             if indent {
@@ -974,7 +1070,8 @@ impl VimEngine {
             } else {
                 let mut removed = 0;
                 let mut end = s;
-                for b in self.text[s..e].chars() {
+                let line = self.slice_string(s..e);
+                for b in line.chars() {
                     if b == ' ' && removed < amount {
                         removed += 1;
                         end += 1;
@@ -988,13 +1085,14 @@ impl VimEngine {
                 self.replace(s..end, "");
             }
         }
-        let lines = Lines::new(&self.text);
-        self.cursor = lines.first_nonblank(ra.min(lines.last_row()));
+        let snap = self.snap();
+        self.cursor = first_nonblank(&snap, ra.min(last_row(&snap)));
     }
 
     fn case_range(&mut self, op: Op, range: Range<usize>) {
         let start = range.start;
-        let new: String = self.text[range.clone()]
+        let new: String = self
+            .slice_string(range.clone())
             .chars()
             .flat_map(|c| convert_case(op, c))
             .collect();
@@ -1063,20 +1161,21 @@ impl VimEngine {
 
     fn start_insert(&mut self, ch: char, n: usize) {
         self.change_flag = true;
-        let lines = Lines::new(&self.text);
-        let row = lines.row_of(self.cursor);
-        let (s, e) = (lines.start(row), lines.end(row));
-        let first = lines.first_nonblank(row);
+        let snap = self.snap();
+        let row = row_of(&snap, self.cursor);
+        let (s, e) = (line_start(&snap, row), line_end(&snap, row));
+        let first = first_nonblank(&snap, row);
         let first_raw = if first < s { s } else { first };
-        drop(lines);
+        let next_pos = if ch == 'a' && self.cursor < e {
+            next_char(&snap, self.cursor).unwrap_or(e).min(e)
+        } else {
+            self.cursor
+        };
+        drop(snap);
         let eol = self.eol();
         let mut kind = InsertKind::Plain;
         match ch {
-            'a' => {
-                if self.cursor < e {
-                    self.cursor = next_char(&self.text, self.cursor).unwrap_or(e).min(e);
-                }
-            }
+            'a' => self.cursor = next_pos,
             'I' => self.cursor = first_raw,
             'A' => self.cursor = e,
             'o' => {
@@ -1098,30 +1197,31 @@ impl VimEngine {
         let (n, _) = self.counts();
         let times = n.max(2) - 1;
         for _ in 0..times {
-            let lines = Lines::new(&self.text);
-            let row = lines.row_of(self.cursor);
-            if row >= lines.last_row() {
+            let snap = self.snap();
+            let row = row_of(&snap, self.cursor);
+            if row >= last_row(&snap) {
                 break;
             }
-            let e = lines.end(row);
-            let next_start = lines.start(row + 1);
-            let next_end = lines.end(row + 1);
+            let e = line_end(&snap, row);
+            let next_start = line_start(&snap, row + 1);
+            let next_end = line_end(&snap, row + 1);
             let mut ws_end = next_start;
             if spaced {
-                ws_end += self.text[next_start..next_end]
+                let next_line = line_str(&snap, row + 1);
+                ws_end += next_line
                     .chars()
                     .take_while(|c| *c == ' ' || *c == '\t')
                     .map(char::len_utf8)
                     .sum::<usize>();
             }
-            let cur_empty = e == lines.start(row);
-            let ends_ws = self.text[..e]
-                .chars()
-                .next_back()
+            let cur_empty = e == line_start(&snap, row);
+            let ends_ws = prev_char(&snap, e)
+                .filter(|&p| p >= line_start(&snap, row))
+                .and_then(|p| char_at(&snap, p))
                 .is_some_and(char::is_whitespace);
             let next_empty = ws_end >= next_end;
-            let starts_paren = char_at(&self.text, ws_end) == Some(')');
-            drop(lines);
+            let starts_paren = char_at(&snap, ws_end) == Some(')');
+            drop(snap);
             let sep = if spaced && !(cur_empty || ends_ws || next_empty || starts_paren) {
                 " "
             } else {
@@ -1137,7 +1237,8 @@ impl VimEngine {
         let (n, _) = self.counts();
         if self.mode.is_visual() {
             let (range, _) = self.visual_range();
-            let new: String = self.text[range.clone()]
+            let new: String = self
+                .slice_string(range.clone())
                 .chars()
                 .map(|x| if x == '\n' || x == '\r' { x } else { c })
                 .collect();
@@ -1148,14 +1249,15 @@ impl VimEngine {
             return;
         }
         self.change_flag = true;
-        let lines = Lines::new(&self.text);
-        let row = lines.row_of(self.cursor);
-        let e = lines.end(row);
-        drop(lines);
-        let chars: Vec<usize> = self.text[self.cursor..e]
-            .char_indices()
-            .map(|(i, _)| i)
-            .collect();
+        let snap = self.snap();
+        let row = row_of(&snap, self.cursor);
+        let e = line_end(&snap, row);
+        let tail = snap
+            .slice_bytes(self.cursor..e)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        drop(snap);
+        let chars: Vec<usize> = tail.char_indices().map(|(i, _)| i).collect();
         if chars.len() < n || chars.is_empty() {
             return;
         }
@@ -1175,17 +1277,17 @@ impl VimEngine {
 
     fn tilde(&mut self, n: usize) {
         self.change_flag = true;
-        let lines = Lines::new(&self.text);
-        let row = lines.row_of(self.cursor);
-        let e = lines.end(row);
-        drop(lines);
+        let snap = self.snap();
+        let row = row_of(&snap, self.cursor);
+        let e = line_end(&snap, row);
         let mut end = self.cursor;
         for _ in 0..n {
-            match next_char(&self.text, end) {
+            match next_char(&snap, end) {
                 Some(nx) if end < e => end = nx.min(e),
                 _ => break,
             }
         }
+        drop(snap);
         if end == self.cursor {
             return;
         }
@@ -1196,19 +1298,34 @@ impl VimEngine {
 
     fn paste(&mut self, after: bool, n: usize) {
         let name = self.pending.register.unwrap_or('"');
-        let Some(reg) = self.registers.get(&name).cloned() else {
+        let lookup = if name.is_ascii_uppercase() {
+            name.to_ascii_lowercase()
+        } else {
+            name
+        };
+        let Some(reg) = self.registers.get(&lookup).cloned() else {
             return;
         };
         let eol = self.eol();
         let body = reg.text.replace('\n', eol);
-        let lines = Lines::new(&self.text);
-        let row = lines.row_of(self.cursor);
-        let (s, e, ei) = (lines.start(row), lines.end(row), lines.end_incl(row));
-        drop(lines);
+        let snap = self.snap();
+        let row = row_of(&snap, self.cursor);
+        let (s, e, ei) = (
+            line_start(&snap, row),
+            line_end(&snap, row),
+            line_end_incl(&snap, row),
+        );
+        let len_bytes = snap.len_bytes();
+        let next_after = if after && self.cursor < e {
+            next_char(&snap, self.cursor).unwrap_or(e)
+        } else {
+            self.cursor
+        };
+        drop(snap);
         if reg.linewise {
             let chunk = body.repeat(n);
             let (at, ins) = if after {
-                if ei == self.text.len() && e == ei {
+                if ei == len_bytes && e == ei {
                     (ei, format!("{eol}{}", chunk.trim_end_matches(eol)))
                 } else {
                     (ei, chunk)
@@ -1222,20 +1339,17 @@ impl VimEngine {
                 at
             };
             self.replace(at..at, &ins);
-            let lines = Lines::new(&self.text);
-            self.cursor = lines.first_nonblank(lines.row_of(first_line_at));
+            let snap = self.snap();
+            self.cursor = first_nonblank(&snap, row_of(&snap, first_line_at));
         } else {
-            let at = if after && self.cursor < e {
-                next_char(&self.text, self.cursor).unwrap_or(e)
-            } else {
-                self.cursor
-            };
+            let at = next_after;
             let ins = body.repeat(n);
             self.replace(at..at, &ins);
+            let snap = self.snap();
             self.cursor = if ins.contains('\n') {
                 at
             } else {
-                self.clamp(prev_char(&self.text, at + ins.len()).unwrap_or(at))
+                clamp_normal(&snap, prev_char(&snap, at + ins.len()).unwrap_or(at))
             };
         }
         self.want_col = None;
@@ -1249,17 +1363,17 @@ impl VimEngine {
         } else {
             (self.cursor, self.anchor)
         };
-        let lines = Lines::new(&self.text);
+        let snap = self.snap();
         if self.mode == VimMode::VisualLine {
             return (
-                lines.start(lines.row_of(a))..lines.end_incl(lines.row_of(b)),
+                line_start(&snap, row_of(&snap, a))..line_end_incl(&snap, row_of(&snap, b)),
                 true,
             );
         }
-        let end = if self.text[b..].starts_with("\r\n") {
+        let end = if starts_with_crlf_at(&snap, b) {
             b + 2
         } else {
-            next_char(&self.text, b).unwrap_or(b)
+            next_char(&snap, b).unwrap_or(b)
         };
         (a..end, false)
     }
@@ -1325,13 +1439,13 @@ impl VimEngine {
 
     fn visual_join(&mut self) {
         let (range, _) = self.visual_range();
-        let lines = Lines::new(&self.text);
+        let snap = self.snap();
         let (ra, rb) = (
-            lines.row_of(range.start),
-            lines.row_of(range.end.saturating_sub(1).max(range.start)),
+            row_of(&snap, range.start),
+            row_of(&snap, range.end.saturating_sub(1).max(range.start)),
         );
-        let start = lines.start(ra);
-        drop(lines);
+        let start = line_start(&snap, ra);
+        drop(snap);
         self.exit_visual();
         self.cursor = start;
         self.pending.count = Some(rb - ra + 1);
@@ -1341,14 +1455,19 @@ impl VimEngine {
 
     fn visual_paste(&mut self) {
         let name = self.pending.register.unwrap_or('"');
-        let Some(reg) = self.registers.get(&name).cloned() else {
+        let lookup = if name.is_ascii_uppercase() {
+            name.to_ascii_lowercase()
+        } else {
+            name
+        };
+        let Some(reg) = self.registers.get(&lookup).cloned() else {
             return;
         };
         let (range, line_sel) = self.visual_range();
         let eol = self.eol();
         let mut body = reg.text.replace('\n', eol);
         self.exit_visual();
-        let replaced = self.text[range.clone()].to_string();
+        let replaced = self.slice_string(range.clone());
         if reg.linewise && !line_sel {
             body = format!("{eol}{body}");
         } else if !reg.linewise && line_sel {
@@ -1357,12 +1476,13 @@ impl VimEngine {
         let start = range.start;
         self.replace(range, &body);
         self.pending.register = None;
-        self.store(&replaced, line_sel);
+        self.store(&replaced, line_sel, false);
         let end = start + body.len();
+        let snap = self.snap();
         self.cursor = if reg.linewise || body.contains('\n') {
-            self.clamp(start)
+            clamp_normal(&snap, start)
         } else {
-            self.clamp(prev_char(&self.text, end).unwrap_or(start))
+            clamp_normal(&snap, prev_char(&snap, end).unwrap_or(start))
         };
     }
 
@@ -1392,11 +1512,13 @@ impl VimEngine {
             VimKey::Ctrl('w') => self.insert_delete_word(),
             VimKey::Delete => {
                 let at = self.cursor;
-                let end = if self.text[at..].starts_with("\r\n") {
+                let snap = self.snap();
+                let end = if starts_with_crlf_at(&snap, at) {
                     at + 2
                 } else {
-                    next_char(&self.text, at).unwrap_or(at)
+                    next_char(&snap, at).unwrap_or(at)
                 };
+                drop(snap);
                 self.replace(at..end, "");
             }
             VimKey::Left
@@ -1416,11 +1538,13 @@ impl VimEngine {
         if at == 0 {
             return;
         }
-        let start = if self.text[..at].ends_with("\r\n") {
+        let snap = self.snap();
+        let start = if ends_with_crlf_before(&snap, at) {
             at - 2
         } else {
-            prev_char(&self.text, at).unwrap_or(at)
+            prev_char(&snap, at).unwrap_or(at)
         };
+        drop(snap);
         if self.replace(start..at, "") {
             self.cursor = start;
             if let Some(ins) = self.insert.as_mut() {
@@ -1431,18 +1555,18 @@ impl VimEngine {
 
     fn insert_delete_word(&mut self) {
         let at = self.cursor;
-        let lines = Lines::new(&self.text);
-        let ls = lines.start(lines.row_of(at));
-        drop(lines);
+        let snap = self.snap();
+        let ls = line_start(&snap, row_of(&snap, at));
         let target = if at == ls {
-            at.saturating_sub(if self.text[..at].ends_with("\r\n") {
+            at.saturating_sub(if ends_with_crlf_before(&snap, at) {
                 2
             } else {
                 1
             })
         } else {
-            word_backward(&self.text, at, false).max(ls)
+            word_backward(&snap, at, false).max(ls)
         };
+        drop(snap);
         if target < at && self.replace(target..at, "") {
             self.cursor = target;
             if let Some(ins) = self.insert.as_mut() {
@@ -1452,26 +1576,26 @@ impl VimEngine {
     }
 
     fn insert_move(&mut self, key: VimKey) {
-        let lines = Lines::new(&self.text);
-        let row = lines.row_of(self.cursor);
-        let (s, e) = (lines.start(row), lines.end(row));
+        let snap = self.snap();
+        let row = row_of(&snap, self.cursor);
+        let (s, e) = (line_start(&snap, row), line_end(&snap, row));
         let new = match key {
-            VimKey::Left => prev_char(&self.text, self.cursor).filter(|p| *p >= s),
-            VimKey::Right => next_char(&self.text, self.cursor).filter(|_| self.cursor < e),
+            VimKey::Left => prev_char(&snap, self.cursor).filter(|p| *p >= s),
+            VimKey::Right => next_char(&snap, self.cursor).filter(|_| self.cursor < e),
             VimKey::Home => Some(s),
             VimKey::End => Some(e),
             VimKey::Up | VimKey::Down => {
                 let target = if key == VimKey::Up {
                     row.checked_sub(1)
                 } else {
-                    Some(row + 1).filter(|r| *r <= lines.last_row())
+                    Some(row + 1).filter(|r| *r <= last_row(&snap))
                 };
                 target.map(|r| {
-                    let col = lines.col_chars(self.cursor);
-                    let p = lines.pos_at_col(r, col);
+                    let col = col_chars(&snap, self.cursor);
+                    let p = pos_at_col(&snap, r, col);
                     // `pos_at_col` clamps to the last char; allow end-of-line.
-                    if col >= lines.text()[lines.start(r)..lines.end(r)].chars().count() {
-                        lines.end(r)
+                    if col >= line_str(&snap, r).chars().count() {
+                        line_end(&snap, r)
                     } else {
                         p
                     }
@@ -1479,7 +1603,7 @@ impl VimEngine {
             }
             _ => None,
         };
-        drop(lines);
+        drop(snap);
         if let Some(p) = new {
             self.cursor = p;
             if let Some(ins) = self.insert.as_mut() {
@@ -1509,48 +1633,50 @@ impl VimEngine {
             }
         }
         self.mode = VimMode::Normal;
-        let lines = Lines::new(&self.text);
-        let ls = lines.start(lines.row_of(self.cursor));
-        drop(lines);
+        let snap = self.snap();
+        let ls = line_start(&snap, row_of(&snap, self.cursor));
         if self.cursor > ls {
-            self.cursor = prev_char(&self.text, self.cursor)
-                .unwrap_or(self.cursor)
-                .max(ls);
+            self.cursor = prev_char(&snap, self.cursor).unwrap_or(self.cursor).max(ls);
         }
-        self.cursor = self.clamp(self.cursor);
+        self.cursor = clamp_normal(&snap, self.cursor);
+        drop(snap);
         self.want_col = None;
         self.commit();
     }
 
     // ----------------------------------------------------------------- undo/redo
 
-    fn restore(&mut self, snap: &Snap) {
-        let new = snap.snapshot.text();
-        let len = self.text.len();
-        self.replace(0..len, &new);
-        self.cursor = self.clamp(snap.cursor);
-        self.dirty = false;
-    }
-
     fn undo_once(&mut self) {
-        if let Some(prev) = self.undo.pop() {
-            let current = Snap {
-                snapshot: self.buffer.snapshot(),
-                cursor: self.cursor,
-            };
-            self.redo.push(current);
-            self.restore(&prev);
+        if let Some(entry) = self.undo.pop() {
+            for edit in entry.edits.iter().rev() {
+                if let Err(e) = self
+                    .buffer
+                    .apply_edit(edit.inverse_range.clone(), &edit.inverse_text)
+                {
+                    self.last_error = Some(e);
+                    break;
+                }
+            }
+            self.cursor = self.clamp(entry.cursor_before);
+            self.redo.push(entry);
+            self.dirty = false;
         }
     }
 
     fn redo_once(&mut self) {
-        if let Some(next) = self.redo.pop() {
-            let current = Snap {
-                snapshot: self.buffer.snapshot(),
-                cursor: self.cursor,
-            };
-            self.undo.push(current);
-            self.restore(&next);
+        if let Some(entry) = self.redo.pop() {
+            for edit in &entry.edits {
+                if let Err(e) = self
+                    .buffer
+                    .apply_edit(edit.forward_range.clone(), &edit.forward_text)
+                {
+                    self.last_error = Some(e);
+                    break;
+                }
+            }
+            self.cursor = self.clamp(entry.cursor_after);
+            self.undo.push(entry);
+            self.dirty = false;
         }
     }
 }
@@ -1570,6 +1696,7 @@ fn motion_name(ch: char) -> Option<&'static str> {
         '0' => "0",
         '^' => "^",
         '$' => "$",
+        '%' => "%",
         'G' => "G",
         '{' => "{",
         '}' => "}",

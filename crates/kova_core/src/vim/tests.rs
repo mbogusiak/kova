@@ -19,7 +19,7 @@ fn ed(start: &str, keys: &str) -> String {
     let mut e = VimEngine::from_text(&text);
     e.set_cursor(pos);
     e.feed(keys);
-    let mut out = e.text().to_string();
+    let mut out = e.text();
     out.insert(e.cursor(), '|');
     out
 }
@@ -760,9 +760,87 @@ fn from_char_decodes_scripts() {
 
 #[test]
 fn performance_smoke_large_buffer() {
-    let text = "let x = foo(bar, baz);\n".repeat(5_000);
+    let text = "let x = foo(bar, baz);\n".repeat(100_000);
     let mut e = VimEngine::from_text(&text);
     let start = std::time::Instant::now();
-    e.feed("Gddggwdwj.");
-    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    e.feed("Gddggwdwju.");
+    assert!(start.elapsed() < std::time::Duration::from_millis(250));
+}
+
+#[test]
+fn percent_bracket_matching() {
+    assert_eq!(ed("|foo(a(b)c)", "%"), "foo(a(b)c|)");
+    assert_eq!(ed("foo(a(b)c|)", "%"), "foo|(a(b)c)");
+    assert_eq!(ed("foo|(a(b)c)", "d%"), "fo|o");
+    assert_eq!(ed("foo|(a(b)c)", "c%X\u{1b}"), "foo|X");
+    assert_eq!(ed("{\n  [x]\n|}", "%"), "|{\n  [x]\n}");
+    assert_eq!(ed("foo|(a(b)c)", "v%d"), "fo|o");
+    assert_eq!(ed("|abc", "%"), "|abc");
+}
+
+#[test]
+fn registers_numbered_append_and_clipboard() {
+    let mut e = VimEngine::from_text("first\nsecond\nthird");
+    e.feed("yy");
+    assert_eq!(e.register('0').map(|r| r.text.as_str()), Some("first\n"));
+    assert_eq!(e.register('"').map(|r| r.text.as_str()), Some("first\n"));
+
+    e.feed("jdd");
+    // `dd` shifts into "1 without overwriting "0.
+    assert_eq!(e.register('0').map(|r| r.text.as_str()), Some("first\n"));
+    assert_eq!(e.register('1').map(|r| r.text.as_str()), Some("second\n"));
+    assert_eq!(e.register('"').map(|r| r.text.as_str()), Some("second\n"));
+
+    e.feed("dd");
+    assert_eq!(e.register('1').map(|r| r.text.as_str()), Some("third\n"));
+    assert_eq!(e.register('2').map(|r| r.text.as_str()), Some("second\n"));
+    assert_eq!(e.register('0').map(|r| r.text.as_str()), Some("first\n"));
+
+    // Uppercase register appends to lowercase register.
+    let mut e = VimEngine::from_text("alpha beta gamma");
+    e.feed("\"adw\"Adw");
+    assert_eq!(
+        e.register('a').map(|r| r.text.as_str()),
+        Some("alpha beta ")
+    );
+    assert_eq!(
+        e.register('"').map(|r| r.text.as_str()),
+        Some("alpha beta ")
+    );
+
+    // `+` and `*` clipboard registers.
+    let mut e = VimEngine::from_text("hello");
+    e.feed("\"+yy\"+p");
+    assert_eq!(e.register('+').map(|r| r.text.as_str()), Some("hello\n"));
+    assert_eq!(e.text(), "hello\nhello");
+    e.feed("\"*yy\"*p");
+    assert_eq!(e.register('*').map(|r| r.text.as_str()), Some("hello\n"));
+    assert_eq!(e.text(), "hello\nhello\nhello");
+}
+
+#[test]
+fn count_in_bracket_text_objects() {
+    assert_eq!(ed("{outer {in|ner} end}", "2di{"), "{|}");
+    assert_eq!(ed("f(a(b|c)d)", "2ci(Z\u{1b}"), "f(|Z)");
+    assert_eq!(ed("[[x|y]]", "2da["), "|");
+}
+
+#[test]
+fn handle_text_input_ime_and_await() {
+    let mut e = VimEngine::from_text("bąk");
+    // Normal mode not awaiting -> PassThrough.
+    assert_eq!(e.handle_text_input("ą"), VimOutcome::PassThrough);
+    // `f` + IME `ą`.
+    e.feed("f");
+    assert_eq!(e.handle_text_input("ą"), VimOutcome::Handled);
+    assert_eq!(e.cursor(), 1);
+    // `r` + IME `ż`.
+    e.feed("r");
+    assert_eq!(e.handle_text_input("ż"), VimOutcome::Handled);
+    assert_eq!(e.text(), "bżk");
+    // Insert mode multi-byte IME string + dot-repeat.
+    e.feed("A");
+    assert_eq!(e.handle_text_input(" żółć🚀"), VimOutcome::Handled);
+    e.feed(ESC);
+    assert_eq!(e.text(), "bżk żółć🚀");
 }

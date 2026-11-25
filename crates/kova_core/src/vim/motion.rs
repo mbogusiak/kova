@@ -1,7 +1,8 @@
 //! Pure text geometry, motions and text objects for the Vim engine.
 //!
-//! Everything here operates on a `&str` and UTF-8 byte offsets that lie on
-//! `char` boundaries. Line terminators (`\n` and `\r\n`) are never split.
+//! Everything here operates on a [`BufferSnapshot`] in $O(\log N + \text{line\_len})$
+//! time and UTF-8 byte offsets that lie on `char` boundaries. Line terminators
+//! (`\n` and `\r\n`) are never split.
 
 #![allow(
     clippy::many_single_char_names,
@@ -9,130 +10,159 @@
     reason = "text-geometry code uses conventional short names (s/e/c/i) and one large motion table"
 )]
 
+use std::borrow::Cow;
 use std::ops::Range;
 
-/// Line index of a text, following Vim semantics: a trailing line terminator
-/// does not start an additional line.
-#[derive(Debug)]
-pub(crate) struct Lines<'a> {
-    text: &'a str,
-    starts: Vec<usize>,
+use kova_buffer::BufferSnapshot;
+
+/// Last 0-based line index following Vim semantics: a trailing line
+/// terminator does not start an additional empty line.
+pub(crate) fn last_row(snap: &BufferSnapshot) -> usize {
+    let len = snap.len_bytes();
+    if len == 0 {
+        return 0;
+    }
+    let rope_lines = snap.len_lines();
+    if snap.rope().get_byte(len - 1) == Some(b'\n') {
+        rope_lines.saturating_sub(2)
+    } else {
+        rope_lines.saturating_sub(1)
+    }
 }
 
-impl<'a> Lines<'a> {
-    pub(crate) fn new(text: &'a str) -> Self {
-        let mut starts = vec![0];
-        for (i, b) in text.bytes().enumerate() {
-            if b == b'\n' && i + 1 < text.len() {
-                starts.push(i + 1);
-            }
-        }
-        Self { text, starts }
-    }
+pub(crate) fn row_of(snap: &BufferSnapshot, pos: usize) -> usize {
+    let pos = pos.min(snap.len_bytes());
+    snap.rope().byte_to_line(pos).min(last_row(snap))
+}
 
-    pub(crate) fn text(&self) -> &'a str {
-        self.text
-    }
+pub(crate) fn line_start(snap: &BufferSnapshot, row: usize) -> usize {
+    let row = row.min(last_row(snap));
+    snap.rope().line_to_byte(row)
+}
 
-    #[cfg(test)]
-    pub(crate) fn count(&self) -> usize {
-        self.starts.len()
+/// Start of the next line (or text length), i.e. end including terminator.
+pub(crate) fn line_end_incl(snap: &BufferSnapshot, row: usize) -> usize {
+    let lr = last_row(snap);
+    if row < lr {
+        snap.rope().line_to_byte(row + 1)
+    } else {
+        snap.len_bytes()
     }
+}
 
-    pub(crate) fn last_row(&self) -> usize {
-        self.starts.len() - 1
-    }
-
-    pub(crate) fn start(&self, row: usize) -> usize {
-        self.starts[row.min(self.last_row())]
-    }
-
-    /// Start of the next line (or text length), i.e. end including terminator.
-    pub(crate) fn end_incl(&self, row: usize) -> usize {
-        if row < self.last_row() {
-            self.starts[row + 1]
-        } else {
-            self.text.len()
-        }
-    }
-
-    /// End of the line content, excluding the terminator.
-    pub(crate) fn end(&self, row: usize) -> usize {
-        let s = self.start(row);
-        let mut e = self.end_incl(row);
-        if e > s && self.text.as_bytes()[e - 1] == b'\n' {
+/// End of the line content, excluding the terminator.
+pub(crate) fn line_end(snap: &BufferSnapshot, row: usize) -> usize {
+    let s = line_start(snap, row);
+    let mut e = line_end_incl(snap, row);
+    let rope = snap.rope();
+    if e > s && rope.get_byte(e - 1) == Some(b'\n') {
+        e -= 1;
+        if e > s && rope.get_byte(e - 1) == Some(b'\r') {
             e -= 1;
-            if e > s && self.text.as_bytes()[e - 1] == b'\r' {
-                e -= 1;
-            }
         }
-        e
     }
-
-    pub(crate) fn row_of(&self, pos: usize) -> usize {
-        self.starts
-            .partition_point(|&s| s <= pos)
-            .saturating_sub(1)
-            .min(self.last_row())
-    }
-
-    pub(crate) fn first_nonblank(&self, row: usize) -> usize {
-        let s = self.start(row);
-        let e = self.end(row);
-        let off = self.text[s..e]
-            .char_indices()
-            .find(|(_, c)| *c != ' ' && *c != '\t')
-            .map_or(e, |(i, _)| s + i);
-        self.clamp_normal(off)
-    }
-
-    pub(crate) fn col_chars(&self, pos: usize) -> usize {
-        let row = self.row_of(pos);
-        self.text[self.start(row)..pos.max(self.start(row))]
-            .chars()
-            .count()
-    }
-
-    /// Position of the `col`-th char of `row`, clamped to the last char.
-    pub(crate) fn pos_at_col(&self, row: usize, col: usize) -> usize {
-        let s = self.start(row);
-        let e = self.end(row);
-        let mut last = s;
-        for (n, (i, _)) in self.text[s..e].char_indices().enumerate() {
-            last = s + i;
-            if n == col {
-                return last;
-            }
-        }
-        last
-    }
-
-    /// Clamps `pos` so it denotes a char (not a terminator) unless the line is empty.
-    pub(crate) fn clamp_normal(&self, pos: usize) -> usize {
-        let pos = pos.min(self.text.len());
-        let row = self.row_of(pos);
-        let (s, e) = (self.start(row), self.end(row));
-        if e == s || pos < s {
-            return s;
-        }
-        if pos >= e {
-            return prev_char(self.text, e).unwrap_or(s);
-        }
-        pos
-    }
+    e
 }
 
-pub(crate) fn char_at(text: &str, pos: usize) -> Option<char> {
-    text.get(pos..).and_then(|t| t.chars().next())
+/// Content of line `row` (excluding terminator) without allocating when contiguous.
+pub(crate) fn line_str(snap: &BufferSnapshot, row: usize) -> Cow<'_, str> {
+    let row = row.min(last_row(snap));
+    let Ok(slice) = snap.line_slice(row) else {
+        return Cow::Borrowed("");
+    };
+    slice
+        .as_str()
+        .map_or_else(|| Cow::Owned(slice.to_string()), Cow::Borrowed)
 }
 
-pub(crate) fn next_char(text: &str, pos: usize) -> Option<usize> {
-    char_at(text, pos).map(|c| pos + c.len_utf8())
+pub(crate) fn first_nonblank(snap: &BufferSnapshot, row: usize) -> usize {
+    let s = line_start(snap, row);
+    let e = line_end(snap, row);
+    let line = line_str(snap, row);
+    let off = line
+        .char_indices()
+        .find(|(_, c)| *c != ' ' && *c != '\t')
+        .map_or(e, |(i, _)| s + i);
+    clamp_normal(snap, off)
 }
 
-pub(crate) fn prev_char(text: &str, pos: usize) -> Option<usize> {
-    text.get(..pos)
-        .and_then(|t| t.char_indices().next_back().map(|(i, _)| i))
+pub(crate) fn col_chars(snap: &BufferSnapshot, pos: usize) -> usize {
+    let row = row_of(snap, pos);
+    let s = line_start(snap, row);
+    let clamped = pos.max(s).min(snap.len_bytes());
+    let rope = snap.rope();
+    rope.byte_to_char(clamped)
+        .saturating_sub(rope.byte_to_char(s))
+}
+
+/// Position of the `col`-th char of `row`, clamped to the last char.
+pub(crate) fn pos_at_col(snap: &BufferSnapshot, row: usize, col: usize) -> usize {
+    let s = line_start(snap, row);
+    let e = line_end(snap, row);
+    if e <= s {
+        return s;
+    }
+    let rope = snap.rope();
+    let sc = rope.byte_to_char(s);
+    let ec = rope.byte_to_char(e);
+    if ec <= sc {
+        return s;
+    }
+    let target_ci = (sc.saturating_add(col)).min(ec - 1);
+    rope.char_to_byte(target_ci)
+}
+
+/// Clamps `pos` so it denotes a char (not a terminator) unless the line is empty.
+pub(crate) fn clamp_normal(snap: &BufferSnapshot, pos: usize) -> usize {
+    let pos = snap.clamp_byte_to_char_boundary(pos);
+    let row = row_of(snap, pos);
+    let (s, e) = (line_start(snap, row), line_end(snap, row));
+    if e == s || pos < s {
+        return s;
+    }
+    if pos >= e {
+        return prev_char(snap, e).unwrap_or(s);
+    }
+    pos
+}
+
+pub(crate) fn char_at(snap: &BufferSnapshot, pos: usize) -> Option<char> {
+    if pos >= snap.len_bytes() {
+        return None;
+    }
+    let rope = snap.rope();
+    let ci = rope.byte_to_char(pos);
+    if rope.char_to_byte(ci) != pos {
+        return None;
+    }
+    rope.get_char(ci)
+}
+
+pub(crate) fn next_char(snap: &BufferSnapshot, pos: usize) -> Option<usize> {
+    char_at(snap, pos).map(|c| pos + c.len_utf8())
+}
+
+pub(crate) fn prev_char(snap: &BufferSnapshot, pos: usize) -> Option<usize> {
+    if pos == 0 {
+        return None;
+    }
+    let pos = pos.min(snap.len_bytes());
+    let rope = snap.rope();
+    let ci = rope.byte_to_char(pos);
+    if ci == 0 {
+        return None;
+    }
+    Some(rope.char_to_byte(ci - 1))
+}
+
+pub(crate) fn ends_with_crlf_before(snap: &BufferSnapshot, pos: usize) -> bool {
+    pos >= 2
+        && snap.rope().get_byte(pos - 2) == Some(b'\r')
+        && snap.rope().get_byte(pos - 1) == Some(b'\n')
+}
+
+pub(crate) fn starts_with_crlf_at(snap: &BufferSnapshot, pos: usize) -> bool {
+    snap.rope().get_byte(pos) == Some(b'\r') && snap.rope().get_byte(pos + 1) == Some(b'\n')
 }
 
 fn is_eol(c: char) -> bool {
@@ -191,14 +221,13 @@ pub(crate) struct OpRange {
 ///
 /// Backward exclusive motions are right-exclusive with respect to the cursor
 /// character (`dFb` on `abcd` with cursor on `d` removes `bc`).
-pub(crate) fn operator_range(lines: &Lines<'_>, cursor: usize, m: Motion) -> OpRange {
-    let text = lines.text();
+pub(crate) fn operator_range(snap: &BufferSnapshot, cursor: usize, m: Motion) -> OpRange {
     let mut target = m.target;
-    if m.word && lines.row_of(target) > lines.row_of(cursor) && target > cursor {
+    if m.word && row_of(snap, target) > row_of(snap, cursor) && target > cursor {
         // `dw` on the last word of a line stops at the end of that word.
         let mut i = target;
-        while let Some(p) = prev_char(text, i) {
-            if char_at(text, p).is_some_and(char::is_whitespace) {
+        while let Some(p) = prev_char(snap, i) {
+            if char_at(snap, p).is_some_and(char::is_whitespace) {
                 i = p;
             } else {
                 break;
@@ -213,14 +242,14 @@ pub(crate) fn operator_range(lines: &Lines<'_>, cursor: usize, m: Motion) -> OpR
     };
     match m.kind {
         MotionKind::Linewise => {
-            let (ra, rb) = (lines.row_of(a), lines.row_of(b));
+            let (ra, rb) = (row_of(snap, a), row_of(snap, b));
             OpRange {
-                range: lines.start(ra)..lines.end_incl(rb),
+                range: line_start(snap, ra)..line_end_incl(snap, rb),
                 linewise: true,
             }
         }
         MotionKind::Inclusive => {
-            let end = match char_at(text, b) {
+            let end = match char_at(snap, b) {
                 Some(c) if !is_eol(c) => b + c.len_utf8(),
                 _ => b,
             };
@@ -231,23 +260,23 @@ pub(crate) fn operator_range(lines: &Lines<'_>, cursor: usize, m: Motion) -> OpR
         }
         MotionKind::Exclusive => {
             let mut end = b;
-            let (ra, rb) = (lines.row_of(a), lines.row_of(b));
-            if m.paragraph && rb > ra && end == text.len() && end != lines.start(rb) {
+            let (ra, rb) = (row_of(snap, a), row_of(snap, b));
+            if m.paragraph && rb > ra && end == snap.len_bytes() && end != line_start(snap, rb) {
                 // `}` stopped at the end of the last line: inclusive of that line.
-                if a <= lines.first_nonblank(ra) {
+                if a <= first_nonblank(snap, ra) {
                     return OpRange {
-                        range: lines.start(ra)..lines.end_incl(rb),
+                        range: line_start(snap, ra)..line_end_incl(snap, rb),
                         linewise: true,
                     };
                 }
-            } else if rb > ra && end == lines.start(rb) {
-                if m.paragraph && a <= lines.first_nonblank(ra) {
+            } else if rb > ra && end == line_start(snap, rb) {
+                if m.paragraph && a <= first_nonblank(snap, ra) {
                     return OpRange {
-                        range: lines.start(ra)..lines.end_incl(rb - 1),
+                        range: line_start(snap, ra)..line_end_incl(snap, rb - 1),
                         linewise: true,
                     };
                 }
-                end = lines.end(rb - 1);
+                end = line_end(snap, rb - 1);
             }
             OpRange {
                 range: a..end.max(a),
@@ -258,59 +287,82 @@ pub(crate) fn operator_range(lines: &Lines<'_>, cursor: usize, m: Motion) -> OpR
 }
 
 /// `w`/`W`: start of next word, stopping at empty lines.
-pub(crate) fn word_forward(text: &str, pos: usize, big: bool) -> usize {
-    let lines = Lines::new(text);
-    let mut i = pos;
-    let Some(c0) = char_at(text, i) else {
-        return text.len();
+pub(crate) fn word_forward(snap: &BufferSnapshot, pos: usize, big: bool) -> usize {
+    let len = snap.len_bytes();
+    if pos >= len {
+        return len;
+    }
+    let rope = snap.rope();
+    let mut chars = rope.chars_at(rope.byte_to_char(pos));
+    let Some(c0) = chars.next() else {
+        return len;
     };
+    let mut i = pos;
+    let mut at_line_start = false;
     let k0 = class(c0, big);
     if k0 != 0 {
-        while let Some(c) = char_at(text, i) {
+        i += c0.len_utf8();
+        for c in chars.by_ref() {
             if class(c, big) == k0 {
                 i += c.len_utf8();
             } else {
+                if class(c, big) != 0 {
+                    return i;
+                }
+                if c == '\n' {
+                    at_line_start = true;
+                }
+                i += c.len_utf8();
                 break;
             }
         }
+    } else {
+        if c0 == '\n' {
+            at_line_start = true;
+        }
+        i += c0.len_utf8();
     }
-    let pos_row = lines.row_of(pos);
-    while let Some(c) = char_at(text, i) {
+    for c in chars {
         if class(c, big) != 0 {
             return i;
         }
-        let row = lines.row_of(i);
-        if row > pos_row && lines.start(row) == lines.end(row) && i == lines.start(row) {
+        if at_line_start && (c == '\n' || (c == '\r' && rope.get_byte(i + 1) == Some(b'\n'))) {
             return i;
         }
+        at_line_start = c == '\n';
         i += c.len_utf8();
     }
-    text.len()
+    len
 }
 
 /// `b`/`B`: start of previous word.
-pub(crate) fn word_backward(text: &str, pos: usize, big: bool) -> usize {
-    let lines = Lines::new(text);
-    let pos_row = lines.row_of(pos);
-    let mut i = pos;
-    loop {
-        let Some(p) = prev_char(text, i) else {
+pub(crate) fn word_backward(snap: &BufferSnapshot, pos: usize, big: bool) -> usize {
+    if pos == 0 {
+        return 0;
+    }
+    let rope = snap.rope();
+    let mut chars = rope.chars_at(rope.byte_to_char(pos.min(snap.len_bytes())));
+    let mut i = pos.min(snap.len_bytes());
+    let pos_row = row_of(snap, i);
+    let k = loop {
+        let Some(c) = chars.prev() else {
             return 0;
         };
-        i = p;
-        let c = char_at(text, i).unwrap_or(' ');
-        if class(c, big) != 0 {
-            break;
+        i -= c.len_utf8();
+        let kc = class(c, big);
+        if kc != 0 {
+            break kc;
         }
-        let row = lines.row_of(i);
-        if row < pos_row && lines.start(row) == lines.end(row) {
-            return lines.start(row);
+        if c == '\n' {
+            let r = row_of(snap, i);
+            if r < pos_row && line_start(snap, r) == line_end(snap, r) {
+                return line_start(snap, r);
+            }
         }
-    }
-    let k = char_at(text, i).map_or(0, |c| class(c, big));
-    while let Some(p) = prev_char(text, i) {
-        if char_at(text, p).is_some_and(|c| class(c, big) == k) {
-            i = p;
+    };
+    while let Some(c) = chars.prev() {
+        if class(c, big) == k {
+            i -= c.len_utf8();
         } else {
             break;
         }
@@ -319,24 +371,28 @@ pub(crate) fn word_backward(text: &str, pos: usize, big: bool) -> usize {
 }
 
 /// `e`/`E`: last char of the current/next word.
-pub(crate) fn word_end_forward(text: &str, pos: usize, big: bool) -> usize {
-    let Some(mut i) = next_char(text, pos) else {
+pub(crate) fn word_end_forward(snap: &BufferSnapshot, pos: usize, big: bool) -> usize {
+    let Some(mut i) = next_char(snap, pos) else {
         return pos;
     };
-    while let Some(c) = char_at(text, i) {
-        if class(c, big) == 0 {
+    let rope = snap.rope();
+    let mut chars = rope.chars_at(rope.byte_to_char(i));
+    let mut k = 0;
+    for c in chars.by_ref() {
+        let kc = class(c, big);
+        if kc == 0 {
             i += c.len_utf8();
         } else {
+            k = kc;
             break;
         }
     }
-    let Some(c) = char_at(text, i) else {
-        return prev_char(text, text.len()).unwrap_or(pos).max(pos);
-    };
-    let k = class(c, big);
-    while let Some(n) = next_char(text, i) {
-        if char_at(text, n).is_some_and(|c| class(c, big) == k) {
-            i = n;
+    if k == 0 {
+        return prev_char(snap, snap.len_bytes()).unwrap_or(pos).max(pos);
+    }
+    for c in chars {
+        if class(c, big) == k {
+            i += c.len_utf8();
         } else {
             break;
         }
@@ -345,17 +401,22 @@ pub(crate) fn word_end_forward(text: &str, pos: usize, big: bool) -> usize {
 }
 
 /// Target of `cw`/`cW`: end of the current word (not the following blanks).
-pub(crate) fn change_word_target(text: &str, pos: usize, count: usize, big: bool) -> usize {
+pub(crate) fn change_word_target(
+    snap: &BufferSnapshot,
+    pos: usize,
+    count: usize,
+    big: bool,
+) -> usize {
     let mut j = pos;
     for n in 0..count.max(1) {
-        let k = char_at(text, j).map_or(0, |c| class(c, big));
-        let at_end = next_char(text, j)
-            .and_then(|nx| char_at(text, nx))
+        let k = char_at(snap, j).map_or(0, |c| class(c, big));
+        let at_end = next_char(snap, j)
+            .and_then(|nx| char_at(snap, nx))
             .is_none_or(|c| class(c, big) != k);
         j = if n == 0 && !at_end {
             let mut i = j;
-            while let Some(nx) = next_char(text, i) {
-                if char_at(text, nx).is_some_and(|c| class(c, big) == k) {
+            while let Some(nx) = next_char(snap, i) {
+                if char_at(snap, nx).is_some_and(|c| class(c, big) == k) {
                     i = nx;
                 } else {
                     break;
@@ -365,110 +426,131 @@ pub(crate) fn change_word_target(text: &str, pos: usize, count: usize, big: bool
         } else if n == 0 {
             j
         } else {
-            word_end_forward(text, j, big)
+            word_end_forward(snap, j, big)
         };
     }
     j
 }
 
 /// Whether `pos` is on a non-blank character.
-pub(crate) fn on_word(text: &str, pos: usize) -> bool {
-    char_at(text, pos).is_some_and(|c| !c.is_whitespace())
+pub(crate) fn on_word(snap: &BufferSnapshot, pos: usize) -> bool {
+    char_at(snap, pos).is_some_and(|c| !c.is_whitespace())
 }
 
 /// `ge`/`gE`: last char of the previous word.
-pub(crate) fn word_end_backward(text: &str, pos: usize, big: bool) -> usize {
+pub(crate) fn word_end_backward(snap: &BufferSnapshot, pos: usize, big: bool) -> usize {
+    let pos = pos.min(snap.len_bytes());
+    let rope = snap.rope();
     let mut i = pos;
-    let k = char_at(text, i).map_or(0, |c| class(c, big));
+    let mut chars = rope.chars_at(rope.byte_to_char(i));
+    let k = char_at(snap, i).map_or(0, |c| class(c, big));
     if k != 0 {
-        while let Some(p) = prev_char(text, i) {
-            if char_at(text, p).is_some_and(|c| class(c, big) == k) {
-                i = p;
+        while let Some(c) = chars.prev() {
+            if class(c, big) == k {
+                i -= c.len_utf8();
+            } else if class(c, big) != 0 {
+                return i - c.len_utf8();
             } else {
+                i -= c.len_utf8();
                 break;
             }
         }
     }
-    loop {
-        let Some(p) = prev_char(text, i) else {
-            return 0;
-        };
-        i = p;
-        if char_at(text, i).is_some_and(|c| class(c, big) != 0) {
+    while let Some(c) = chars.prev() {
+        i -= c.len_utf8();
+        if class(c, big) != 0 {
             return i;
         }
     }
+    0
+}
+
+fn str_next_char(s: &str, pos: usize) -> Option<usize> {
+    s.get(pos..)
+        .and_then(|t| t.chars().next())
+        .map(|c| pos + c.len_utf8())
+}
+
+fn str_prev_char(s: &str, pos: usize) -> Option<usize> {
+    s.get(..pos)
+        .and_then(|t| t.char_indices().next_back().map(|(i, _)| i))
+}
+
+fn str_char_at(s: &str, pos: usize) -> Option<char> {
+    s.get(pos..).and_then(|t| t.chars().next())
 }
 
 /// `f`/`F`/`t`/`T` search on the current line. Returns the motion target.
 pub(crate) fn find_char(
-    lines: &Lines<'_>,
+    snap: &BufferSnapshot,
     pos: usize,
     kind: char,
     ch: char,
     count: usize,
     repeat: bool,
 ) -> Option<usize> {
-    let text = lines.text();
-    let row = lines.row_of(pos);
-    let (s, e) = (lines.start(row), lines.end(row));
+    let row = row_of(snap, pos);
+    let s = line_start(snap, row);
+    let line = line_str(snap, row);
+    let len = line.len();
+    let rel_pos = pos.saturating_sub(s).min(len);
     let forward = kind == 'f' || kind == 't';
     let till = kind == 't' || kind == 'T';
     let mut remaining = count.max(1);
-    let mut from = pos;
+    let mut from = rel_pos;
     if repeat && till {
         from = if forward {
-            next_char(text, pos).filter(|&n| n < e).unwrap_or(pos)
+            str_next_char(&line, rel_pos)
+                .filter(|&n| n < len)
+                .unwrap_or(rel_pos)
         } else {
-            prev_char(text, pos).filter(|&p| p >= s).unwrap_or(pos)
+            str_prev_char(&line, rel_pos).unwrap_or(rel_pos)
         };
     }
     loop {
         from = if forward {
-            let n = next_char(text, from)?;
-            if n >= e {
+            let n = str_next_char(&line, from)?;
+            if n >= len {
                 return None;
             }
             n
         } else {
-            let p = prev_char(text, from)?;
-            if p < s {
-                return None;
-            }
-            p
+            str_prev_char(&line, from)?
         };
-        if char_at(text, from) == Some(ch) {
+        if str_char_at(&line, from) == Some(ch) {
             remaining -= 1;
             if remaining == 0 {
                 break;
             }
         }
     }
-    if till {
+    let rel_target = if till {
         if forward {
-            prev_char(text, from)
+            str_prev_char(&line, from)?
         } else {
-            next_char(text, from)
+            str_next_char(&line, from)?
         }
     } else {
-        Some(from)
-    }
+        from
+    };
+    Some(s + rel_target)
 }
 
 /// `}` (forward) / `{` (backward) paragraph motion.
-pub(crate) fn paragraph(lines: &Lines<'_>, pos: usize, forward: bool, count: usize) -> usize {
-    let blank = |r: usize| lines.start(r) == lines.end(r);
-    let mut row = lines.row_of(pos);
+pub(crate) fn paragraph(snap: &BufferSnapshot, pos: usize, forward: bool, count: usize) -> usize {
+    let lr = last_row(snap);
+    let blank = |r: usize| line_start(snap, r) == line_end(snap, r);
+    let mut row = row_of(snap, pos);
     for _ in 0..count.max(1) {
         if forward {
-            while row < lines.last_row() && blank(row) {
+            while row < lr && blank(row) {
                 row += 1;
             }
-            while row < lines.last_row() && !blank(row) {
+            while row < lr && !blank(row) {
                 row += 1;
             }
-            if row == lines.last_row() && !blank(row) {
-                return lines.text().len();
+            if row == lr && !blank(row) {
+                return snap.len_bytes();
             }
         } else {
             while row > 0 && blank(row) {
@@ -482,31 +564,93 @@ pub(crate) fn paragraph(lines: &Lines<'_>, pos: usize, forward: bool, count: usi
             }
         }
     }
-    lines.start(row)
+    line_start(snap, row)
+}
+
+const fn matching_bracket(b: u8) -> Option<(u8, bool)> {
+    match b {
+        b'(' => Some((b')', true)),
+        b'[' => Some((b']', true)),
+        b'{' => Some((b'}', true)),
+        b')' => Some((b'(', false)),
+        b']' => Some((b'[', false)),
+        b'}' => Some((b'{', false)),
+        _ => None,
+    }
+}
+
+/// `%`: finds a bracket on the current line (at or after `pos`) and jumps to
+/// its matching partner across lines, respecting nesting.
+pub(crate) fn match_bracket(snap: &BufferSnapshot, pos: usize) -> Option<usize> {
+    let row = row_of(snap, pos);
+    let s = line_start(snap, row);
+    let line = line_str(snap, row);
+    let rel = pos.saturating_sub(s).min(line.len());
+    let (rel_off, open_b, mate, forward) = line[rel..]
+        .bytes()
+        .enumerate()
+        .find_map(|(i, b)| matching_bracket(b).map(|(m, fwd)| (rel + i, b, m, fwd)))?;
+    let start_pos = s + rel_off;
+    let rope = snap.rope();
+    let mut depth = 0usize;
+    if forward {
+        for (i, b) in (start_pos + 1..).zip(rope.bytes_at(start_pos + 1)) {
+            if b == open_b {
+                depth += 1;
+            } else if b == mate {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+        }
+        None
+    } else {
+        let mut i = start_pos;
+        let mut bytes = rope.bytes_at(start_pos);
+        while let Some(b) = bytes.prev() {
+            i -= 1;
+            if b == open_b {
+                depth += 1;
+            } else if b == mate {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+        }
+        None
+    }
 }
 
 /// `iw` / `aw` / `iW` / `aW`.
-pub(crate) fn word_object(text: &str, pos: usize, around: bool, big: bool) -> Option<Range<usize>> {
-    let lines = Lines::new(text);
-    let row = lines.row_of(pos);
-    let (s, e) = (lines.start(row), lines.end(row));
+pub(crate) fn word_object(
+    snap: &BufferSnapshot,
+    pos: usize,
+    around: bool,
+    big: bool,
+) -> Option<Range<usize>> {
+    let row = row_of(snap, pos);
+    let (s, e) = (line_start(snap, row), line_end(snap, row));
     if s == e {
         return Some(pos..pos);
     }
-    let c = char_at(text, pos).filter(|c| !is_eol(*c))?;
+    let line = line_str(snap, row);
+    let rel = pos.saturating_sub(s);
+    let c = str_char_at(&line, rel).filter(|c| !is_eol(*c))?;
     let k = class(c, big);
     let run = |from: usize, kk: u8| -> Range<usize> {
         let mut a = from;
-        while let Some(p) = prev_char(text, a) {
-            if p >= s && char_at(text, p).is_some_and(|c| class(c, big) == kk) {
+        while let Some(p) = str_prev_char(&line, a) {
+            if str_char_at(&line, p).is_some_and(|ch| class(ch, big) == kk) {
                 a = p;
             } else {
                 break;
             }
         }
         let mut b = from;
-        while let Some(n) = next_char(text, b) {
-            if b < e && char_at(text, b).is_some_and(|c| class(c, big) == kk) {
+        while let Some(n) = str_next_char(&line, b) {
+            if str_char_at(&line, b).is_some_and(|ch| class(ch, big) == kk) {
                 b = n;
             } else {
                 break;
@@ -514,52 +658,49 @@ pub(crate) fn word_object(text: &str, pos: usize, around: bool, big: bool) -> Op
         }
         a..b
     };
-    let r = run(pos, k);
+    let r = run(rel, k);
     if !around {
-        return Some(r);
+        return Some((s + r.start)..(s + r.end));
     }
-    let extend_run = |from: usize, kk: u8| -> usize { run(from, kk).end };
     if k != 0 {
         let after = r.end;
-        let kk = char_at(text, after)
-            .filter(|_| after < e)
-            .map(|c| class(c, big));
+        let kk = str_char_at(&line, after).map(|ch| class(ch, big));
         if kk == Some(0) {
-            return Some(r.start..extend_run(after, 0));
+            return Some((s + r.start)..(s + run(after, 0).end));
         }
         // No trailing blanks: take leading blanks.
         let mut a = r.start;
-        while let Some(p) = prev_char(text, a) {
-            if p >= s && char_at(text, p).is_some_and(char::is_whitespace) {
+        while let Some(p) = str_prev_char(&line, a) {
+            if str_char_at(&line, p).is_some_and(char::is_whitespace) {
                 a = p;
             } else {
                 break;
             }
         }
-        Some(a..r.end)
+        Some((s + a)..(s + r.end))
     } else {
         let after = r.end;
-        if after < e {
-            let kk = char_at(text, after).map_or(0, |c| class(c, big));
-            return Some(r.start..extend_run(after, kk));
+        if after < line.len() {
+            let kk = str_char_at(&line, after).map_or(0, |ch| class(ch, big));
+            return Some((s + r.start)..(s + run(after, kk).end));
         }
-        Some(r)
+        Some((s + r.start)..(s + r.end))
     }
 }
 
 /// `i"`/`a"` (also `'` and `` ` ``) on the current line.
 pub(crate) fn quote_object(
-    text: &str,
+    snap: &BufferSnapshot,
     pos: usize,
     quote: char,
     around: bool,
 ) -> Option<Range<usize>> {
-    let lines = Lines::new(text);
-    let row = lines.row_of(pos);
-    let (s, e) = (lines.start(row), lines.end(row));
+    let row = row_of(snap, pos);
+    let s = line_start(snap, row);
+    let line = line_str(snap, row);
     let mut quotes = Vec::new();
     let mut escaped = false;
-    for (i, c) in text[s..e].char_indices() {
+    for (i, c) in line.char_indices() {
         if escaped {
             escaped = false;
         } else if c == '\\' {
@@ -576,83 +717,108 @@ pub(crate) fn quote_object(
     if !around {
         return Some(open + quote.len_utf8()..close);
     }
-    let after = close + quote.len_utf8();
-    let mut end = after;
-    while end < e && char_at(text, end).is_some_and(|c| c == ' ' || c == '\t') {
-        end += 1;
-    }
-    if end > after {
-        return Some(open..end);
-    }
-    let mut start = open;
-    while let Some(p) = prev_char(text, start) {
-        if p >= s && char_at(text, p).is_some_and(|c| c == ' ' || c == '\t') {
-            start = p;
+    let rel_after = (close + quote.len_utf8()).saturating_sub(s);
+    let mut rel_end = rel_after;
+    while let Some(c) = str_char_at(&line, rel_end) {
+        if c == ' ' || c == '\t' {
+            rel_end += 1;
         } else {
             break;
         }
     }
-    Some(start..after)
+    if rel_end > rel_after {
+        return Some(open..(s + rel_end));
+    }
+    let mut rel_start = open.saturating_sub(s);
+    while let Some(p) = str_prev_char(&line, rel_start) {
+        if str_char_at(&line, p).is_some_and(|c| c == ' ' || c == '\t') {
+            rel_start = p;
+        } else {
+            break;
+        }
+    }
+    Some((s + rel_start)..(s + rel_after))
 }
 
-/// `i(`/`a(`/`i{`/… bracket text objects (multi-line, nesting aware).
+/// `i(`/`a(`/`i{`/… bracket text objects (multi-line, nesting and `[count]` aware).
 pub(crate) fn bracket_object(
-    text: &str,
+    snap: &BufferSnapshot,
     pos: usize,
     open: char,
     close: char,
+    count: usize,
     around: bool,
 ) -> Option<Range<usize>> {
-    let o = if char_at(text, pos) == Some(open) {
+    let open_b = u8::try_from(open).ok()?;
+    let close_b = u8::try_from(close).ok()?;
+    let rope = snap.rope();
+    let mut remaining = count.max(1);
+    let o = if rope.get_byte(pos) == Some(open_b) && {
+        remaining -= 1;
+        remaining == 0
+    } {
         pos
     } else {
         let mut depth = 0usize;
         let mut i = pos;
+        let mut bytes = rope.bytes_at(pos);
         loop {
-            let p = prev_char(text, i)?;
-            i = p;
-            let c = char_at(text, i)?;
-            if c == close {
+            let b = bytes.prev()?;
+            i -= 1;
+            if b == close_b {
                 depth += 1;
-            } else if c == open {
+            } else if b == open_b {
                 if depth == 0 {
-                    break i;
+                    remaining -= 1;
+                    if remaining == 0 {
+                        break i;
+                    }
+                } else {
+                    depth -= 1;
                 }
-                depth -= 1;
             }
         }
     };
     let mut depth = 0usize;
-    let mut i = o + open.len_utf8();
-    let c = loop {
-        let ch = char_at(text, i)?;
-        if ch == open {
-            depth += 1;
-        } else if ch == close {
-            if depth == 0 {
-                break i;
+    let mut i = o + 1;
+    let c = {
+        let mut found = None;
+        for b in rope.bytes_at(i) {
+            if b == open_b {
+                depth += 1;
+            } else if b == close_b {
+                if depth == 0 {
+                    found = Some(i);
+                    break;
+                }
+                depth -= 1;
             }
-            depth -= 1;
+            i += 1;
         }
-        i += ch.len_utf8();
+        found?
     };
     if around {
-        return Some(o..c + close.len_utf8());
+        return Some(o..c + 1);
     }
-    let mut s = o + open.len_utf8();
+    let mut s = o + 1;
     let mut e = c;
-    let skipped = if text[s..].starts_with("\r\n") {
+    let skipped = if starts_with_crlf_at(snap, s) {
         s += 2;
         true
-    } else if text[s..].starts_with('\n') {
+    } else if rope.get_byte(s) == Some(b'\n') {
         s += 1;
         true
     } else {
         false
     };
     if skipped && s <= e {
-        let ls = text[..e].rfind('\n').map_or(0, |i| i + 1);
-        if ls >= s && text[ls..e].chars().all(|c| c == ' ' || c == '\t') {
+        let erow = row_of(snap, e);
+        let ls = line_start(snap, erow);
+        if ls >= s
+            && snap
+                .slice_bytes(ls..e)
+                .is_ok_and(|tail| tail.chars().all(|ch| ch == ' ' || ch == '\t'))
+        {
             e = ls;
         }
     }
@@ -661,68 +827,94 @@ pub(crate) fn bracket_object(
 
 #[cfg(test)]
 mod tests {
+    use kova_buffer::Buffer;
+
     use super::*;
+
+    fn snap(text: &str) -> BufferSnapshot {
+        Buffer::from_text(text).snapshot()
+    }
 
     #[test]
     fn lines_ignore_trailing_terminator() {
-        let l = Lines::new("a\nb\n");
-        assert_eq!(l.count(), 2);
-        assert_eq!(l.end(0), 1);
-        assert_eq!(Lines::new("a\r\nb").end(0), 1);
-        assert_eq!(Lines::new("").count(), 1);
+        let s = snap("a\nb\n");
+        assert_eq!(last_row(&s), 1);
+        assert_eq!(line_end(&s, 0), 1);
+        assert_eq!(line_end(&snap("a\r\nb"), 0), 1);
+        assert_eq!(last_row(&snap("")), 0);
     }
 
     #[test]
     fn words_forward_backward() {
-        let t = "foo bar.baz";
-        assert_eq!(word_forward(t, 0, false), 4);
-        assert_eq!(word_forward(t, 4, false), 7);
-        assert_eq!(word_forward(t, 4, true), t.len());
-        assert_eq!(word_backward(t, 8, false), 7);
-        assert_eq!(word_backward(t, 4, false), 0);
-        assert_eq!(word_end_forward(t, 0, false), 2);
-        assert_eq!(word_end_backward(t, 4, false), 2);
+        let s = snap("foo bar.baz");
+        assert_eq!(word_forward(&s, 0, false), 4);
+        assert_eq!(word_forward(&s, 4, false), 7);
+        assert_eq!(word_forward(&s, 4, true), s.len_bytes());
+        assert_eq!(word_backward(&s, 8, false), 7);
+        assert_eq!(word_backward(&s, 4, false), 0);
+        assert_eq!(word_end_forward(&s, 0, false), 2);
+        assert_eq!(word_end_backward(&s, 4, false), 2);
     }
 
     #[test]
     fn w_stops_on_empty_line() {
-        let t = "a\n\nb";
-        assert_eq!(word_forward(t, 0, false), 2);
-        assert_eq!(word_forward(t, 2, false), 3);
-        assert_eq!(word_backward(t, 3, false), 2);
+        let s = snap("a\n\nb");
+        assert_eq!(word_forward(&s, 0, false), 2);
+        assert_eq!(word_forward(&s, 2, false), 3);
+        assert_eq!(word_backward(&s, 3, false), 2);
     }
 
     #[test]
     fn find_motions() {
-        let l = Lines::new("a,b,c");
-        assert_eq!(find_char(&l, 0, 'f', ',', 1, false), Some(1));
-        assert_eq!(find_char(&l, 0, 't', ',', 1, false), Some(0));
-        assert_eq!(find_char(&l, 0, 'f', ',', 2, false), Some(3));
-        assert_eq!(find_char(&l, 4, 'F', ',', 1, false), Some(3));
-        assert_eq!(find_char(&l, 4, 'T', ',', 1, false), Some(4));
-        assert_eq!(find_char(&l, 0, 'f', 'z', 1, false), None);
+        let s = snap("a,b,c");
+        assert_eq!(find_char(&s, 0, 'f', ',', 1, false), Some(1));
+        assert_eq!(find_char(&s, 0, 't', ',', 1, false), Some(0));
+        assert_eq!(find_char(&s, 0, 'f', ',', 2, false), Some(3));
+        assert_eq!(find_char(&s, 4, 'F', ',', 1, false), Some(3));
+        assert_eq!(find_char(&s, 4, 'T', ',', 1, false), Some(4));
+        assert_eq!(find_char(&s, 0, 'f', 'z', 1, false), None);
     }
 
     #[test]
     fn backward_exclusive_range() {
-        let l = Lines::new("abcd");
+        let s = snap("abcd");
         let m = Motion::new(1, MotionKind::Exclusive);
-        assert_eq!(operator_range(&l, 3, m).range, 1..3);
+        assert_eq!(operator_range(&s, 3, m).range, 1..3);
+    }
+
+    #[test]
+    fn bracket_matching_motion() {
+        assert_eq!(match_bracket(&snap("f(a(b)c)"), 1), Some(7));
+        assert_eq!(match_bracket(&snap("f(a(b)c)"), 0), Some(7));
+        assert_eq!(match_bracket(&snap("f(a(b)c)"), 7), Some(1));
+        assert_eq!(match_bracket(&snap("f(a(b)c)"), 3), Some(5));
+        assert_eq!(match_bracket(&snap("{\n  [x]\n}"), 0), Some(8));
+        assert_eq!(match_bracket(&snap("abc"), 0), None);
     }
 
     #[test]
     fn objects() {
-        assert_eq!(word_object("foo bar", 1, false, false), Some(0..3));
-        assert_eq!(word_object("foo bar", 1, true, false), Some(0..4));
-        assert_eq!(word_object("foo bar", 5, true, false), Some(3..7));
-        assert_eq!(quote_object("x \"hi\" y", 4, '"', false), Some(3..5));
-        assert_eq!(quote_object("x \"hi\" y", 4, '"', true), Some(2..7));
-        assert_eq!(bracket_object("f(a(b)c)", 2, '(', ')', false), Some(2..7));
-        assert_eq!(bracket_object("f(a(b)c)", 4, '(', ')', true), Some(3..6));
+        assert_eq!(word_object(&snap("foo bar"), 1, false, false), Some(0..3));
+        assert_eq!(word_object(&snap("foo bar"), 1, true, false), Some(0..4));
+        assert_eq!(word_object(&snap("foo bar"), 5, true, false), Some(3..7));
+        assert_eq!(quote_object(&snap("x \"hi\" y"), 4, '"', false), Some(3..5));
+        assert_eq!(quote_object(&snap("x \"hi\" y"), 4, '"', true), Some(2..7));
         assert_eq!(
-            bracket_object("f {\n  x\n}", 6, '{', '}', false),
+            bracket_object(&snap("f(a(b)c)"), 2, '(', ')', 1, false),
+            Some(2..7)
+        );
+        assert_eq!(
+            bracket_object(&snap("f(a(b)c)"), 4, '(', ')', 1, true),
+            Some(3..6)
+        );
+        assert_eq!(
+            bracket_object(&snap("f(a(b)c)"), 4, '(', ')', 2, false),
+            Some(2..7)
+        );
+        assert_eq!(
+            bracket_object(&snap("f {\n  x\n}"), 6, '{', '}', 1, false),
             Some(4..8)
         );
-        assert_eq!(bracket_object("abc", 1, '(', ')', false), None);
+        assert_eq!(bracket_object(&snap("abc"), 1, '(', ')', 1, false), None);
     }
 }
