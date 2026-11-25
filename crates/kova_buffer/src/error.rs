@@ -97,3 +97,28 @@ pub enum BufferError {
         actual: usize,
     },
 }
+
+/// Errors returned by [`History`](crate::History) undo/redo and transaction operations.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum HistoryError {
+    /// Underlying text buffer validation or mutation failed.
+    #[error(transparent)]
+    Buffer(#[from] BufferError),
+
+    /// [`History::end_group`](crate::History::end_group) was called without an active group.
+    #[error("end_group called without a matching begin_group")]
+    UnmatchedEndGroup,
+
+    /// History navigation (`undo`, `redo`, `redo_branch`) was attempted while a group is open.
+    #[error("cannot navigate history while an explicit edit group is open")]
+    GroupStillOpen,
+
+    /// Requested child branch index is out of bounds for the current node.
+    #[error("invalid branch index {index}: current node has {available} child branch(es)")]
+    InvalidBranchIndex {
+        /// Requested 0-based child branch index.
+        index: usize,
+        /// Number of child branches available at the current node.
+        available: usize,
+    },
+}
