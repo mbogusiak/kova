@@ -5,9 +5,11 @@
 
 pub mod engine;
 pub mod error;
+pub mod folding;
 pub mod highlight;
 pub mod input;
 pub mod registry;
+pub mod structure;
 pub mod tree;
 
 pub use engine::{
@@ -15,9 +17,14 @@ pub use engine::{
     SyntaxTreeStore,
 };
 pub use error::SyntaxError;
+pub use folding::{FoldKind, FoldRange, extract_folds};
 pub use highlight::{HighlightSpan, Highlighter};
 pub use input::{RopeBytesIter, RopeTextProvider, from_ts_point, parse_rope_with, to_ts_point};
 pub use registry::{HighlightQuery, LanguageEntry, LanguageRegistry, detect_language};
+pub use structure::{
+    MAX_STRUCTURE_DEPTH, StructureNode, StructureOutline, StructureSymbolKind, SymbolVisibility,
+    extract_structure,
+};
 pub use tree::{SyntaxEdit, SyntaxTree};
 
 /// Name of this crate as declared in its `Cargo.toml`.
