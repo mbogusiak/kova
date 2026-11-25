@@ -92,7 +92,7 @@ pub struct JvmWorkspaceIndex {
 }
 
 impl JvmWorkspaceIndex {
-    fn from_parts(
+    pub(crate) fn from_parts(
         source_units_by_file: HashMap<PathBuf, Vec<ParsedClassUnit>>,
         classpath_units: Vec<ParsedClassUnit>,
         source_files_scanned: usize,
@@ -213,6 +213,11 @@ pub struct WorkspaceIndexer {
 }
 
 impl WorkspaceIndexer {
+    /// Returns the indexer configuration.
+    #[must_use]
+    pub const fn config(&self) -> &IndexerConfig {
+        &self.config
+    }
     /// Creates a new [`WorkspaceIndexer`] with a dedicated `rayon` thread pool.
     ///
     /// # Errors

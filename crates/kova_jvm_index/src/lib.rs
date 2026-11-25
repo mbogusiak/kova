@@ -4,6 +4,7 @@
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
 
 pub mod bytecode;
+pub mod cache;
 pub mod classpath;
 pub mod discovery;
 pub mod error;
