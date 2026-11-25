@@ -3,11 +3,15 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use gpui::{Context, FontWeight, IntoElement, ParentElement, Render, Styled, Window, div, px};
+use gpui::{
+    AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement, Render, Styled,
+    Window, div, px,
+};
 use kova_core::perf::{
     BudgetKind, budgets, check_duration_budget, check_rss_budget, current_process_rss_bytes,
 };
 
+use crate::editor::EditorView;
 use crate::theme::{KovaTheme, hsla_from_rgba};
 
 /// Canonical Islands UI layout geometry from `KOVA-013` / `KOVA-014` (`editor_ux_guidelines.md` §5).
@@ -157,6 +161,7 @@ pub struct WorkspaceShell {
     first_frame_scheduled: bool,
     exit_after_first_frame: bool,
     on_first_frame: Option<FirstFrameCallback>,
+    editor: Entity<EditorView>,
 }
 
 impl fmt::Debug for WorkspaceShell {
@@ -173,8 +178,8 @@ impl fmt::Debug for WorkspaceShell {
 impl WorkspaceShell {
     /// Creates a new [`WorkspaceShell`] anchored to `process_start` for cold-start telemetry.
     #[must_use]
-    pub fn new(process_start: Instant) -> Self {
-        Self::with_probe(process_start, false, None)
+    pub fn new(process_start: Instant, cx: &mut Context<'_, Self>) -> Self {
+        Self::with_probe(process_start, false, None, cx)
     }
 
     /// Creates a [`WorkspaceShell`] with optional automated probe exit and completion hook.
@@ -183,14 +188,23 @@ impl WorkspaceShell {
         process_start: Instant,
         exit_after_first_frame: bool,
         on_first_frame: Option<FirstFrameCallback>,
+        cx: &mut Context<'_, Self>,
     ) -> Self {
+        let editor = cx.new(EditorView::welcome_demo);
         Self {
             process_start,
             metrics: StartupMetrics::new(),
             first_frame_scheduled: false,
             exit_after_first_frame,
             on_first_frame,
+            editor,
         }
+    }
+
+    /// Returns the embedded [`EditorView`] entity handle.
+    #[must_use]
+    pub const fn editor(&self) -> &Entity<EditorView> {
+        &self.editor
     }
 
     /// Returns the current [`StartupMetrics`] captured by this shell.
@@ -250,7 +264,7 @@ impl WorkspaceShell {
             )
     }
 
-    fn render_editor_island(theme: &KovaTheme) -> gpui::Div {
+    fn render_editor_island(&self, theme: &KovaTheme) -> gpui::Div {
         let editor_bg = hsla_from_rgba(theme.surfaces().editor);
         let tab_inactive_bg = hsla_from_rgba(theme.surfaces().tab_inactive);
         let tab_active_bg = hsla_from_rgba(theme.surfaces().tab_active);
@@ -263,6 +277,7 @@ impl WorkspaceShell {
         div()
             .flex_1()
             .w_full()
+            .min_h(px(0.0))
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -292,42 +307,26 @@ impl WorkspaceShell {
                             .text_size(px(12.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(text_primary)
-                            .child("Welcome"),
+                            .child("KovaApplication.java"),
                     )
                     .child(
                         div()
                             .pr(px(12.0))
                             .text_size(px(11.0))
                             .text_color(text_muted)
-                            .child("Phase 0 · Islands UI"),
+                            .child("Rope O(1) · 120 FPS"),
                     ),
             )
             .child(
                 div()
                     .flex_1()
                     .w_full()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .text_size(px(15.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(text_primary)
-                            .child("Kova"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(text_muted)
-                            .child("Editor ready"),
-                    ),
+                    .min_h(px(0.0))
+                    .child(self.editor.clone()),
             )
     }
 
-    fn render_statusbar(&self, theme: &KovaTheme) -> gpui::Div {
+    fn render_statusbar(&self, theme: &KovaTheme, cx: &Context<'_, Self>) -> gpui::Div {
         let statusbar_bg = hsla_from_rgba(theme.surfaces().statusbar);
         let island_border = hsla_from_rgba(theme.borders().island);
         let text_primary = hsla_from_rgba(theme.text().primary);
@@ -335,6 +334,11 @@ impl WorkspaceShell {
         let text_muted = hsla_from_rgba(theme.text().muted);
         let run_icon = hsla_from_rgba(theme.gutter().run_icon);
         let warning_color = hsla_from_rgba(theme.editor().diagnostic_warning);
+
+        let editor = self.editor.read(cx);
+        let (cursor_line, cursor_col) = editor.primary_cursor_position();
+        let total_lines = editor.line_count();
+        let cursor_summary = format!("Ln {cursor_line}, Col {cursor_col} · {total_lines} lines");
 
         let start_color = match self.metrics.cold_start_within_budget {
             Some(true) => run_icon,
@@ -373,6 +377,7 @@ impl WorkspaceShell {
                     .flex()
                     .items_center()
                     .gap(px(12.0))
+                    .child(div().text_color(text_primary).child(cursor_summary))
                     .child(
                         div()
                             .font_weight(FontWeight::MEDIUM)
@@ -415,13 +420,14 @@ impl Render for WorkspaceShell {
                 div()
                     .flex_1()
                     .w_full()
+                    .min_h(px(0.0))
                     .flex()
                     .flex_col()
                     .px(px(SHELL_OUTER_PADDING_PX))
                     .pb(px(SHELL_OUTER_PADDING_PX))
                     .gap(px(SHELL_ISLAND_GAP_PX))
-                    .child(Self::render_editor_island(theme))
-                    .child(self.render_statusbar(theme)),
+                    .child(self.render_editor_island(theme))
+                    .child(self.render_statusbar(theme, cx)),
             )
     }
 }

@@ -95,7 +95,7 @@ pub fn run_with_options(process_start: Instant, options: AppLaunchOptions) -> Ex
 
         let open_result = cx.open_window(default_window_options(cx), move |_, cx| {
             cx.activate(true);
-            cx.new(move |_| {
+            cx.new(move |cx| {
                 WorkspaceShell::with_probe(
                     process_start,
                     options.exit_after_first_frame,
@@ -107,6 +107,7 @@ pub fn run_with_options(process_start: Instant, options: AppLaunchOptions) -> Ex
                             &probe_printed_for_shell,
                         );
                     })),
+                    cx,
                 )
             })
         });

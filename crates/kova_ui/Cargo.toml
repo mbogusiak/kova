@@ -9,9 +9,11 @@ license.workspace      = true
 publish.workspace      = true
 
 [dependencies]
-gpui.workspace       = true
-kova_core.workspace  = true
-kova_theme.workspace = true
+gpui.workspace        = true
+kova_buffer.workspace = true
+kova_core.workspace   = true
+kova_theme.workspace  = true
+smallvec.workspace    = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { workspace = true, features = ["wayland", "x11"] }
