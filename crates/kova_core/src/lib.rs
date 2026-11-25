@@ -4,6 +4,7 @@
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
 
 pub mod action;
+pub mod builtin_actions;
 pub mod context;
 pub mod keymap;
 pub mod perf;
@@ -11,12 +12,16 @@ pub mod perf;
 pub use action::{
     ActionCategory, ActionDescriptor, ActionError, ActionId, ActionRegistry, ActionSource,
 };
+pub use builtin_actions::{
+    builtin_action_ids, builtin_action_registry, builtin_action_registry_ref,
+    register_builtin_actions,
+};
 pub use context::{ContextExpr, ContextExprError, ContextState, FocusContext, FocusStack};
 pub use keymap::{
     BindingRule, BindingTarget, KeyChord, KeyCode, KeyDispatch, KeyStep, KeyStroke,
     KeymapDiagnostic, KeymapDiagnosticKind, KeymapLayer, KeymapLayerKind, KeymapParseError,
     KeymapPresetMode, KeymapResolver, KeymapSession, ModifierTap, ModifierTapDetector, Modifiers,
-    Platform,
+    Platform, build_effective_keymap, jetbrains_keymap_layer, jetbrains_keymap_layer_ref, presets,
 };
 
 /// Name of this crate as declared in its `Cargo.toml`.

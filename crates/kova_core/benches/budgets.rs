@@ -18,7 +18,7 @@ use kova_core::action::ActionId;
 use kova_core::context::{ContextExpr, ContextState, FocusContext, FocusStack};
 use kova_core::keymap::{
     BindingRule, BindingTarget, KeyChord, KeyCode, KeyStep, KeyStroke, KeymapLayer,
-    KeymapLayerKind, KeymapPresetMode, KeymapResolver, Modifiers, Platform,
+    KeymapLayerKind, KeymapPresetMode, KeymapResolver, Modifiers, Platform, build_effective_keymap,
 };
 use kova_core::perf::{
     BudgetKind, budgets, check_duration_budget, check_rss_budget, current_process_rss_bytes,
@@ -150,11 +150,34 @@ fn bench_input_latency_keymap_resolver(c: &mut Criterion) {
     });
 }
 
+fn bench_input_latency_jetbrains_keymap(c: &mut Criterion) {
+    let resolver = build_effective_keymap(Platform::MacOs, None)
+        .unwrap_or_else(|_| KeymapResolver::new(Platform::MacOs));
+    let stack = FocusStack::from_leaf(FocusContext::EditorText);
+    let state = ContextState::new();
+    let probe = KeyStep::Stroke(KeyStroke::new(Modifiers::META, KeyCode::Char('d')));
+
+    c.bench_function("budget_input_latency_jetbrains_keymap", |b| {
+        b.iter(|| {
+            let started = Instant::now();
+            let dispatch =
+                resolver.resolve_step(black_box(probe), black_box(&stack), black_box(&state));
+            let report = check_duration_budget(
+                BudgetKind::InputLatency,
+                started.elapsed(),
+                budgets::INPUT_LATENCY_MAX,
+            );
+            black_box((dispatch, report.is_within_budget()))
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_rss_probe_and_baseline,
     bench_input_latency_skeleton,
     bench_input_latency_keymap_resolver,
+    bench_input_latency_jetbrains_keymap,
     bench_cold_start_skeleton,
     bench_go_to_class_skeleton,
 );

@@ -1,0 +1,470 @@
+# Built-in JetBrains Keymap preset for Linux (Default XWin / GNOME / KDE IntelliJ).
+# Schema compatible with ~/.config/kova/keymap.toml (KOVA-017 / KOVA-018).
+schema_version = 1
+preset = "jetbrains"
+
+# ==============================================================================
+# Navigation & Search
+# ==============================================================================
+
+[[bindings]]
+context = "Global"
+key = "shift shift"
+action = "navigation.search_everywhere"
+
+[[bindings]]
+context = "Global"
+key = "ctrl+shift+a"
+action = "navigation.find_action"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+n"
+action = "navigation.go_to_class"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+shift+n"
+action = "navigation.go_to_file"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+alt+shift+n"
+action = "navigation.go_to_symbol"
+
+[[bindings]]
+context = "Editor"
+key = "ctrl+g"
+action = "navigation.go_to_line"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+b"
+action = "navigation.go_to_declaration"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+alt+b"
+action = "navigation.go_to_implementation"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+u"
+action = "navigation.go_to_super"
+
+[[bindings]]
+context = "Workspace"
+key = "alt+f7"
+action = "navigation.find_usages"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+alt+left"
+action = "navigation.back"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+alt+right"
+action = "navigation.forward"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+e"
+action = "navigation.recent_files"
+
+[[bindings]]
+context = "Editor"
+key = "ctrl+f12"
+action = "navigation.file_structure"
+
+[[bindings]]
+context = "Workspace"
+key = "f2"
+action = "navigation.next_error"
+
+[[bindings]]
+context = "Workspace"
+key = "shift+f2"
+action = "navigation.prev_error"
+
+[[bindings]]
+context = "Workspace"
+key = "alt+right"
+action = "navigation.next_tab"
+
+[[bindings]]
+context = "Workspace"
+key = "alt+left"
+action = "navigation.prev_tab"
+
+# ==============================================================================
+# Editor, Search & Multi-Cursor
+# ==============================================================================
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+s"
+action = "editor.save"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+z"
+action = "editor.undo"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+shift+z"
+action = "editor.redo"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+x"
+action = "editor.cut"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+c"
+action = "editor.copy"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+v"
+action = "editor.paste"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+a"
+action = "editor.select_all"
+
+[[bindings]]
+context = "Editor"
+when = "!vim_enabled"
+key = "escape"
+action = "editor.escape"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+d"
+action = "editor.duplicate_line"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+y"
+action = "editor.delete_line"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+/"
+action = "editor.toggle_line_comment"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+shift+/"
+action = "editor.toggle_block_comment"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+w"
+action = "editor.extend_selection"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+shift+w"
+action = "editor.shrink_selection"
+
+[[bindings]]
+context = "EditorText"
+key = "alt+shift+up"
+action = "editor.move_line_up"
+
+[[bindings]]
+context = "EditorText"
+key = "alt+shift+down"
+action = "editor.move_line_down"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+shift+up"
+action = "editor.move_statement_up"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+shift+down"
+action = "editor.move_statement_down"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+alt+l"
+action = "editor.reformat_code"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+alt+o"
+action = "editor.optimize_imports"
+
+[[bindings]]
+context = "EditorText"
+key = "alt+enter"
+action = "editor.show_intentions"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+space"
+action = "editor.complete_basic"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+shift+space"
+action = "editor.complete_smart"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+p"
+action = "editor.parameter_info"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+q"
+action = "editor.quick_doc"
+
+[[bindings]]
+context = "EditorText"
+key = "alt+j"
+action = "editor.add_next_occurrence"
+
+[[bindings]]
+context = "EditorText"
+key = "alt+shift+j"
+action = "editor.unselect_occurrence"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+alt+shift+j"
+action = "editor.select_all_occurrences"
+
+[[bindings]]
+context = "Editor"
+key = "ctrl+f"
+action = "editor.find"
+
+[[bindings]]
+context = "Editor"
+key = "ctrl+r"
+action = "editor.replace"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+shift+f"
+action = "editor.find_in_files"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+shift+r"
+action = "editor.replace_in_files"
+
+[[bindings]]
+context = "Editor"
+key = "f3"
+action = "editor.find_next"
+
+[[bindings]]
+context = "Editor"
+key = "shift+f3"
+action = "editor.find_prev"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+-"
+action = "editor.fold_region"
+
+[[bindings]]
+context = "EditorText"
+key = ["ctrl+plus", "ctrl+="]
+action = "editor.unfold_region"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+shift+-"
+action = "editor.fold_all"
+
+[[bindings]]
+context = "EditorText"
+key = ["ctrl+shift+plus", "ctrl+shift+="]
+action = "editor.unfold_all"
+
+# ==============================================================================
+# Refactoring
+# ==============================================================================
+
+[[bindings]]
+context = "Workspace"
+key = "shift+f6"
+action = "refactor.rename"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+alt+v"
+action = "refactor.extract_variable"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+alt+m"
+action = "refactor.extract_method"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+alt+c"
+action = "refactor.extract_constant"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+alt+f"
+action = "refactor.extract_field"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+alt+n"
+action = "refactor.inline"
+
+[[bindings]]
+context = "EditorText"
+key = "ctrl+f6"
+action = "refactor.change_signature"
+
+# ==============================================================================
+# Run & Debug
+# ==============================================================================
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+shift+f10"
+action = "run.run_context"
+
+[[bindings]]
+context = "Workspace"
+key = "shift+f10"
+action = "run.run_last"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+shift+f9"
+action = "run.debug_context"
+
+[[bindings]]
+context = "Workspace"
+key = "shift+f9"
+action = "run.debug_last"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+f2"
+action = "run.stop"
+
+[[bindings]]
+context = "Editor"
+key = "ctrl+f8"
+action = "debug.toggle_line_breakpoint"
+
+[[bindings]]
+context = "Workspace"
+key = "f8"
+action = "debug.step_over"
+
+[[bindings]]
+context = "Workspace"
+key = "f7"
+action = "debug.step_into"
+
+[[bindings]]
+context = "Workspace"
+key = "shift+f8"
+action = "debug.step_out"
+
+[[bindings]]
+context = "Workspace"
+key = "f9"
+action = "debug.resume"
+
+[[bindings]]
+context = "Workspace"
+key = "alt+f8"
+action = "debug.evaluate_expression"
+
+# ==============================================================================
+# Tool Windows, View (Omarchy Focus/Tiling), Git & Vim
+# ==============================================================================
+
+[[bindings]]
+context = "Workspace"
+key = "alt+1"
+action = "tool_window.project"
+
+[[bindings]]
+context = "Workspace"
+key = "alt+4"
+action = "tool_window.run"
+
+[[bindings]]
+context = "Workspace"
+key = "alt+5"
+action = "tool_window.debug"
+
+[[bindings]]
+context = "Workspace"
+key = "alt+6"
+action = "tool_window.problems"
+
+[[bindings]]
+context = "Workspace"
+key = "alt+7"
+action = "tool_window.structure"
+
+[[bindings]]
+context = "Workspace"
+key = "alt+9"
+action = "tool_window.git"
+
+[[bindings]]
+context = "Workspace"
+key = "alt+f12"
+action = "tool_window.terminal"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+shift+f12"
+action = "tool_window.hide_all"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+alt+z"
+action = "view.toggle_focus_mode"
+
+[[bindings]]
+context = "Global"
+key = ["ctrl+alt+s", "ctrl+,"]
+action = "view.open_settings"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+f4"
+action = "view.close_tab"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+k"
+action = "git.commit"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+shift+k"
+action = "git.push"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+t"
+action = "git.update_project"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+alt+shift+v"
+action = "vim.toggle"

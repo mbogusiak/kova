@@ -2,9 +2,11 @@
 
 pub mod chord;
 pub mod parser;
+pub mod presets;
 pub mod stroke;
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use smallvec::SmallVec;
 
@@ -18,6 +20,7 @@ pub use parser::{
     KEYMAP_SCHEMA_VERSION, KeymapParseError, KeymapPresetMode, load_user_keymap_or_default,
     parse_keymap_toml, parse_keymap_toml_with_kind,
 };
+pub use presets::{jetbrains_keymap_layer, jetbrains_keymap_layer_ref};
 pub use stroke::{
     KeyChord, KeyCode, KeyStep, KeyStroke, MAX_CHORD_STEPS, ModifierTap, Modifiers, Platform,
 };
@@ -194,6 +197,22 @@ impl KeymapResolver {
             resolver.add_layer(layer);
         }
         resolver
+    }
+
+    /// Loads an optional user override file from `keymap_path` (without creating
+    /// missing files) and composes it with the built-in `JetBrains` preset
+    /// unless the file declares `preset = "none"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeymapParseError`] on non-`NotFound` I/O failures or invalid
+    /// `keymap.toml` content.
+    pub fn from_user_file(
+        keymap_path: &Path,
+        platform: Platform,
+    ) -> Result<Self, KeymapParseError> {
+        let user_layer = load_user_keymap_or_default(keymap_path, platform)?;
+        Ok(compose_effective_resolver(platform, Some(user_layer)))
     }
 
     /// Appends all rules from `layer` and updates the first-step lookup index.
@@ -415,6 +434,48 @@ impl KeymapResolver {
         }
         matches!(best, Some((_, BindingTarget::Unbind)))
     }
+}
+
+/// Builds an effective [`KeymapResolver`] for `platform`, optionally layering
+/// parsed `user_toml` overrides over the built-in `JetBrains` preset.
+///
+/// - When `user_toml` is `None` or declares `preset = "jetbrains"` (the
+///   default), the built-in `JetBrains` layer for `platform` is loaded first,
+///   followed by any user overrides.
+/// - When `user_toml` declares `preset = "none"`, only the rules from
+///   `user_toml` are loaded.
+///
+/// # Errors
+///
+/// Returns [`KeymapParseError`] if `user_toml` fails parsing or validation.
+pub fn build_effective_keymap(
+    platform: Platform,
+    user_toml: Option<&str>,
+) -> Result<KeymapResolver, KeymapParseError> {
+    let user_layer = match user_toml {
+        Some(toml_str) => Some(parse_keymap_toml(toml_str, platform)?),
+        None => None,
+    };
+    Ok(compose_effective_resolver(platform, user_layer))
+}
+
+fn compose_effective_resolver(
+    platform: Platform,
+    user_layer: Option<KeymapLayer>,
+) -> KeymapResolver {
+    let mut resolver = KeymapResolver::new(platform);
+    let include_jetbrains = user_layer
+        .as_ref()
+        .is_none_or(|layer| layer.preset == KeymapPresetMode::JetBrains);
+    if include_jetbrains {
+        resolver.add_layer(jetbrains_keymap_layer(platform));
+    }
+    if let Some(layer) = user_layer
+        && !layer.rules.is_empty()
+    {
+        resolver.add_layer(layer);
+    }
+    resolver
 }
 
 fn evaluate_rule(
