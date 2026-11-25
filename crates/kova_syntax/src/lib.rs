@@ -4,6 +4,7 @@
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
 
 pub mod engine;
+pub mod entry_points;
 pub mod error;
 pub mod folding;
 pub mod highlight;
@@ -16,6 +17,7 @@ pub use engine::{
     DEFAULT_PARSE_TIMEOUT, ParseJobHandle, ParseRequest, SyntaxEngine, SyntaxEngineConfig,
     SyntaxTreeStore,
 };
+pub use entry_points::{EntryPoint, EntryPointKind, GutterIconRole, detect_entry_points};
 pub use error::SyntaxError;
 pub use folding::{FoldKind, FoldRange, extract_folds};
 pub use highlight::{HighlightSpan, Highlighter};

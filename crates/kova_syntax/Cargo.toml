@@ -32,5 +32,9 @@ harness = false
 name    = "highlight_viewport"
 harness = false
 
+[[bench]]
+name    = "entry_points"
+harness = false
+
 [lints]
 workspace = true
