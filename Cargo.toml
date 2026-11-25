@@ -38,6 +38,9 @@ kova_plugin_host = { path = "crates/kova_plugin_host" }
 kova_ui          = { path = "crates/kova_ui" }
 kova_plugin_rs   = { path = "sdk/kova_plugin_rs" }
 
+# External dependencies
+serde_json = "1"
+
 [workspace.lints.cargo]
 unused_workspace_dependencies = "allow" # 12 library crates are pre-declared in E0 for upcoming epics
 unused_dependencies           = "allow" # Stub edges (kova_ui/kova_app) are wired before domain symbols exist
