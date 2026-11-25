@@ -4,7 +4,9 @@
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
 
 pub mod buffer;
+pub mod clipboard;
 pub mod edit;
+pub mod edit_log;
 pub mod error;
 pub mod grapheme;
 pub mod history;
@@ -15,8 +17,15 @@ pub mod selection;
 pub mod snapshot;
 
 pub use buffer::Buffer;
+pub use clipboard::{
+    ClipboardEntry, MultiCursorClipboard, copy_selections, cut_selections, paste, paste_latest,
+    resolve_paste_texts,
+};
 pub use edit::{
     apply_delete_backward, apply_delete_forward, apply_insert_all, apply_insert_per_cursor,
+};
+pub use edit_log::{
+    EditDelta, EditLog, EditLogConfig, LspTextChange, TreeSitterEdit, VersionChanges, VersionDelta,
 };
 pub use error::{BufferError, HistoryError};
 pub use grapheme::{

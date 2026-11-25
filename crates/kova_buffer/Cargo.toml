@@ -26,5 +26,9 @@ harness = false
 name    = "multicursor_ops"
 harness = false
 
+[[bench]]
+name    = "edit_log_ops"
+harness = false
+
 [lints]
 workspace = true
