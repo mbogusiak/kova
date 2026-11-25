@@ -7,12 +7,19 @@ use std::sync::{Arc, OnceLock};
 use kova_theme::{SyntaxLanguage, SyntaxTokenKind, resolve_capture};
 
 use crate::error::SyntaxError;
+use crate::folding::FoldKind;
 
 const JAVA_HIGHLIGHTS_SCM: &str = include_str!("../queries/java/highlights.scm");
 const KOTLIN_HIGHLIGHTS_SCM: &str = include_str!("../queries/kotlin/highlights.scm");
 const HTTP_HIGHLIGHTS_SCM: &str = include_str!("../queries/http/highlights.scm");
 const TOML_HIGHLIGHTS_SCM: &str = include_str!("../queries/toml/highlights.scm");
 const JSON_HIGHLIGHTS_SCM: &str = include_str!("../queries/json/highlights.scm");
+
+const JAVA_FOLDS_SCM: &str = include_str!("../queries/java/folds.scm");
+const KOTLIN_FOLDS_SCM: &str = include_str!("../queries/kotlin/folds.scm");
+const HTTP_FOLDS_SCM: &str = include_str!("../queries/http/folds.scm");
+const TOML_FOLDS_SCM: &str = include_str!("../queries/toml/folds.scm");
+const JSON_FOLDS_SCM: &str = include_str!("../queries/json/folds.scm");
 
 static BUILTIN_REGISTRY: OnceLock<Result<LanguageRegistry, SyntaxError>> = OnceLock::new();
 
@@ -96,12 +103,81 @@ impl HighlightQuery {
     }
 }
 
-/// Immutable entry describing a registered Tree-sitter grammar and its optional highlight query.
+/// Precompiled Tree-sitter fold query with $O(1)$ capture-to-[`FoldKind`] lookup.
+#[derive(Debug)]
+pub struct FoldQuery {
+    query: tree_sitter::Query,
+    capture_kinds: Vec<Option<FoldKind>>,
+}
+
+impl FoldQuery {
+    /// Compiles `source` for `ts_language` and resolves every `@fold.*` capture name once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError::InvalidQuery`] if Tree-sitter rejects `source`.
+    pub fn compile(
+        language: SyntaxLanguage,
+        ts_language: &tree_sitter::Language,
+        source: &str,
+    ) -> Result<Self, SyntaxError> {
+        let query = tree_sitter::Query::new(ts_language, source).map_err(|err| {
+            SyntaxError::InvalidQuery {
+                language,
+                kind: "folds",
+                message: err.to_string(),
+            }
+        })?;
+
+        let capture_kinds = query
+            .capture_names()
+            .iter()
+            .map(|name| resolve_fold_capture(name))
+            .collect();
+
+        Ok(Self {
+            query,
+            capture_kinds,
+        })
+    }
+
+    /// Returns the underlying compiled [`tree_sitter::Query`].
+    #[must_use]
+    pub const fn query(&self) -> &tree_sitter::Query {
+        &self.query
+    }
+
+    /// Returns the precompiled [`FoldKind`] for `capture_index` in $O(1)$ time,
+    /// or `None` for internal `_`-prefixed or unrecognized captures.
+    #[must_use]
+    pub fn capture_kind(&self, capture_index: u32) -> Option<FoldKind> {
+        self.capture_kinds
+            .get(capture_index as usize)
+            .copied()
+            .flatten()
+    }
+}
+
+fn resolve_fold_capture(name: &str) -> Option<FoldKind> {
+    match name {
+        "fold.type" => Some(FoldKind::Type),
+        "fold.function" => Some(FoldKind::Function),
+        "fold.block" => Some(FoldKind::Block),
+        "fold.comment" => Some(FoldKind::Comment),
+        "fold.request" => Some(FoldKind::Request),
+        "fold.imports" => Some(FoldKind::Imports),
+        "fold.region" => Some(FoldKind::Region),
+        _ => None,
+    }
+}
+
+/// Immutable entry describing a registered Tree-sitter grammar and its optional queries.
 #[derive(Debug, Clone)]
 pub struct LanguageEntry {
     language: SyntaxLanguage,
     ts_language: tree_sitter::Language,
     highlight_query: Option<Arc<HighlightQuery>>,
+    fold_query: Option<Arc<FoldQuery>>,
 }
 
 impl LanguageEntry {
@@ -122,6 +198,12 @@ impl LanguageEntry {
     pub fn highlight_query(&self) -> Option<&HighlightQuery> {
         self.highlight_query.as_deref()
     }
+
+    /// Returns the precompiled [`FoldQuery`] for this language, if registered.
+    #[must_use]
+    pub fn fold_query(&self) -> Option<&FoldQuery> {
+        self.fold_query.as_deref()
+    }
 }
 
 /// Thread-safe, cheaply cloneable registry mapping [`SyntaxLanguage`] to Tree-sitter grammars.
@@ -138,46 +220,52 @@ impl LanguageRegistry {
     }
 
     /// Creates a [`LanguageRegistry`] pre-populated with all 5 built-in grammars
-    /// (`Java`, `Kotlin`, `Http`, `Toml`, `Json`) and their compiled `highlights.scm` queries.
+    /// (`Java`, `Kotlin`, `Http`, `Toml`, `Json`) and their compiled `highlights.scm` and
+    /// `folds.scm` queries.
     ///
     /// Prefer [`Self::builtin`] on hot paths to reuse the process-wide cached registry.
     ///
     /// # Errors
     ///
     /// Returns [`SyntaxError::LanguageLoadFailed`] or [`SyntaxError::InvalidQuery`] if any
-    /// built-in grammar or highlight query fails validation.
+    /// built-in grammar or query fails validation.
     pub fn with_defaults() -> Result<Self, SyntaxError> {
         let mut registry = Self::new();
-        registry.register_with_highlights(
+        registry.register_with_queries(
             SyntaxLanguage::Java,
             tree_sitter_java::LANGUAGE.into(),
             JAVA_HIGHLIGHTS_SCM,
+            JAVA_FOLDS_SCM,
         )?;
-        registry.register_with_highlights(
+        registry.register_with_queries(
             SyntaxLanguage::Kotlin,
             tree_sitter_kotlin_ng::LANGUAGE.into(),
             KOTLIN_HIGHLIGHTS_SCM,
+            KOTLIN_FOLDS_SCM,
         )?;
-        registry.register_with_highlights(
+        registry.register_with_queries(
             SyntaxLanguage::Http,
             tree_sitter_http::language(),
             HTTP_HIGHLIGHTS_SCM,
+            HTTP_FOLDS_SCM,
         )?;
-        registry.register_with_highlights(
+        registry.register_with_queries(
             SyntaxLanguage::Toml,
             tree_sitter_toml_ng::LANGUAGE.into(),
             TOML_HIGHLIGHTS_SCM,
+            TOML_FOLDS_SCM,
         )?;
-        registry.register_with_highlights(
+        registry.register_with_queries(
             SyntaxLanguage::Json,
             tree_sitter_json::LANGUAGE.into(),
             JSON_HIGHLIGHTS_SCM,
+            JSON_FOLDS_SCM,
         )?;
         Ok(registry)
     }
 
     /// Returns a process-wide cached [`LanguageRegistry`] containing all 5 built-in grammars
-    /// and compiled highlight queries, compiling them at most once per process.
+    /// and compiled highlight and fold queries, compiling them at most once per process.
     ///
     /// # Errors
     ///
@@ -189,8 +277,8 @@ impl LanguageRegistry {
             .map_err(Clone::clone)
     }
 
-    /// Validates ABI compatibility and registers `ts_language` under `language` without a
-    /// highlight query.
+    /// Validates ABI compatibility and registers `ts_language` under `language` without
+    /// queries.
     ///
     /// Replacing an existing registration overwrites the previous entry.
     ///
@@ -202,7 +290,7 @@ impl LanguageRegistry {
         language: SyntaxLanguage,
         ts_language: tree_sitter::Language,
     ) -> Result<(), SyntaxError> {
-        self.register_entry(language, ts_language, None)
+        self.register_entry(language, ts_language, None, None)
     }
 
     /// Validates ABI compatibility, compiles `highlights_scm`, and registers both under
@@ -222,15 +310,34 @@ impl LanguageRegistry {
     ) -> Result<(), SyntaxError> {
         validate_language_abi(language, &ts_language)?;
         let query = HighlightQuery::compile(language, &ts_language, highlights_scm)?;
-        self.entries.insert(
+        self.register_entry(language, ts_language, Some(Arc::new(query)), None)
+    }
+
+    /// Validates ABI compatibility, compiles `highlights_scm` and `folds_scm`, and registers
+    /// them under `language`.
+    ///
+    /// Replacing an existing registration overwrites the previous entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError::LanguageLoadFailed`] if Tree-sitter rejects the grammar ABI, or
+    /// [`SyntaxError::InvalidQuery`] if either query fails to compile.
+    pub fn register_with_queries(
+        &mut self,
+        language: SyntaxLanguage,
+        ts_language: tree_sitter::Language,
+        highlights_scm: &str,
+        folds_scm: &str,
+    ) -> Result<(), SyntaxError> {
+        validate_language_abi(language, &ts_language)?;
+        let highlight_query = HighlightQuery::compile(language, &ts_language, highlights_scm)?;
+        let fold_query = FoldQuery::compile(language, &ts_language, folds_scm)?;
+        self.register_entry(
             language,
-            Arc::new(LanguageEntry {
-                language,
-                ts_language,
-                highlight_query: Some(Arc::new(query)),
-            }),
-        );
-        Ok(())
+            ts_language,
+            Some(Arc::new(highlight_query)),
+            Some(Arc::new(fold_query)),
+        )
     }
 
     fn register_entry(
@@ -238,6 +345,7 @@ impl LanguageRegistry {
         language: SyntaxLanguage,
         ts_language: tree_sitter::Language,
         highlight_query: Option<Arc<HighlightQuery>>,
+        fold_query: Option<Arc<FoldQuery>>,
     ) -> Result<(), SyntaxError> {
         validate_language_abi(language, &ts_language)?;
         self.entries.insert(
@@ -246,6 +354,7 @@ impl LanguageRegistry {
                 language,
                 ts_language,
                 highlight_query,
+                fold_query,
             }),
         );
         Ok(())

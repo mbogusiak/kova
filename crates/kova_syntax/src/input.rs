@@ -1,10 +1,122 @@
 //! Zero-copy `ropey::Rope` input adapters and coordinate conversions for Tree-sitter.
 
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Range};
 
 use kova_buffer::{BufferSnapshot, Point};
 use ropey::Rope;
 use ropey::iter::Chunks;
+
+/// Reads a UTF-8 byte range from `snapshot` without panicking on out-of-bounds offsets,
+/// multi-byte UTF-8 boundaries, or `\r\n` (CRLF) line endings.
+///
+/// When `snapshot.slice_bytes(range)` fails (for instance because Tree-sitter places a node's
+/// end byte between `\r` and `\n`), this falls back to [`Rope::byte_to_char`] boundary clamping.
+#[must_use]
+pub fn read_byte_range_text(range: Range<usize>, snapshot: &BufferSnapshot) -> String {
+    let rope = snapshot.rope();
+    let len = rope.len_bytes();
+    let start = range.start.min(len);
+    let end = range.end.min(len);
+    if start >= end {
+        return String::new();
+    }
+
+    if let Ok(slice) = snapshot.slice_bytes(start..end) {
+        return slice.to_string();
+    }
+
+    let start_char = rope.byte_to_char(start);
+    let end_char = rope.byte_to_char(end);
+    if start_char >= end_char {
+        return String::new();
+    }
+    rope.slice(start_char..end_char).to_string()
+}
+
+/// Safely reads the source text covered by `node` from `snapshot`.
+#[must_use]
+pub fn read_node_text(node: tree_sitter::Node<'_>, snapshot: &BufferSnapshot) -> String {
+    read_byte_range_text(node.byte_range(), snapshot)
+}
+
+/// Safely reads `node`'s text, collapses runs of whitespace into single spaces, and truncates
+/// to at most `max_chars` Unicode scalar values (appending `"..."` when truncated).
+#[must_use]
+pub fn read_node_text_compact(
+    node: tree_sitter::Node<'_>,
+    snapshot: &BufferSnapshot,
+    max_chars: usize,
+) -> String {
+    let raw = read_node_text(node, snapshot);
+    compact_whitespace_and_truncate(&raw, max_chars)
+}
+
+/// Collapses runs of whitespace in `text` to single spaces and truncates at `max_chars`
+/// Unicode scalar values.
+#[must_use]
+pub(crate) fn compact_whitespace_and_truncate(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut prev_ws = true;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !prev_ws {
+                out.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            out.push(ch);
+            prev_ws = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = out.chars().count();
+    if char_count <= max_chars {
+        return out;
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut truncated: String = out.chars().take(keep).collect();
+    if max_chars >= 3 {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+/// Trims trailing ASCII whitespace (`' '`, `'\t'`, `'\r'`, `'\n'`) from `range.end` inside
+/// `snapshot` and returns `(trimmed_end_byte, end_line)`.
+///
+/// Returns `None` if trimming shrinks the range to empty (`trimmed_end <= range.start`).
+#[must_use]
+pub(crate) fn trimmed_end_byte_and_line(
+    range: Range<usize>,
+    snapshot: &BufferSnapshot,
+) -> Option<(usize, usize)> {
+    let rope = snapshot.rope();
+    let len = rope.len_bytes();
+    let start = range.start.min(len);
+    let mut end = range.end.min(len);
+    if start >= end {
+        return None;
+    }
+
+    while end > start {
+        match rope.get_byte(end - 1) {
+            Some(b' ' | b'\t' | b'\r' | b'\n') => end -= 1,
+            _ => break,
+        }
+    }
+    if end <= start {
+        return None;
+    }
+
+    // `end` is inclusive-after-last-non-ws byte; the last byte of content is `end - 1`.
+    let line = rope.byte_to_line(end - 1);
+    Some((end, line))
+}
 
 /// Converts a [`kova_buffer::Point`] into a [`tree_sitter::Point`].
 #[must_use]
