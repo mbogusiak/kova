@@ -71,6 +71,7 @@ tree-sitter-toml-ng   = "0.7"
 unicode-segmentation = "1"
 unicode-width        = "0.2"
 zip                  = { version = "2", default-features = false, features = ["deflate"] }
+nucleo-matcher = { version = "0.1", features = ["default"] }
 
 [workspace.lints.cargo]
 unused_workspace_dependencies = "allow" # 12 library crates are pre-declared in E0 for upcoming epics
