@@ -24,6 +24,7 @@ use kova_core::perf::{
     BudgetKind, budgets, check_duration_budget, check_rss_budget, current_process_rss_bytes,
     sample_process_memory,
 };
+use kova_core::vim::VimEngine;
 
 fn bench_rss_probe_and_baseline(c: &mut Criterion) {
     // Verify baseline RSS reporting path once before micro-benchmarking the probe.
@@ -172,12 +173,32 @@ fn bench_input_latency_jetbrains_keymap(c: &mut Criterion) {
     });
 }
 
+fn bench_input_latency_vim_100k(c: &mut Criterion) {
+    let line = "fn compute(x: i32) { let y = (x + 1); }\n";
+    let text = line.repeat(100_000);
+    let mut engine = VimEngine::from_text(&text);
+
+    c.bench_function("budget_input_latency_vim_100k", |b| {
+        b.iter(|| {
+            let started = Instant::now();
+            engine.feed("G$%ddggu");
+            let report = check_duration_budget(
+                BudgetKind::InputLatency,
+                started.elapsed(),
+                budgets::INPUT_LATENCY_MAX,
+            );
+            black_box((engine.cursor(), report.is_within_budget()))
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_rss_probe_and_baseline,
     bench_input_latency_skeleton,
     bench_input_latency_keymap_resolver,
     bench_input_latency_jetbrains_keymap,
+    bench_input_latency_vim_100k,
     bench_cold_start_skeleton,
     bench_go_to_class_skeleton,
 );
