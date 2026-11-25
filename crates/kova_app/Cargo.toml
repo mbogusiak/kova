@@ -17,8 +17,13 @@ path = "src/main.rs"
 doc  = false
 
 [dependencies]
-kova_core.workspace = true
-kova_ui.workspace   = true
+gpui.workspace       = true
+kova_core.workspace  = true
+kova_theme.workspace = true
+kova_ui.workspace    = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui = { workspace = true, features = ["wayland", "x11"] }
 
 [lints]
 workspace = true

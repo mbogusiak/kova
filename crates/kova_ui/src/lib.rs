@@ -3,6 +3,14 @@
 //! GPU presentation layer (GPUI) — one of the only two crates allowed to depend
 //! on windowing (`kova_ui` and `kova_app`).
 
+pub mod editor;
+pub mod shell;
+pub mod theme;
+
+pub use editor::EditorView;
+pub use shell::{StartupMetrics, WorkspaceShell};
+pub use theme::{KovaTheme, ThemeState, hsla_from_rgba, rgba_to_gpui};
+
 /// Name of this crate as declared in its `Cargo.toml`.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
