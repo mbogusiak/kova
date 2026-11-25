@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kova_app",          # Binarka startowa, inicjalizacja GPUI i pętli zdarzeń
+    "crates/kova_core",         # Zarządzanie projektem, Akcje, Keymapa JetBrains + silnik modalny Vim
+    "crates/kova_config",       # Parser/serializer z zachowaniem komentarzy (toml_edit) dla settings.toml i kova.toml
+    "crates/kova_theme",        # System tokenów Aether (UI + Tree-sitter + Terminal + Wtyczki)
+    "crates/kova_buffer",       # Bufor tekstu (ropey), wielokursory, zaznaczenia, drzewo Undo/Redo
+    "crates/kova_syntax",       # Tree-sitter (Java, Kotlin, HTTP, TOML, JSON) + zapytania o punkty startowe (@Test/main)
+    "crates/kova_jvm_index",    # Indeks symboli projektu, parser bajtkodu .jar/.class (cafebabe) i fuzzy search (nucleo)
+    "crates/kova_toolchain",    # Menedżer "Omakase": detekcja JDK, pobieranie jdt.ls, Lombok, Vineflower, java-debug
+    "crates/kova_lsp_dap",      # Asynchroniczny mostek LSP, BSP i DAP z polityką limitów RAM i auto-usypiania JVM
+    "crates/kova_tools",        # Pakiet narzędzi JVM: Git (gix), runner plików .http, model wyników JUnit, Terminal PTY
+    "crates/kova_plugin_host",  # Sandbox Wasmtime + kontrakty WIT + mostek deklaratywnego UI
+    "crates/kova_ui",           # Komponenty GPUI: IntelliJ New UI Dock, Focus/Tiling Layout, Edytor, Okno Ustawień
+    "sdk/kova_plugin_rs",       # Oficjalne SDK w Rust do pisania wtyczek WASM
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+authors      = ["Kova Contributors"]
+license      = "MIT OR Apache-2.0"
+publish      = false
+
+[workspace.dependencies]
+kova_core        = { path = "crates/kova_core" }
+kova_config      = { path = "crates/kova_config" }
+kova_theme       = { path = "crates/kova_theme" }
+kova_buffer      = { path = "crates/kova_buffer" }
+kova_syntax      = { path = "crates/kova_syntax" }
+kova_jvm_index   = { path = "crates/kova_jvm_index" }
+kova_toolchain   = { path = "crates/kova_toolchain" }
+kova_lsp_dap     = { path = "crates/kova_lsp_dap" }
+kova_tools       = { path = "crates/kova_tools" }
+kova_plugin_host = { path = "crates/kova_plugin_host" }
+kova_ui          = { path = "crates/kova_ui" }
+kova_plugin_rs   = { path = "sdk/kova_plugin_rs" }
+
+[workspace.lints.cargo]
+unused_workspace_dependencies = "allow" # 12 library crates are pre-declared in E0 for upcoming epics
+unused_dependencies           = "allow" # Stub edges (kova_ui/kova_app) are wired before domain symbols exist
+
+[workspace.lints.rust]
+unsafe_code                   = "deny"
+missing_docs                  = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub               = "warn"
+unused_qualifications         = "warn"
+unused_lifetimes              = "warn"
+unused_import_braces          = "warn"
+trivial_casts                 = "warn"
+trivial_numeric_casts         = "warn"
+let_underscore_drop           = "warn"
+non_ascii_idents              = "deny"
+rust_2018_idioms              = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions         = "allow"
+allow_attributes_without_reason = "warn"
+dbg_macro                       = "warn"
+todo                            = "warn"
+unimplemented                   = "warn"
+print_stdout                    = "warn"
+print_stderr                    = "warn"
+unwrap_used                     = "warn"
+expect_used                     = "warn"
+exit                            = "warn"
+mem_forget                      = "warn"
+undocumented_unsafe_blocks      = "warn"
+wildcard_dependencies           = "warn"
