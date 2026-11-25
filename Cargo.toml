@@ -25,6 +25,7 @@ license      = "MIT OR Apache-2.0"
 publish      = false
 
 [workspace.dependencies]
+# Internal workspace crates
 kova_core        = { path = "crates/kova_core" }
 kova_config      = { path = "crates/kova_config" }
 kova_theme       = { path = "crates/kova_theme" }
@@ -39,7 +40,9 @@ kova_ui          = { path = "crates/kova_ui" }
 kova_plugin_rs   = { path = "sdk/kova_plugin_rs" }
 
 # External dependencies
-serde_json = "1"
+criterion    = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+memory-stats = "1.2"
+serde_json   = "1"
 
 [workspace.lints.cargo]
 unused_workspace_dependencies = "allow" # 12 library crates are pre-declared in E0 for upcoming epics
