@@ -548,9 +548,13 @@ name = "kova_jvm_index"
 version = "0.1.0"
 dependencies = [
  "cafebabe",
+ "ignore",
+ "kova_syntax",
+ "rayon",
  "serde",
  "tempfile",
  "thiserror",
+ "tree-sitter",
  "zip",
 ]
 
