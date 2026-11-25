@@ -51,6 +51,7 @@ pub enum ConfigError {
 pub enum KeymapPreset {
     /// `IntelliJ` IDEA / `JetBrains` default keybindings (Kova Omakase default).
     #[default]
+    #[serde(rename = "jetbrains")]
     JetBrains,
     /// Modal Vim keybindings as primary keymap.
     Vim,
@@ -397,7 +398,7 @@ impl SettingUpdate {
             Self::EditorVimMode(v) => ("editor.vim_mode", Some(toml_edit::Value::from(v))),
             Self::EditorKeymap(preset) => {
                 let s = match preset {
-                    KeymapPreset::JetBrains => "jet_brains",
+                    KeymapPreset::JetBrains => "jetbrains",
                     KeymapPreset::Vim => "vim",
                     KeymapPreset::Custom => "custom",
                 };

@@ -7,7 +7,7 @@ use std::io::{ErrorKind, Write as _};
 use std::path::Path;
 
 use tempfile::NamedTempFile;
-use toml_edit::{DocumentMut, Item, Table, Value};
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use crate::model::{ConfigError, KovaSettings, SettingUpdate};
 
@@ -21,7 +21,7 @@ line_height = 1.45
 tab_size = 4
 insert_spaces = true
 vim_mode = false
-keymap = "jet_brains"
+keymap = "jetbrains"
 
 [ui]
 theme = "kova-islands-dark"
@@ -354,14 +354,14 @@ pub(crate) fn save_atomic(path: &Path, contents: &str) -> Result<(), ConfigError
     Ok(())
 }
 
-fn collect_unknown_keys(table: &Table, prefix: &str, out: &mut Vec<String>) {
-    for (key, item) in table {
+fn collect_unknown_keys(table: &dyn TableLike, prefix: &str, out: &mut Vec<String>) {
+    for (key, item) in table.iter() {
         let full = if prefix.is_empty() {
             key.to_owned()
         } else {
             format!("{prefix}.{key}")
         };
-        if let Some(sub) = item.as_table() {
+        if let Some(sub) = item.as_table_like() {
             if matches!(key, "editor" | "ui" | "jvm" | "terminal") && prefix.is_empty() {
                 collect_unknown_keys(sub, &full, out);
             } else {

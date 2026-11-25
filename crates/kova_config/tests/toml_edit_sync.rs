@@ -292,3 +292,122 @@ vm_options = ["-Dspring.profiles.active=dev"]
     assert_eq!(user.jvm.jdtls_max_ram_mb, 2048);
     assert_eq!(user.jvm.preferred_jdk, None);
 }
+
+#[test]
+fn keymap_preset_deserializes_and_round_trips_jetbrains_vim_custom() {
+    for (raw_value, expected_preset) in [
+        ("jetbrains", KeymapPreset::JetBrains),
+        ("vim", KeymapPreset::Vim),
+        ("custom", KeymapPreset::Custom),
+    ] {
+        let raw = format!("[editor]\nkeymap = \"{raw_value}\"\n");
+        let doc = SettingsDocument::from_toml_str(&raw).expect("parse keymap preset");
+        assert_eq!(doc.settings().editor.keymap, expected_preset);
+    }
+
+    let mut doc = SettingsDocument::default_template().expect("default template");
+    assert_eq!(doc.settings().editor.keymap, KeymapPreset::JetBrains);
+    assert!(doc.to_toml_string().contains("keymap = \"jetbrains\""));
+
+    for preset in [
+        KeymapPreset::Vim,
+        KeymapPreset::Custom,
+        KeymapPreset::JetBrains,
+    ] {
+        doc.set_setting(SettingUpdate::EditorKeymap(preset))
+            .expect("update keymap");
+        assert_eq!(doc.settings().editor.keymap, preset);
+
+        let reparsed =
+            SettingsDocument::from_toml_str(&doc.to_toml_string()).expect("reparse keymap");
+        assert_eq!(reparsed.settings().editor.keymap, preset);
+    }
+    assert!(doc.to_toml_string().contains("keymap = \"jetbrains\""));
+}
+
+#[test]
+fn unknown_keys_detects_extra_keys_and_handles_inline_tables() {
+    let raw = r#"
+extra_top_level = true
+ui = { theme = "kova-light", custom_ui_flag = 42 }
+
+[editor]
+vim_mode = true
+experimental_flag = "on"
+
+[editor.nested]
+foo = 1
+
+[custom_plugin]
+enabled = true
+"#;
+
+    let doc = SettingsDocument::from_toml_str(raw).expect("parse with unknown keys");
+    let unknown = doc.unknown_keys();
+    assert_eq!(
+        unknown,
+        vec![
+            "extra_top_level",
+            "ui.custom_ui_flag",
+            "editor.experimental_flag",
+            "editor.nested",
+            "custom_plugin",
+        ]
+    );
+
+    let inline_known_only = "editor = { vim_mode = true, keymap = \"jetbrains\" }\n";
+    let inline_doc =
+        SettingsDocument::from_toml_str(inline_known_only).expect("parse inline editor table");
+    assert_eq!(inline_doc.unknown_keys(), Vec::<String>::new());
+}
+
+#[test]
+fn non_finite_floats_nan_and_infinity_are_rejected_and_rolled_back() {
+    let nan_toml = "[editor]\nfont_size = nan\n";
+    let err = SettingsDocument::from_toml_str(nan_toml).expect_err("NaN must fail validation");
+    assert!(matches!(
+        err,
+        ConfigError::Validation {
+            field: "editor.font_size",
+            ..
+        }
+    ));
+
+    let inf_toml = "[editor]\nline_height = inf\n";
+    let err = SettingsDocument::from_toml_str(inf_toml).expect_err("Inf must fail validation");
+    assert!(matches!(
+        err,
+        ConfigError::Validation {
+            field: "editor.line_height",
+            ..
+        }
+    ));
+
+    let raw = "[editor]\nfont_size = 13.0 # keep valid\n";
+    let mut doc = SettingsDocument::from_toml_str(raw).expect("parse valid float");
+
+    let nan_err = doc
+        .set_setting(SettingUpdate::EditorFontSize(f64::NAN))
+        .expect_err("f64::NAN update must fail");
+    assert!(matches!(
+        nan_err,
+        ConfigError::Validation {
+            field: "editor.font_size",
+            ..
+        }
+    ));
+    assert!((doc.settings().editor.font_size - 13.0).abs() < f64::EPSILON);
+    assert_eq!(doc.to_toml_string(), raw);
+
+    let inf_err = doc
+        .set_dotted_value("ui.sidebar_width", Value::from(f64::INFINITY))
+        .expect_err("f64::INFINITY update must fail");
+    assert!(matches!(
+        inf_err,
+        ConfigError::Validation {
+            field: "ui.sidebar_width",
+            ..
+        }
+    ));
+    assert_eq!(doc.to_toml_string(), raw);
+}
