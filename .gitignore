@@ -1,0 +1,42 @@
+# Rust / Cargo build & coverage artifacts
+# Note: Cargo.lock, jvm_rust_ide_plan.md, and kova.toml are intentionally tracked.
+target/
+**/*.rs.bk
+*.pdb
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.lcov
+
+# macOS temporary & metadata files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+*.dSYM/
+
+# Linux & general OS temporary / debug / profiling files
+*~
+.directory
+.Trash-*
+.nfs*
+*.swp
+*.swo
+*.tmp
+*.bak
+*.orig
+perf.data
+perf.data.old
+flamegraph.svg
+
+# External IDEs, editors, agent harnesses & Omarchy clean-repo guard
+.idea/
+.vscode/
+.zed/
+.fleet/
+.herdr/
+.kova/
+*.iml
