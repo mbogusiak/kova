@@ -19,7 +19,7 @@ It combines the ergonomics and visual clarity of **IntelliJ IDEA (New UI)** with
 
 Kova strictly separates deterministic IDE state from GPU rendering across a 13-crate Cargo workspace (11 headless crates + 2 GPU presentation crates):
 
-- **Headless Core (`kova_core`, `kova_config`, `kova_theme`, `kova_buffer`, `kova_syntax`, `kova_jvm_index`, `kova_toolchain`, `kova_lsp_dap`, `kova_tools`, `kova_plugin_host`, `kova_plugin_rs` in `sdk/kova_plugin_rs`):** All 11 crates outside `kova_ui` and `kova_app` compile and pass integration tests without initializing a graphics context or window. Text buffers use `ropey::Rope` with $O(1)$ `Arc` snapshots to feed `rayon` CPU workers, `tokio` async LSP/DAP/BSP bridges, semantic Aether theme tokens, and `wasmtime` plugins lock-free.
+- **Headless Core (`kova_core`, `kova_config`, `kova_theme`, `kova_buffer`, `kova_syntax`, `kova_jvm_index`, `kova_toolchain`, `kova_lsp_dap`, `kova_tools`, `kova_plugin_host`, `kova_plugin_rs` in `sdk/kova_plugin_rs`):** All 11 crates outside `kova_ui` and `kova_app` compile and pass integration tests without initializing a graphics context or window. This boundary is automatically enforced by [crates/kova_core/tests/headless_guardrail.rs](crates/kova_core/tests/headless_guardrail.rs). Text buffers use `ropey::Rope` with $O(1)$ `Arc` snapshots to feed `rayon` CPU workers, `tokio` async LSP/DAP/BSP bridges, semantic Aether theme tokens, and `wasmtime` plugins lock-free.
 - **GPU Presentation (`kova_ui`, `kova_app`):** 120 FPS hardware-accelerated rendering via **GPUI** on **macOS (Metal)** and **Linux (Wayland/X11 via Vulkan)**.
 
 See [jvm_rust_ide_plan.md](jvm_rust_ide_plan.md) for the complete architectural specification and roadmap.
@@ -58,6 +58,18 @@ Kova never pollutes your project repositories with hidden `.idea/` directories. 
 ```
 
 Projects remain completely clean; teams may optionally commit a single, explicit `kova.toml` file for shared run/build configurations.
+
+---
+
+## Development
+
+Run the workspace quality gate before opening any PR:
+
+```bash
+./scripts/verify-workspace.sh
+```
+
+This single command verifies formatting (`cargo fmt`), strict linting (`clippy -D warnings`), all workspace tests, the `Headless Core` dependency guardrail (`crates/kova_core/tests/headless_guardrail.rs`), UI-excluded headless test execution, and documentation (`cargo doc`).
 
 ---
 
