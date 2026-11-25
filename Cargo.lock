@@ -532,6 +532,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "ignore",
+ "kova_buffer",
  "kova_config",
  "memory-stats",
  "serde",

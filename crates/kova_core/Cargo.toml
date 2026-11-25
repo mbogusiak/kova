@@ -10,6 +10,7 @@ publish.workspace      = true
 
 [dependencies]
 ignore       = { workspace = true }
+kova_buffer  = { workspace = true }
 kova_config  = { workspace = true }
 memory-stats = { workspace = true }
 serde        = { workspace = true }

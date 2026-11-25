@@ -9,6 +9,7 @@ pub mod context;
 pub mod keymap;
 pub mod perf;
 pub mod project;
+pub mod vim;
 
 pub use action::{
     ActionCategory, ActionDescriptor, ActionError, ActionId, ActionRegistry, ActionSource,
@@ -31,6 +32,10 @@ pub use project::{
     SESSION_SCHEMA_VERSION, SessionLayoutState, WorkspaceSession, load_recent_workspaces,
     load_workspace_session, load_workspace_session_or_default, record_recent_workspace,
     save_recent_workspaces, save_workspace_session, scan_project,
+};
+
+pub use vim::{
+    KeyConflictPolicy, Register, VimCursorShape, VimEngine, VimKey, VimMode, VimOutcome, VimStatus,
 };
 
 /// Name of this crate as declared in its `Cargo.toml`.
