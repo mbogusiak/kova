@@ -8,6 +8,7 @@ pub mod document;
 pub mod model;
 pub mod paths;
 pub mod project;
+pub mod watcher;
 
 pub use document::SettingsDocument;
 pub use model::{
@@ -18,6 +19,10 @@ pub use paths::{KovaPaths, PathsError};
 pub use project::{
     EffectiveConfig, ProjectBuildTool, ProjectConfig, ProjectConfigDocument,
     ProjectEditorOverrides, ProjectJvmOverrides, RunConfigKind, RunConfiguration,
+};
+pub use watcher::{
+    ConfigReloadEvent, ConfigWatcher, ConfigWatcherHandle, ConfigWatcherOptions, LiveConfigState,
+    ReloadTarget, WatcherError,
 };
 
 /// Name of this crate as declared in its `Cargo.toml`.
