@@ -4,15 +4,27 @@
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
 
 pub mod bytecode;
+pub mod classpath;
+pub mod discovery;
 pub mod error;
+pub mod indexer;
 pub mod model;
 pub mod signature;
+pub mod source;
 
 pub use bytecode::{
     ArchiveScanResult, ArchiveScanStats, BytecodeScanOptions, DEFAULT_MAX_CLASS_BYTES,
     DEFAULT_TARGET_JAVA_VERSION, parse_class_bytes, scan_jar_archive,
 };
+pub use classpath::{
+    ClasspathDiscoveryConfig, ClasspathEntry, ClasspathOrigin, DEFAULT_MAX_JAR_COUNT,
+    discover_classpath,
+};
+pub use discovery::{DiscoveredSourceFile, SourceDiscoveryOptions, collect_project_sources};
 pub use error::JvmIndexError;
+pub use indexer::{
+    IndexCancelToken, IndexStats, IndexerConfig, JvmWorkspaceIndex, WorkspaceIndexer,
+};
 pub use model::{
     JvmMemberEntry, JvmModifiers, JvmSourceOrigin, JvmSymbolKind, JvmTypeEntry, JvmVisibility,
     ParsedClassUnit, internal_name_to_binary, internal_name_to_fqcn,
@@ -25,6 +37,10 @@ pub use signature::{
     decode_field_descriptor_with_mode, decode_field_signature, decode_field_signature_with_mode,
     decode_method_descriptor, decode_method_descriptor_with_mode, decode_method_signature,
     decode_method_signature_with_mode, parse_class_signature,
+};
+pub use source::{
+    DEFAULT_MAX_SOURCE_BYTES, SourceScanOptions, parse_java_source, parse_kotlin_source,
+    parse_source_file,
 };
 
 /// Name of this crate as declared in its `Cargo.toml`.
