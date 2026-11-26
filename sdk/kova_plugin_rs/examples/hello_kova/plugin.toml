@@ -1,0 +1,17 @@
+# Hello Kova — minimal example plugin for the kova_plugin_rs SDK (KOVA-046).
+# Build: cargo build --release --target wasm32-wasip2 -p hello_kova
+id          = "hello-kova"
+name        = "Hello Kova"
+version     = "0.1.0"
+entrypoint  = "hello_kova.wasm"
+api_version = "0.1.0"
+description = "Shows every declarative widget kind and greets the user from a command."
+
+[permissions]
+# Needs no host data: the panel is built from plugin state only.
+editor_read   = false
+editor_write  = false
+network       = []
+fs_read       = false
+fs_write      = false
+process_spawn = false

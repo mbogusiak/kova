@@ -1,0 +1,19 @@
+[package]
+name                   = "hello_kova"
+description            = "Minimal example plugin for the kova_plugin_rs SDK (KOVA-046)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+publish.workspace      = true
+
+[lib]
+# cdylib: WASM component for kova_plugin_host; rlib: native unit tests of plugin logic.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+kova_plugin_rs = { workspace = true }
+
+[lints]
+workspace = true

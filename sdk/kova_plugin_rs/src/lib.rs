@@ -4,12 +4,17 @@
 //! contract (the single source of truth lives in
 //! `crates/kova_plugin_host/wit/kova-plugin.wit`) and adds:
 //!
-//! - [`ui::UiBuilder`] and the [`ui`] widget constructors for building
-//!   arena-encoded declarative widget trees,
+//! - [`KovaPlugin`], a stateful trait with default hooks; any type
+//!   implementing it is a WIT [`Guest`] through a blanket impl,
+//! - the [`export_plugin!`] macro wiring a [`KovaPlugin`] (or a hand-written
+//!   [`Guest`]) implementation to the component exports,
+//! - [`ui::Element`] (fluent, nested) plus [`ui::UiBuilder`] (arena) and the
+//!   [`ui`] widget constructors for every WIT widget kind,
 //! - [`language::LanguageServerDescriptor`], a data-only template used by
-//!   optional language packs (Kotlin LSP, Scala Metals),
-//! - the [`export_plugin!`] macro wiring a [`Guest`] implementation to the
-//!   component exports.
+//!   optional language packs (Kotlin LSP, Scala Metals).
+//!
+//! Start with `use kova_plugin_rs::prelude::*;` and see the `hello_kova`
+//! example in `sdk/kova_plugin_rs/examples/hello_kova`.
 //!
 //! Compile plugins for `wasm32-wasip2` (`cargo build --target wasm32-wasip2`)
 //! to obtain a Component Model `.wasm` file loadable by `kova_plugin_host`.
@@ -23,7 +28,10 @@
 extern crate self as kova_plugin_rs;
 
 pub mod language;
+pub mod plugin;
 pub mod ui;
+
+pub use plugin::{KovaPlugin, command, tool_window};
 
 #[allow(
     unsafe_code,
@@ -77,13 +85,26 @@ pub mod host {
     };
 }
 
-/// Exports a type implementing [`Guest`] as the plugin component entrypoint.
+/// Everything a typical plugin needs: `use kova_plugin_rs::prelude::*;`.
+pub mod prelude {
+    pub use crate::plugin::{KovaPlugin, command, tool_window};
+    pub use crate::ui::{self, Element, UiBuilder, WidgetKindExt};
+    pub use crate::{
+        CommandDescriptor, LogLevel, PluginEvent, SemanticIcon, SplitDirection, StyleVariant,
+        ToolWindowDescriptor, UiEvent, UiEventKind, WidgetKind, WidgetTree, export_plugin, host,
+    };
+}
+
+/// Exports a plugin type as the component entrypoint.
 ///
-/// Invoke exactly once at the crate root of a `cdylib` plugin:
+/// The type implements either [`KovaPlugin`] (recommended: stateful, with
+/// default hooks) or the raw [`Guest`] trait. Invoke exactly once at the crate
+/// root of a `cdylib` plugin:
 ///
 /// ```ignore
+/// #[derive(Default)]
 /// struct MyPlugin;
-/// impl kova_plugin_rs::Guest for MyPlugin { /* ... */ }
+/// impl kova_plugin_rs::KovaPlugin for MyPlugin { /* ... */ }
 /// kova_plugin_rs::export_plugin!(MyPlugin);
 /// ```
 #[macro_export]
