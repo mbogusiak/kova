@@ -1,5 +1,6 @@
 //! Edit descriptors and immutable syntax tree snapshots (`SyntaxEdit`, `SyntaxTree`).
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -196,6 +197,27 @@ impl SyntaxTree {
         self.tree.root_node()
     }
 
+    /// Returns the smallest syntax node byte range that strictly encloses `start..end`,
+    /// climbing parent nodes when the innermost node matches `start..end` exactly.
+    #[must_use]
+    pub fn enclosing_node_range(&self, start: usize, end: usize) -> Option<Range<usize>> {
+        let root = self.tree.root_node();
+        let clamped_start = start.min(root.end_byte());
+        let clamped_end = end.max(clamped_start).min(root.end_byte());
+        let mut node = root.descendant_for_byte_range(clamped_start, clamped_end)?;
+        loop {
+            let n_start = node.start_byte();
+            let n_end = node.end_byte();
+            if n_start <= clamped_start
+                && n_end >= clamped_end
+                && (n_start < clamped_start || n_end > clamped_end)
+            {
+                return Some(n_start..n_end);
+            }
+            node = node.parent()?;
+        }
+    }
+
     /// Returns `true` if the syntax tree contains any syntax or missing-token errors.
     #[must_use]
     pub fn has_error(&self) -> bool {
@@ -283,5 +305,40 @@ mod tests {
         assert_eq!(edited.root_node().end_byte(), 11);
         // Original `SyntaxTree` remains completely immutable.
         assert_eq!(tree.root_node().end_byte(), source.len());
+    }
+
+    #[test]
+    fn enclosing_node_range_climbs_strictly_larger_ast_parents() {
+        let source = "{\"alpha\": [1, 2]}";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_json::LANGUAGE.into())
+            .unwrap();
+        let ts_tree = parser.parse(source, None).unwrap();
+        let tree = SyntaxTree::new(
+            BufferId::new(1),
+            BufferVersion::new(0),
+            SyntaxLanguage::Json,
+            ts_tree,
+            Duration::from_micros(50),
+            false,
+        );
+
+        let one_pos = source.find('1').unwrap();
+        let num_range = tree.enclosing_node_range(one_pos, one_pos).unwrap();
+        assert_eq!(&source[num_range.clone()], "1");
+        let array_range = tree
+            .enclosing_node_range(num_range.start, num_range.end)
+            .unwrap();
+        assert_eq!(&source[array_range.clone()], "[1, 2]");
+        let pair_range = tree
+            .enclosing_node_range(array_range.start, array_range.end)
+            .unwrap();
+        assert_eq!(&source[pair_range.clone()], "\"alpha\": [1, 2]");
+        let obj_range = tree
+            .enclosing_node_range(pair_range.start, pair_range.end)
+            .unwrap();
+        assert_eq!(&source[obj_range.clone()], source);
+        assert_eq!(tree.enclosing_node_range(0, source.len()), None);
     }
 }

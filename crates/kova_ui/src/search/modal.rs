@@ -45,6 +45,7 @@ pub enum SearchKeyOutcome {
 #[derive(Debug)]
 pub struct SearchEverywhereState {
     open: bool,
+    recent_files_mode: bool,
     scope: SearchScope,
     query: TextInputState,
     entries: Vec<SearchEntry>,
@@ -66,6 +67,7 @@ impl SearchEverywhereState {
     pub fn new() -> Self {
         Self {
             open: false,
+            recent_files_mode: false,
             scope: SearchScope::All,
             query: TextInputState::default(),
             entries: Vec::new(),
@@ -80,6 +82,12 @@ impl SearchEverywhereState {
     #[must_use]
     pub const fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Whether the modal is showing the MRU *Recent Files* list (`Cmd+E` / `Ctrl+E`).
+    #[must_use]
+    pub const fn is_recent_files_mode(&self) -> bool {
+        self.recent_files_mode
     }
 
     /// Active scope tab.
@@ -114,17 +122,39 @@ impl SearchEverywhereState {
 
     /// Opens the modal with a fresh candidate snapshot and resets query/selection.
     pub fn open(&mut self, entries: Vec<SearchEntry>) {
+        self.open_with_scope(entries, SearchScope::All);
+    }
+
+    /// Opens the modal pre-selected on `scope`.
+    pub fn open_with_scope(&mut self, entries: Vec<SearchEntry>, scope: SearchScope) {
         self.open = true;
-        self.scope = SearchScope::All;
+        self.recent_files_mode = false;
+        self.scope = scope;
         self.query = TextInputState::default();
         self.entries = entries;
         self.selected = 0;
         self.recompute();
     }
 
+    /// Opens the modal in *Recent Files* MRU mode (`Cmd+E` / `Ctrl+E`), pre-selecting index `1`
+    /// when at least two files exist so `Cmd+E` + `Enter` toggles between the last two files.
+    pub fn open_recent_files(&mut self, entries: Vec<SearchEntry>) {
+        self.open = true;
+        self.recent_files_mode = true;
+        self.scope = SearchScope::Files;
+        self.query = TextInputState::default();
+        self.entries = entries;
+        self.selected = 0;
+        self.recompute();
+        if self.hits.len() >= 2 {
+            self.selected = 1;
+        }
+    }
+
     /// Closes the modal and drops transient results.
     pub fn close(&mut self) {
         self.open = false;
+        self.recent_files_mode = false;
         self.hits.clear();
         self.entries.clear();
         self.query.clear();
@@ -179,12 +209,14 @@ impl SearchEverywhereState {
             };
         }
         if key == "tab" && !mods.platform && !mods.control && !mods.alt {
-            let next = if mods.shift {
-                self.scope.prev()
-            } else {
-                self.scope.next()
-            };
-            self.set_scope(next);
+            if !self.recent_files_mode {
+                let next = if mods.shift {
+                    self.scope.prev()
+                } else {
+                    self.scope.next()
+                };
+                self.set_scope(next);
+            }
             return SearchKeyOutcome::Consumed;
         }
 
@@ -327,6 +359,31 @@ impl SearchEverywhereModal {
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
 
+    /// Opens the modal pre-selected on `scope`.
+    pub fn open_with_scope(
+        &mut self,
+        entries: Vec<SearchEntry>,
+        scope: SearchScope,
+        return_focus: Option<FocusHandle>,
+    ) {
+        self.return_focus = return_focus;
+        self.state.open_with_scope(entries, scope);
+        self.scroll
+            .scroll_to_item(self.state.selected(), ScrollStrategy::Top);
+    }
+
+    /// Opens the modal in *Recent Files* MRU mode.
+    pub fn open_recent_files(
+        &mut self,
+        entries: Vec<SearchEntry>,
+        return_focus: Option<FocusHandle>,
+    ) {
+        self.return_focus = return_focus;
+        self.state.open_recent_files(entries);
+        self.scroll
+            .scroll_to_item(self.state.selected(), ScrollStrategy::Top);
+    }
+
     /// Closes the modal and yields the saved [`FocusHandle`] to restore.
     pub fn close(&mut self) -> Option<FocusHandle> {
         self.state.close();
@@ -391,7 +448,7 @@ impl SearchEverywhereModal {
         let tabs_bar = self.render_tabs_bar(&p, active_bg, tab_indicator, border_subtle, cx);
         let input_bar = self.render_input_bar(&p, border_subtle);
         let results = self.render_results(list_height, &p, cx);
-        let footer = Self::render_footer(&p, border_subtle);
+        let footer = Self::render_footer(self.state.is_recent_files_mode(), &p, border_subtle);
 
         let card = div()
             .id("search-everywhere-panel")
@@ -453,34 +510,43 @@ impl SearchEverywhereModal {
         border_subtle: gpui::Hsla,
         cx: &Context<'_, WorkspaceShell>,
     ) -> Div {
-        let mut tabs = div().flex().items_center().gap(px(2.0));
-        for (idx, scope) in SearchScope::ALL.into_iter().enumerate() {
-            let active = scope == self.state.scope();
-            let mut tab = div()
-                .id(("se-scope-tab", idx))
-                .h(px(26.0))
-                .px(px(10.0))
-                .flex()
-                .items_center()
-                .rounded(px(5.0))
-                .text_size(px(12.0))
-                .cursor_pointer()
-                .hover(|s| s.bg(p.hover))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    this.set_search_scope(scope, window, cx);
-                }));
-            tab = if active {
-                tab.bg(active_bg)
-                    .text_color(p.text)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .border_b_2()
-                    .border_color(tab_indicator)
-            } else {
-                tab.text_color(p.text_muted)
-            };
-            tabs = tabs.child(tab.child(scope.label()));
-        }
+        let left = if self.state.is_recent_files_mode() {
+            div()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(p.text)
+                .child("Recent Files")
+        } else {
+            let mut tabs = div().flex().items_center().gap(px(2.0));
+            for (idx, scope) in SearchScope::ALL.into_iter().enumerate() {
+                let active = scope == self.state.scope();
+                let mut tab = div()
+                    .id(("se-scope-tab", idx))
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(5.0))
+                    .text_size(px(12.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(p.hover))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.set_search_scope(scope, window, cx);
+                    }));
+                tab = if active {
+                    tab.bg(active_bg)
+                        .text_color(p.text)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .border_b_2()
+                        .border_color(tab_indicator)
+                } else {
+                    tab.text_color(p.text_muted)
+                };
+                tabs = tabs.child(tab.child(scope.label()));
+            }
+            tabs
+        };
 
         let summary = format!(
             "{} hits · {:.1} ms",
@@ -496,7 +562,7 @@ impl SearchEverywhereModal {
             .justify_between()
             .border_b_1()
             .border_color(border_subtle)
-            .child(tabs)
+            .child(left)
             .child(
                 div()
                     .text_size(px(11.0))
@@ -508,6 +574,11 @@ impl SearchEverywhereModal {
     fn render_input_bar(&self, p: &ControlPalette, border_subtle: gpui::Hsla) -> Div {
         let (before, after) = self.state.query().split_at_cursor();
         let empty = before.is_empty() && after.is_empty();
+        let placeholder = if self.state.is_recent_files_mode() {
+            "Filter recent files…"
+        } else {
+            "Search classes, files, symbols, actions… (or :line)"
+        };
 
         let mut field = div()
             .flex_1()
@@ -528,7 +599,7 @@ impl SearchEverywhereModal {
                     .ml(px(2.0))
                     .text_size(px(13.0))
                     .text_color(p.text_muted)
-                    .child("Search classes, files, symbols, actions… (or :line)"),
+                    .child(placeholder),
             );
         }
 
@@ -591,7 +662,16 @@ impl SearchEverywhereModal {
         )
     }
 
-    fn render_footer(p: &ControlPalette, border_subtle: gpui::Hsla) -> Div {
+    fn render_footer(
+        recent_files_mode: bool,
+        p: &ControlPalette,
+        border_subtle: gpui::Hsla,
+    ) -> Div {
+        let hints = if recent_files_mode {
+            "↑↓ Navigate · Enter Open · Shift+Enter Split · Esc Close"
+        } else {
+            "↑↓ Navigate · Tab Scope · Enter Open · Shift+Enter Split · Esc Close"
+        };
         div()
             .h(px(28.0))
             .px(px(12.0))
@@ -602,7 +682,7 @@ impl SearchEverywhereModal {
             .border_color(border_subtle)
             .text_size(px(11.0))
             .text_color(p.text_muted)
-            .child("↑↓ Navigate · Tab Scope · Enter Open · Shift+Enter Split · Esc Close")
+            .child(hints)
     }
 }
 
@@ -881,5 +961,59 @@ mod tests {
         assert_eq!(modal.handle_key(&ks("delete")), SearchKeyOutcome::Consumed);
         assert_eq!(modal.query().text(), "");
         assert_eq!(modal.handle_key(&ks("escape")), SearchKeyOutcome::Close);
+    }
+
+    #[test]
+    fn open_with_scope_and_recent_files_mode_behave_per_intellij() {
+        let mut modal = SearchEverywhereState::new();
+        modal.open_with_scope(sample_entries(), SearchScope::Classes);
+        assert!(modal.is_open());
+        assert!(!modal.is_recent_files_mode());
+        assert_eq!(modal.scope(), SearchScope::Classes);
+        assert_eq!(modal.hits().len(), 1);
+
+        let files = vec![
+            SearchEntry {
+                kind: SearchEntryKind::File,
+                title: "Current.java".to_owned(),
+                subtitle: "src".to_owned(),
+                match_text: "src/Current.java".to_owned(),
+                icon: "F",
+                shortcut_hint: None,
+                target: SearchTarget::File {
+                    path: PathBuf::from("src/Current.java"),
+                    line: None,
+                },
+            },
+            SearchEntry {
+                kind: SearchEntryKind::File,
+                title: "Previous.java".to_owned(),
+                subtitle: "src".to_owned(),
+                match_text: "src/Previous.java".to_owned(),
+                icon: "F",
+                shortcut_hint: None,
+                target: SearchTarget::File {
+                    path: PathBuf::from("src/Previous.java"),
+                    line: None,
+                },
+            },
+        ];
+        modal.open_recent_files(files);
+        assert!(modal.is_recent_files_mode());
+        assert_eq!(modal.scope(), SearchScope::Files);
+        assert_eq!(modal.selected(), 1, "pre-selects previous file at index 1");
+        // Tab in Recent Files mode keeps scope fixed at Files.
+        assert_eq!(
+            modal.handle_key(&ks_char("tab", "\t")),
+            SearchKeyOutcome::Consumed
+        );
+        assert_eq!(modal.scope(), SearchScope::Files);
+        assert_eq!(
+            modal.handle_key(&ks_char("enter", "\n")),
+            SearchKeyOutcome::Activate {
+                index: 1,
+                split: false
+            }
+        );
     }
 }

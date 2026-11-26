@@ -21,6 +21,8 @@ pub enum ExCommand {
     Split(SplitAxis),
     /// `:<n>` — jump to 1-based line `n`.
     GoToLine(usize),
+    /// `:<n>:<c>` — jump to 1-based line `n` and 1-based column `c`.
+    GoToLineColumn(usize, usize),
     /// `:noh` — clear search highlighting.
     NoHighlight,
     /// `:only` — Focus Mode (hide every dock).
@@ -63,6 +65,17 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand, ExParseError> {
             .parse::<usize>()
             .map(|line| ExCommand::GoToLine(line.max(1)))
             .map_err(|_| ExParseError::NotAnEditorCommand(cmd.to_owned()));
+    }
+    if let Some((line_str, col_str)) = cmd.split_once(':')
+        && !line_str.is_empty()
+        && !col_str.is_empty()
+        && line_str.bytes().all(|b| b.is_ascii_digit())
+        && col_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return match (line_str.parse::<usize>(), col_str.parse::<usize>()) {
+            (Ok(line), Ok(col)) => Ok(ExCommand::GoToLineColumn(line.max(1), col.max(1))),
+            _ => Err(ExParseError::NotAnEditorCommand(cmd.to_owned())),
+        };
     }
     Ok(match cmd {
         "w" | "write" => ExCommand::Write,
@@ -224,6 +237,19 @@ mod tests {
         );
         assert_eq!(parse_ex_command("42"), Ok(ExCommand::GoToLine(42)));
         assert_eq!(parse_ex_command("0"), Ok(ExCommand::GoToLine(1)));
+        assert_eq!(
+            parse_ex_command("42:10"),
+            Ok(ExCommand::GoToLineColumn(42, 10))
+        );
+        assert_eq!(parse_ex_command("0:0"), Ok(ExCommand::GoToLineColumn(1, 1)));
+        assert!(matches!(
+            parse_ex_command("42:"),
+            Err(ExParseError::NotAnEditorCommand(_))
+        ));
+        assert!(matches!(
+            parse_ex_command(":10"),
+            Err(ExParseError::NotAnEditorCommand(_))
+        ));
         assert_eq!(parse_ex_command("noh"), Ok(ExCommand::NoHighlight));
         assert_eq!(parse_ex_command("only"), Ok(ExCommand::Only));
         assert_eq!(parse_ex_command("  "), Err(ExParseError::Empty));

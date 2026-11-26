@@ -92,6 +92,18 @@ impl EditorSyntax {
         self.entry_points.get(idx).filter(|e| e.line == line)
     }
 
+    /// Returns the grammar language of this syntax snapshot.
+    #[must_use]
+    pub const fn language(&self) -> kova_theme::SyntaxLanguage {
+        self.tree.language()
+    }
+
+    /// Returns the smallest enclosing AST node range strictly larger than `start..end`.
+    #[must_use]
+    pub fn enclosing_node_range(&self, start: usize, end: usize) -> Option<Range<usize>> {
+        self.tree.enclosing_node_range(start, end)
+    }
+
     /// Returns the absolute start byte of `line` in [`Self::snapshot`], or `None` past its end.
     #[must_use]
     pub fn line_start_byte(&self, line: usize) -> Option<usize> {

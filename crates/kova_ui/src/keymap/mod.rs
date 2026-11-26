@@ -29,6 +29,7 @@ use kova_core::{
 pub use ex::{ExCommand, ExCommandLine, ExLineEvent, ExParseError, parse_ex_command};
 
 use crate::dock::{Direction, DockToolId, FocusModeVariant, SplitAxis};
+use crate::search::SearchScope;
 
 /// Chord prefix timeout (`1000 ms`, `KOVA-026` FR-3).
 pub const CHORD_TIMEOUT: std::time::Duration = DEFAULT_CHORD_TIMEOUT;
@@ -219,6 +220,16 @@ pub enum ShellAction {
     AddNextOccurrence,
     /// Open *Search Everywhere* (`Shift Shift`).
     OpenSearchEverywhere,
+    /// Open *Search Everywhere* pre-focused on a specific scope tab (`Cmd+O`, `Cmd+Shift+O`, `Cmd+Alt+O`, `Cmd+Shift+A`).
+    OpenSearchScope(SearchScope),
+    /// Open *Recent Files* popup (`Cmd+E` / `Ctrl+E`).
+    OpenRecentFiles,
+    /// Open inline *Go to Line/Column* prompt (`Cmd+L` / `Ctrl+G`).
+    GoToLine,
+    /// Jump to the next problem (`F2`).
+    NextProblem,
+    /// Jump to the previous problem (`Shift+F2`).
+    PrevProblem,
     /// Open *Settings* (`Cmd+,`).
     OpenSettings,
     /// Open or close the Git *Commit* panel (`Cmd+K` / `Ctrl+K`).
@@ -229,6 +240,46 @@ pub enum ShellAction {
     NavigateBack,
     /// Step forward in navigation history (`Cmd+]` / `Ctrl+Alt+Right`).
     NavigateForward,
+    /// Delete the line(s) at active carets (`Cmd+Backspace` / `Ctrl+Y`).
+    DeleteLine,
+    /// Toggle block comment around selection or caret (`Cmd+Alt+/` / `Ctrl+Shift+/`).
+    ToggleBlockComment,
+    /// Move current line or selection up (`true`) or down (`false`) (`Alt+Shift+Up/Down`).
+    MoveLine(bool),
+    /// Extend selection outward (`Alt+Up` / `Ctrl+W`).
+    ExtendSelection,
+    /// Shrink selection inward (`Alt+Down` / `Ctrl+Shift+W`).
+    ShrinkSelection,
+    /// Reformat active file (`Cmd+Alt+L` / `Ctrl+Alt+L`).
+    ReformatCode,
+    /// Unselect the last added multi-cursor occurrence (`Ctrl+Shift+G` / `Alt+Shift+J`).
+    UnselectOccurrence,
+    /// Select all occurrences of word or selection (`Ctrl+Cmd+G` / `Ctrl+Alt+Shift+J`).
+    SelectAllOccurrences,
+    /// Editor escape: close inline find bar or clear multi-cursors/selection (`Esc` when Vim is off).
+    EditorEscape,
+    /// Collapse foldable region at caret (`Cmd+-` / `Ctrl+-`).
+    FoldRegion,
+    /// Expand foldable region at caret (`Cmd+=` / `Ctrl+=`).
+    UnfoldRegion,
+    /// Collapse all foldable regions (`Cmd+Shift+-` / `Ctrl+Shift+-`).
+    FoldAll,
+    /// Expand all foldable regions (`Cmd+Shift+=` / `Ctrl+Shift+=`).
+    UnfoldAll,
+    /// Open inline Find bar (`Cmd+F` / `Ctrl+F`).
+    Find,
+    /// Open inline Replace bar (`Cmd+R` / `Ctrl+R`).
+    Replace,
+    /// Jump to next find match (`Cmd+G` / `F3`).
+    FindNext,
+    /// Jump to previous find match (`Cmd+Shift+G` / `Shift+F3`).
+    FindPrev,
+    /// Open workspace-wide *Find in Files* modal (`Cmd+Shift+F` / `Ctrl+Shift+F`).
+    FindInFiles,
+    /// Run entry point at caret context (`Ctrl+Shift+R` / `Ctrl+Shift+F10`).
+    RunContext,
+    /// Re-run last executed configuration or entry point (`Ctrl+R` / `Shift+F10`).
+    RunLast,
     /// JVM debugger command (`KOVA-041`).
     Debug(DebugShellAction),
 }
@@ -261,7 +312,9 @@ impl ShellAction {
     pub fn from_action_id(action: &ActionId) -> Option<Self> {
         Some(match action.as_str() {
             ids::TOOL_WINDOW_PROJECT => Self::ToggleTool(DockToolId::Project),
-            ids::TOOL_WINDOW_STRUCTURE => Self::ToggleTool(DockToolId::Structure),
+            ids::TOOL_WINDOW_STRUCTURE | ids::NAVIGATION_FILE_STRUCTURE => {
+                Self::ToggleTool(DockToolId::Structure)
+            }
             ids::TOOL_WINDOW_RUN => Self::ToggleTool(DockToolId::Run),
             ids::TOOL_WINDOW_PROBLEMS => Self::ToggleTool(DockToolId::Problems),
             ids::TOOL_WINDOW_GIT => Self::ToggleTool(DockToolId::Commit),
@@ -288,16 +341,45 @@ impl ShellAction {
             ids::VIEW_CLOSE_TAB => Self::CloseActiveTab,
             ids::NAVIGATION_NEXT_TAB => Self::CycleTab(true),
             ids::NAVIGATION_PREV_TAB => Self::CycleTab(false),
+            ids::NAVIGATION_GO_TO_CLASS => Self::OpenSearchScope(SearchScope::Classes),
+            ids::NAVIGATION_GO_TO_FILE => Self::OpenSearchScope(SearchScope::Files),
+            ids::NAVIGATION_GO_TO_SYMBOL => Self::OpenSearchScope(SearchScope::Symbols),
+            ids::NAVIGATION_FIND_ACTION => Self::OpenSearchScope(SearchScope::Actions),
+            ids::NAVIGATION_RECENT_FILES => Self::OpenRecentFiles,
+            ids::NAVIGATION_GO_TO_LINE => Self::GoToLine,
+            ids::NAVIGATION_NEXT_ERROR => Self::NextProblem,
+            ids::NAVIGATION_PREV_ERROR => Self::PrevProblem,
             ids::NAVIGATION_GO_TO_DECLARATION => Self::GoToDefinition,
             ids::NAVIGATION_BACK => Self::NavigateBack,
             ids::NAVIGATION_FORWARD => Self::NavigateForward,
             ids::EDITOR_SAVE => Self::Save,
+            ids::EDITOR_ESCAPE => Self::EditorEscape,
             ids::EDITOR_DUPLICATE_LINE => Self::DuplicateLine,
+            ids::EDITOR_DELETE_LINE => Self::DeleteLine,
             ids::EDITOR_TOGGLE_LINE_COMMENT => Self::ToggleLineComment,
+            ids::EDITOR_TOGGLE_BLOCK_COMMENT => Self::ToggleBlockComment,
+            ids::EDITOR_MOVE_LINE_UP => Self::MoveLine(true),
+            ids::EDITOR_MOVE_LINE_DOWN => Self::MoveLine(false),
+            ids::EDITOR_EXTEND_SELECTION => Self::ExtendSelection,
+            ids::EDITOR_SHRINK_SELECTION => Self::ShrinkSelection,
+            ids::EDITOR_REFORMAT_CODE => Self::ReformatCode,
             ids::EDITOR_ADD_NEXT_OCCURRENCE => Self::AddNextOccurrence,
+            ids::EDITOR_UNSELECT_OCCURRENCE => Self::UnselectOccurrence,
+            ids::EDITOR_SELECT_ALL_OCCURRENCES => Self::SelectAllOccurrences,
+            ids::EDITOR_FOLD_REGION => Self::FoldRegion,
+            ids::EDITOR_UNFOLD_REGION => Self::UnfoldRegion,
+            ids::EDITOR_FOLD_ALL => Self::FoldAll,
+            ids::EDITOR_UNFOLD_ALL => Self::UnfoldAll,
+            ids::EDITOR_FIND => Self::Find,
+            ids::EDITOR_REPLACE => Self::Replace,
+            ids::EDITOR_FIND_NEXT => Self::FindNext,
+            ids::EDITOR_FIND_PREV => Self::FindPrev,
+            ids::EDITOR_FIND_IN_FILES => Self::FindInFiles,
             ids::NAVIGATION_SEARCH_EVERYWHERE => Self::OpenSearchEverywhere,
             ids::VIEW_OPEN_SETTINGS => Self::OpenSettings,
             ids::GIT_COMMIT => Self::ToggleCommitPanel,
+            ids::RUN_RUN_CONTEXT => Self::RunContext,
+            ids::RUN_RUN_LAST => Self::RunLast,
             ids::DEBUG_TOGGLE_LINE_BREAKPOINT => Self::Debug(DebugShellAction::ToggleBreakpoint),
             ids::DEBUG_STEP_OVER => Self::Debug(DebugShellAction::StepOver),
             ids::DEBUG_STEP_INTO => Self::Debug(DebugShellAction::StepInto),
@@ -1258,5 +1340,164 @@ mod tests {
             mac.dispatch(shortcut_stroke(&ks("cmd-d")).unwrap(), ro_ctx, now),
             DispatchOutcome::Unhandled
         );
+    }
+
+    #[test]
+    fn intellij_shortcuts_resolve_on_macos() {
+        let now = Instant::now();
+        let editor = FocusContext::EditorText;
+        let mut mac = KeyDispatchLayer::new(Platform::MacOs);
+        let mac_cases = [
+            ("cmd-o", ShellAction::OpenSearchScope(SearchScope::Classes)),
+            (
+                "cmd-shift-o",
+                ShellAction::OpenSearchScope(SearchScope::Files),
+            ),
+            (
+                "cmd-alt-o",
+                ShellAction::OpenSearchScope(SearchScope::Symbols),
+            ),
+            (
+                "cmd-shift-a",
+                ShellAction::OpenSearchScope(SearchScope::Actions),
+            ),
+            ("cmd-e", ShellAction::OpenRecentFiles),
+            ("cmd-l", ShellAction::GoToLine),
+            ("cmd-f12", ShellAction::ToggleTool(DockToolId::Structure)),
+            ("f2", ShellAction::NextProblem),
+            ("shift-f2", ShellAction::PrevProblem),
+            ("cmd-backspace", ShellAction::DeleteLine),
+            ("cmd-alt-/", ShellAction::ToggleBlockComment),
+            ("alt-shift-up", ShellAction::MoveLine(true)),
+            ("alt-shift-down", ShellAction::MoveLine(false)),
+            ("alt-up", ShellAction::ExtendSelection),
+            ("alt-down", ShellAction::ShrinkSelection),
+            ("cmd--", ShellAction::FoldRegion),
+            ("cmd-=", ShellAction::UnfoldRegion),
+            ("cmd-shift--", ShellAction::FoldAll),
+            ("cmd-shift-=", ShellAction::UnfoldAll),
+            ("cmd-alt-l", ShellAction::ReformatCode),
+            ("ctrl-g", ShellAction::AddNextOccurrence),
+            ("ctrl-shift-g", ShellAction::UnselectOccurrence),
+            ("ctrl-cmd-g", ShellAction::SelectAllOccurrences),
+            ("cmd-f", ShellAction::Find),
+            ("cmd-r", ShellAction::Replace),
+            ("cmd-g", ShellAction::FindNext),
+            ("cmd-shift-g", ShellAction::FindPrev),
+            ("cmd-shift-f", ShellAction::FindInFiles),
+            ("ctrl-shift-r", ShellAction::RunContext),
+            ("ctrl-r", ShellAction::RunLast),
+            ("escape", ShellAction::EditorEscape),
+        ];
+        for (shortcut, expected) in mac_cases {
+            assert_eq!(
+                press(&mut mac, shortcut, editor, false, now),
+                DispatchOutcome::Action(expected),
+                "macOS {shortcut}"
+            );
+        }
+        // In Vim NORMAL, `Ctrl+R` is passed through to Vim Redo while `editor.escape` is disabled.
+        assert_eq!(
+            press(&mut mac, "escape", FocusContext::EditorVimNormal, true, now),
+            DispatchOutcome::Unhandled
+        );
+    }
+
+    #[test]
+    fn intellij_shortcuts_resolve_on_linux() {
+        let now = Instant::now();
+        let editor = FocusContext::EditorText;
+        let mut linux = KeyDispatchLayer::new(Platform::Linux);
+        let linux_cases = [
+            ("ctrl-n", ShellAction::OpenSearchScope(SearchScope::Classes)),
+            (
+                "ctrl-shift-n",
+                ShellAction::OpenSearchScope(SearchScope::Files),
+            ),
+            (
+                "ctrl-alt-shift-n",
+                ShellAction::OpenSearchScope(SearchScope::Symbols),
+            ),
+            (
+                "ctrl-shift-a",
+                ShellAction::OpenSearchScope(SearchScope::Actions),
+            ),
+            ("ctrl-e", ShellAction::OpenRecentFiles),
+            ("ctrl-g", ShellAction::GoToLine),
+            ("ctrl-f12", ShellAction::ToggleTool(DockToolId::Structure)),
+            ("f2", ShellAction::NextProblem),
+            ("shift-f2", ShellAction::PrevProblem),
+            ("ctrl-y", ShellAction::DeleteLine),
+            ("ctrl-shift-/", ShellAction::ToggleBlockComment),
+            ("alt-shift-up", ShellAction::MoveLine(true)),
+            ("alt-shift-down", ShellAction::MoveLine(false)),
+            ("ctrl-w", ShellAction::ExtendSelection),
+            ("ctrl-shift-w", ShellAction::ShrinkSelection),
+            ("ctrl--", ShellAction::FoldRegion),
+            ("ctrl-=", ShellAction::UnfoldRegion),
+            ("ctrl-shift--", ShellAction::FoldAll),
+            ("ctrl-shift-=", ShellAction::UnfoldAll),
+            ("ctrl-alt-l", ShellAction::ReformatCode),
+            ("alt-j", ShellAction::AddNextOccurrence),
+            ("alt-shift-j", ShellAction::UnselectOccurrence),
+            ("ctrl-alt-shift-j", ShellAction::SelectAllOccurrences),
+            ("ctrl-f", ShellAction::Find),
+            ("ctrl-r", ShellAction::Replace),
+            ("f3", ShellAction::FindNext),
+            ("shift-f3", ShellAction::FindPrev),
+            ("ctrl-shift-f", ShellAction::FindInFiles),
+            ("ctrl-shift-f10", ShellAction::RunContext),
+            ("shift-f10", ShellAction::RunLast),
+            ("escape", ShellAction::EditorEscape),
+        ];
+        for (shortcut, expected) in linux_cases {
+            assert_eq!(
+                press(&mut linux, shortcut, editor, false, now),
+                DispatchOutcome::Action(expected),
+                "Linux {shortcut}"
+            );
+        }
+    }
+
+    #[test]
+    fn intellij_shortcuts_respect_read_only_context() {
+        let now = Instant::now();
+        let mut mac = KeyDispatchLayer::new(Platform::MacOs);
+        let ro_ctx = DispatchContext {
+            leaf: FocusContext::EditorText,
+            vim_enabled: false,
+            editor_read_only: true,
+        };
+        for shortcut in [
+            "alt-up",
+            "alt-down",
+            "cmd--",
+            "cmd-=",
+            "cmd-f",
+            "cmd-g",
+            "ctrl-shift-g",
+            "ctrl-cmd-g",
+        ] {
+            assert!(
+                matches!(
+                    mac.dispatch(shortcut_stroke(&ks(shortcut)).unwrap(), ro_ctx, now),
+                    DispatchOutcome::Action(_)
+                ),
+                "read-only should allow {shortcut}"
+            );
+        }
+        for shortcut in [
+            "cmd-backspace",
+            "cmd-alt-/",
+            "alt-shift-up",
+            "alt-shift-down",
+            "cmd-alt-l",
+        ] {
+            assert_eq!(
+                mac.dispatch(shortcut_stroke(&ks(shortcut)).unwrap(), ro_ctx, now),
+                DispatchOutcome::Unhandled,
+                "read-only must block {shortcut}"
+            );
+        }
     }
 }

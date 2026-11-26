@@ -389,6 +389,62 @@ impl SelectionSet {
         false
     }
 
+    /// Removes the primary selection when more than one cursor exists, promoting the previous
+    /// cursor (or index `0`) to primary. Returns `false` if only one cursor remains.
+    pub fn remove_primary(&mut self) -> bool {
+        if self.selections.len() <= 1 {
+            return false;
+        }
+        let removed = self.primary_index;
+        self.selections.remove(removed);
+        self.primary_index = removed.saturating_sub(1).min(self.selections.len() - 1);
+        true
+    }
+
+    /// Selects all non-overlapping occurrences of the primary selection (or word under caret)
+    /// across `snapshot`, preserving the active occurrence as primary. Returns `true` if changed.
+    pub fn select_all_occurrences(&mut self, snapshot: &BufferSnapshot) -> bool {
+        let before = self.clone();
+        let primary = self.selections[self.primary_index].clamp(snapshot);
+        let target_range = if primary.is_empty() {
+            let Some((w_start, w_end)) = word_under_offset(snapshot, primary.head()) else {
+                return false;
+            };
+            w_start..w_end
+        } else {
+            primary.range()
+        };
+        let Ok(needle_slice) = snapshot.slice_bytes(target_range.clone()) else {
+            return false;
+        };
+        let needle = needle_slice.to_string();
+        if needle.is_empty() {
+            return false;
+        }
+        let full_text = snapshot.text();
+        let mut found = Vec::new();
+        let mut primary_idx = 0usize;
+        let mut pos = 0usize;
+        while pos + needle.len() <= full_text.len() {
+            if let Some(rel) = full_text[pos..].find(&needle) {
+                let abs = pos + rel;
+                let end = abs + needle.len();
+                if abs == target_range.start && end == target_range.end {
+                    primary_idx = found.len();
+                }
+                found.push(Selection::new(abs, end));
+                pos = end;
+            } else {
+                break;
+            }
+        }
+        if found.is_empty() {
+            return false;
+        }
+        *self = Self::from_selections(found, primary_idx, snapshot);
+        *self != before
+    }
+
     /// Translates all selection offsets across a batch of pre-edit [`TextEdit`]s
     /// into `post_snapshot` coordinates, clearing `goal_column` and merging overlaps.
     pub fn map_through_edits(&mut self, pre_edits: &[TextEdit], post_snapshot: &BufferSnapshot) {

@@ -36,7 +36,7 @@ impl WorkspaceShell {
     }
 
     /// Absolute path of a document key (project-relative when a project is open).
-    fn debug_abs_path(&self, key: &Path) -> PathBuf {
+    pub(super) fn debug_abs_path(&self, key: &Path) -> PathBuf {
         match self.project.root() {
             Some(root) if key.is_relative() => root.join(key),
             _ => key.to_path_buf(),

@@ -75,7 +75,6 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
     let workspace = Some(WORKSPACE_KEY_CONTEXT);
     let vim = Some(VIM_NORMAL_KEY_CONTEXT);
     let mut bindings = vec![
-        KeyBinding::new("ctrl-shift-r", RunEntryPointAtCursor, ctx),
         KeyBinding::new("z a", ToggleFold, vim),
         KeyBinding::new("z c", FoldAtCursor, vim),
         KeyBinding::new("z o", UnfoldAtCursor, vim),
@@ -112,7 +111,6 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
             KeyBinding::new("ctrl-v", Paste, ctx),
             KeyBinding::new("ctrl-a", SelectAll, ctx),
             KeyBinding::new("ctrl-z", Undo, ctx),
-            KeyBinding::new("ctrl-y", Redo, ctx),
             KeyBinding::new("ctrl-shift-z", Redo, ctx),
         ]
     };
@@ -130,7 +128,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_bindings_parse_and_include_folding_and_run() {
+    fn default_bindings_parse_and_include_folding_and_save() {
         let bindings = default_key_bindings();
         let has =
             |action: &dyn gpui::Action| bindings.iter().any(|b| b.action().partial_eq(action));
@@ -139,7 +137,18 @@ mod tests {
         assert!(has(&FoldAll));
         assert!(has(&UnfoldAll));
         assert!(has(&ToggleFold));
-        assert!(has(&RunEntryPointAtCursor));
+        assert!(!has(&RunEntryPointAtCursor));
         assert!(has(&Save));
+        let keys: Vec<String> = bindings
+            .iter()
+            .flat_map(|b| {
+                b.keystrokes()
+                    .iter()
+                    .map(gpui::KeybindingKeystroke::unparse)
+            })
+            .collect();
+        assert!(!keys.iter().any(|k| k == "ctrl-shift-r"));
+        #[cfg(not(target_os = "macos"))]
+        assert!(!keys.iter().any(|k| k == "ctrl-y"));
     }
 }

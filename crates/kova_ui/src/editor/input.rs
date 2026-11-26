@@ -143,11 +143,6 @@ pub enum EditorKeyCommand {
         /// Extend the selection instead of moving the caret.
         extend: bool,
     },
-    /// Add a cursor on the line above (`up`) or below.
-    AddCursor {
-        /// `true` for above, `false` for below.
-        up: bool,
-    },
     /// Page up/down.
     Page {
         /// `true` for `PageDown`.
@@ -183,9 +178,7 @@ pub fn map_editor_key(key: &str, mods: KeyMods, macos: bool) -> Option<EditorKey
         "right" if word => mv(Motion::WordRight),
         "left" => mv(Motion::Left),
         "right" => mv(Motion::Right),
-        "up" | "down" if mods.alt && mods.shift => {
-            Some(EditorKeyCommand::AddCursor { up: key == "up" })
-        }
+        "up" | "down" if mods.alt => None,
         "up" if macos && mods.primary => mv(Motion::BufferStart),
         "down" if macos && mods.primary => mv(Motion::BufferEnd),
         "up" if !mods.primary => mv(Motion::Up),
@@ -300,10 +293,9 @@ mod tests {
             shift: true,
             ..KeyMods::default()
         };
-        assert_eq!(
-            map_editor_key("up", alt_shift, true),
-            Some(EditorKeyCommand::AddCursor { up: true })
-        );
+        assert_eq!(map_editor_key("up", alt_shift, true), None);
+        assert_eq!(map_editor_key("down", alt_shift, false), None);
+        assert_eq!(map_editor_key("up", alt, true), None);
         assert_eq!(
             map_editor_key("pagedown", none, false),
             Some(EditorKeyCommand::Page {

@@ -77,10 +77,12 @@ use crate::keymap::{
     KeyDispatchLayer, KeyRoute, RouteFlags, ShellAction, is_text_composition, key_route,
     parse_ex_command, shortcut_stroke, vim_stroke,
 };
+use crate::search::find_in_files::render_find_in_files_row;
 use crate::search::modal::render_search_row;
 use crate::search::{
-    SearchEntry, SearchEntryKind, SearchEverywhereModal, SearchEverywhereState, SearchKeyOutcome,
-    SearchScope, SearchTarget,
+    FindInFilesKeyOutcome, FindInFilesModal, FindInFilesState, SearchEntry, SearchEntryKind,
+    SearchEverywhereModal, SearchEverywhereState, SearchKeyOutcome, SearchScope, SearchTarget,
+    search_text_in_buffers_and_paths,
 };
 use crate::settings::view::{SettingsClick, SettingsKey};
 use crate::settings::{
@@ -358,6 +360,22 @@ struct AnalysisResult {
     syntax: Option<Arc<EditorSyntax>>,
 }
 
+/// Most recently executed target re-run by `run.run_last` (`Ctrl+R` / `Shift+F10`).
+#[derive(Debug, Clone)]
+enum LastRunTarget {
+    EntryPoint(RunEntryPointRequested),
+    HttpRequest {
+        request: RunEntryPointRequested,
+        file_key: PathBuf,
+    },
+    TestRun {
+        label: String,
+        targets: Vec<String>,
+        file: Option<PathBuf>,
+    },
+    RunConfig(usize),
+}
+
 /// Root GPUI view rendering the *Kova Islands* `IntelliJ` New UI workspace.
 #[allow(
     clippy::struct_excessive_bools,
@@ -453,6 +471,14 @@ pub struct WorkspaceShell {
     commit_panel_open: bool,
     /// *Search Everywhere* (`Shift+Shift`) modal overlay (`KOVA-050`).
     search_everywhere: SearchEverywhereModal,
+    /// *Find in Files* (`Cmd+Shift+F` / `Ctrl+Shift+F`) modal overlay (`KOVA-053`).
+    find_in_files: FindInFilesModal,
+    /// In-flight background search task for *Find in Files*.
+    find_in_files_task: Option<Task<()>>,
+    /// MRU list of visited/opened document keys (`Cmd+E` / `Ctrl+E`).
+    recent_files: Vec<PathBuf>,
+    /// Most recent run target for `run.run_last` (`Ctrl+R` / `Shift+F10`).
+    last_run: Option<LastRunTarget>,
     /// Back/Forward cursor jump history (`KOVA-051`).
     nav_history: NavigationHistory,
     /// Host symbol definition resolver (Level 1 + LSP/Vineflower, `KOVA-051`).
@@ -526,7 +552,7 @@ impl WorkspaceShell {
             DocumentState::opened(None, welcome_buffer.version().as_u64(), false),
         );
         let mut documents = HashMap::new();
-        documents.insert(welcome_path, welcome_buffer);
+        documents.insert(welcome_path.clone(), welcome_buffer);
 
         let mut project_tree = ProjectTreeModel::from_nodes(demo_project_nodes());
         project_tree.reveal_path(Path::new(WELCOME_DOCUMENT_PATH));
@@ -592,6 +618,10 @@ impl WorkspaceShell {
             commit_panel: None,
             commit_panel_open: false,
             search_everywhere: SearchEverywhereModal::new(cx.focus_handle()),
+            find_in_files: FindInFilesModal::new(cx.focus_handle()),
+            find_in_files_task: None,
+            recent_files: vec![welcome_path],
+            last_run: None,
             nav_history: NavigationHistory::new(),
             definition_sink: None,
             next_definition_request_id: 1,
@@ -931,6 +961,7 @@ impl WorkspaceShell {
             self.start_test_run(test_request);
             return;
         }
+        self.last_run = Some(LastRunTarget::EntryPoint(request.clone()));
         self.bottom_panel.run_logs.push(request.log_line());
         self.dock_layout.bottom_open = Some(DockToolId::Run);
     }
@@ -946,6 +977,12 @@ impl WorkspaceShell {
         text: &str,
         cx: &mut Context<'_, Self>,
     ) {
+        if let Some(file_key) = request.file_path.clone() {
+            self.last_run = Some(LastRunTarget::HttpRequest {
+                request: request.clone(),
+                file_key,
+            });
+        }
         let file = HttpFile::parse(text);
         let line = request.line;
         let title = file
@@ -1002,6 +1039,11 @@ impl WorkspaceShell {
 
     /// Shows `request` in the Test Runner dock and hands it to the host sink.
     fn start_test_run(&mut self, request: TestRunRequest) {
+        self.last_run = Some(LastRunTarget::TestRun {
+            label: request.label.clone(),
+            targets: request.targets.clone(),
+            file: request.file.clone(),
+        });
         let run_id = request.run_id;
         self.test_runner.start(request.clone());
         self.tests_scroll = UniformListScrollHandle::new();
@@ -1143,12 +1185,80 @@ impl WorkspaceShell {
             request.vm_options.clone_from(&config.vm_options);
             request.env.clone_from(&config.env);
             self.start_test_run(request);
+            self.last_run = Some(LastRunTarget::RunConfig(index));
         } else {
+            self.last_run = Some(LastRunTarget::RunConfig(index));
             self.bottom_panel.run_logs.push(format!(
                 "[kova.toml] {} ({}) — only `junit` run configurations execute in this build",
                 config.name,
                 config.summary()
             ));
+        }
+        cx.notify();
+    }
+
+    fn run_context_action(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(editor) = self.active_editor().cloned() else {
+            self.set_notice(
+                StatusKind::Info,
+                "Open a file to run an entry point".to_owned(),
+                cx,
+            );
+            return;
+        };
+        let path = self.active_document_key();
+        let entry = editor.read(cx).debug_entry_point();
+        let Some(entry) = entry else {
+            self.set_notice(
+                StatusKind::Info,
+                "Nothing to run here: place the caret in a `main`, `@Test`, or `.http` request"
+                    .to_owned(),
+                cx,
+            );
+            return;
+        };
+        let request = RunEntryPointRequested::from_entry_point(&entry, path);
+        if request.kind == EntryPointKind::HttpRequest {
+            let text = editor.read(cx).shared_buffer().snapshot().text();
+            self.run_http_request(&request, &text, cx);
+        } else {
+            self.handle_run_request(&request);
+        }
+        cx.notify();
+    }
+
+    fn run_last_action(&mut self, cx: &mut Context<'_, Self>) {
+        match self.last_run.clone() {
+            Some(LastRunTarget::EntryPoint(req)) => self.handle_run_request(&req),
+            Some(LastRunTarget::HttpRequest { request, file_key }) => {
+                let text = self
+                    .documents
+                    .get(&file_key)
+                    .map(|b| b.snapshot().text())
+                    .or_else(|| std::fs::read_to_string(self.debug_abs_path(&file_key)).ok())
+                    .unwrap_or_default();
+                self.run_http_request(&request, &text, cx);
+            }
+            Some(LastRunTarget::TestRun {
+                label,
+                targets,
+                file,
+            }) => {
+                let req =
+                    self.test_runner
+                        .new_request(label, targets, self.project.root_owned(), file);
+                self.start_test_run(req);
+            }
+            Some(LastRunTarget::RunConfig(idx)) => self.run_configuration(idx, cx),
+            None => {
+                if let Some(req) = self.test_runner.rerun_all_request() {
+                    self.start_test_run(req);
+                } else if !self.run_configs.is_empty() {
+                    self.run_configuration(0, cx);
+                } else {
+                    self.run_context_action(cx);
+                }
+            }
         }
         cx.notify();
     }
@@ -1451,11 +1561,20 @@ impl WorkspaceShell {
             window.focus(editor.read(cx).focus_handle());
         }
         self.refresh_debug_gutters(cx);
+        self.record_recent_file(rel_path);
         self.project_tree.reveal_path(rel_path);
         self.set_active_pane(pane_id, cx);
         self.dock_layout.focus(FocusedRegion::EditorPane(pane_id));
         self.refresh_analysis(Duration::ZERO, cx);
         cx.notify();
+    }
+
+    fn record_recent_file(&mut self, rel_path: &Path) {
+        self.recent_files.retain(|p| p != rel_path);
+        self.recent_files.insert(0, rel_path.to_path_buf());
+        if self.recent_files.len() > 64 {
+            self.recent_files.truncate(64);
+        }
     }
 
     fn select_tab(
@@ -1465,8 +1584,14 @@ impl WorkspaceShell {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if let Some(state) = self.panes.get_mut(&pane) {
+        let path = if let Some(state) = self.panes.get_mut(&pane) {
             state.tabs.select_tab(tab);
+            state.tabs.active_tab().and_then(|t| t.path.clone())
+        } else {
+            None
+        };
+        if let Some(path) = path {
+            self.record_recent_file(&path);
         }
         self.set_active_pane(pane, cx);
         self.refresh_analysis(Duration::ZERO, cx);
@@ -1896,6 +2021,18 @@ impl WorkspaceShell {
         self.search_everywhere.state()
     }
 
+    /// Returns whether the *Find in Files* modal overlay is open.
+    #[must_use]
+    pub const fn is_find_in_files_open(&self) -> bool {
+        self.find_in_files.is_open()
+    }
+
+    /// Returns the headless *Find in Files* state for inspection and testing.
+    #[must_use]
+    pub const fn find_in_files_state(&self) -> &FindInFilesState {
+        self.find_in_files.state()
+    }
+
     /// Computes the active focused editor (when focused) and the corresponding [`DispatchContext`].
     fn active_editor_and_dispatch_context(
         &self,
@@ -1942,6 +2079,7 @@ impl WorkspaceShell {
     ) {
         let modal_open = self.settings_open
             || self.commit_panel_open
+            || self.find_in_files.is_open()
             || self.ex_line.is_some()
             || self.debugger.evaluate_modal().is_some();
         let held = if modal_open || self.search_everywhere.is_open() {
@@ -2017,6 +2155,14 @@ impl WorkspaceShell {
             cx.stop_propagation();
             return;
         }
+        if self.find_in_files.is_open() {
+            self.handle_find_in_files_key(keystroke, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.handle_find_bar_capture(keystroke, window, cx) {
+            return;
+        }
         // Terminal focused: its own shortcuts first, `Cmd` chords to the IDE keymap, every
         // other key bubbles to the session (`Ctrl+C`, `Ctrl+W`, `Esc`, `j`/`k` …).
         if let Some(dock) = self.terminal_focused(window, cx) {
@@ -2088,6 +2234,44 @@ impl WorkspaceShell {
                 self.dispatch_keymap(keystroke, ctx, window, cx);
             }
         }
+    }
+
+    fn handle_find_bar_capture(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if let Some(find_editor) = self
+            .active_editor()
+            .filter(|e| e.read(cx).has_find_bar_focus(window))
+            .cloned()
+        {
+            let handled = find_editor.update(cx, |editor, cx| {
+                editor.handle_find_bar_key(keystroke, window, cx)
+            });
+            if handled {
+                cx.stop_propagation();
+                cx.notify();
+                return true;
+            }
+        }
+        if keystroke.key == "escape"
+            && !keystroke.modifiers.platform
+            && !keystroke.modifiers.control
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.shift
+            && let Some(find_editor) = self
+                .active_editor()
+                .filter(|e| e.read(cx).is_find_bar_open())
+                .cloned()
+        {
+            find_editor.update(cx, |editor, cx| editor.close_find_bar(true, window, cx));
+            cx.stop_propagation();
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     /// Resolves `keystroke` against the `JetBrains` keymap and runs the matched shell action.
@@ -2175,25 +2359,37 @@ impl WorkspaceShell {
             ShellAction::CloseActiveTab => self.close_active_tab(window, cx),
             ShellAction::CycleTab(forward) => self.cycle_tab(forward, window, cx),
             ShellAction::Save => self.save_active(window, cx),
-            ShellAction::DuplicateLine => {
-                if let Some(editor) = self.active_editor().cloned() {
-                    editor.update(cx, |editor, cx| editor.duplicate_lines(window, cx));
-                }
-            }
-            ShellAction::ToggleLineComment => {
-                let prefix = line_comment_prefix(self.active_document_key().as_deref());
-                if let Some(editor) = self.active_editor().cloned() {
-                    editor.update(cx, |editor, cx| {
-                        editor.toggle_line_comment(prefix, window, cx);
-                    });
-                }
-            }
-            ShellAction::AddNextOccurrence => {
-                if let Some(editor) = self.active_editor().cloned() {
-                    editor.update(cx, |editor, cx| editor.add_next_occurrence(window, cx));
-                }
-            }
+            ShellAction::DuplicateLine
+            | ShellAction::ToggleLineComment
+            | ShellAction::AddNextOccurrence
+            | ShellAction::UnselectOccurrence
+            | ShellAction::SelectAllOccurrences
+            | ShellAction::DeleteLine
+            | ShellAction::ToggleBlockComment
+            | ShellAction::MoveLine(_)
+            | ShellAction::ExtendSelection
+            | ShellAction::ShrinkSelection
+            | ShellAction::ReformatCode
+            | ShellAction::EditorEscape
+            | ShellAction::FoldRegion
+            | ShellAction::UnfoldRegion
+            | ShellAction::FoldAll
+            | ShellAction::UnfoldAll
+            | ShellAction::Find
+            | ShellAction::Replace
+            | ShellAction::FindNext
+            | ShellAction::FindPrev => self.run_editor_shell_action(action, window, cx),
+            ShellAction::FindInFiles => self.open_find_in_files(window, cx),
             ShellAction::OpenSearchEverywhere => self.open_search_everywhere(window, cx),
+            ShellAction::OpenSearchScope(scope) => self.open_search_scope(scope, window, cx),
+            ShellAction::OpenRecentFiles => self.open_recent_files(window, cx),
+            ShellAction::GoToLine => {
+                self.ex_line = Some(ExCommandLine::new(':'));
+            }
+            ShellAction::NextProblem => self.jump_adjacent_problem(true, window, cx),
+            ShellAction::PrevProblem => self.jump_adjacent_problem(false, window, cx),
+            ShellAction::RunContext => self.run_context_action(cx),
+            ShellAction::RunLast => self.run_last_action(cx),
             ShellAction::OpenSettings => self.open_settings(window, cx),
             ShellAction::ToggleCommitPanel => self.toggle_commit_panel(window, cx),
             ShellAction::GoToDefinition => self.go_to_definition_at(None, window, cx),
@@ -2201,6 +2397,46 @@ impl WorkspaceShell {
             ShellAction::NavigateForward => self.navigate_forward(window, cx),
             ShellAction::Debug(action) => self.run_debug_action(action, window, cx),
         }
+    }
+
+    fn run_editor_shell_action(
+        &mut self,
+        action: ShellAction,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(editor) = self.active_editor().cloned() else {
+            return;
+        };
+        let comment_prefix = line_comment_prefix(self.active_document_key().as_deref());
+        let indent_width = usize::from(self.applied_settings.editor.tab_size).max(1);
+        editor.update(cx, |editor, cx| match action {
+            ShellAction::DuplicateLine => editor.duplicate_lines(window, cx),
+            ShellAction::ToggleLineComment => {
+                editor.toggle_line_comment(comment_prefix, window, cx);
+            }
+            ShellAction::AddNextOccurrence => editor.add_next_occurrence(window, cx),
+            ShellAction::UnselectOccurrence => editor.unselect_occurrence(window, cx),
+            ShellAction::SelectAllOccurrences => editor.select_all_occurrences(window, cx),
+            ShellAction::DeleteLine => editor.delete_lines(window, cx),
+            ShellAction::ToggleBlockComment => {
+                editor.toggle_block_comment("/*", "*/", window, cx);
+            }
+            ShellAction::MoveLine(up) => editor.move_lines(up, window, cx),
+            ShellAction::ExtendSelection => editor.extend_selection(window, cx),
+            ShellAction::ShrinkSelection => editor.shrink_selection(window, cx),
+            ShellAction::ReformatCode => editor.reformat_code(indent_width, window, cx),
+            ShellAction::EditorEscape => editor.escape_editor(window, cx),
+            ShellAction::FoldRegion => editor.fold_region(window, cx),
+            ShellAction::UnfoldRegion => editor.unfold_region(window, cx),
+            ShellAction::FoldAll => editor.fold_all(window, cx),
+            ShellAction::UnfoldAll => editor.unfold_all(window, cx),
+            ShellAction::Find => editor.open_find_bar(false, window, cx),
+            ShellAction::Replace => editor.open_find_bar(true, window, cx),
+            ShellAction::FindNext => editor.find_next(window, cx),
+            ShellAction::FindPrev => editor.find_prev(window, cx),
+            _ => {}
+        });
     }
 
     /// Installs the host *Go to Definition* resolver (`KOVA-051`).
@@ -2555,6 +2791,268 @@ impl WorkspaceShell {
         cx.notify();
     }
 
+    /// Opens *Search Everywhere* pre-focused on `scope` (`Cmd+O`, `Cmd+Shift+O`, `Cmd+Alt+O`, `Cmd+Shift+A`).
+    pub fn open_search_scope(
+        &mut self,
+        scope: SearchScope,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.search_everywhere.is_open()
+            && !self.search_everywhere.state().is_recent_files_mode()
+        {
+            self.search_everywhere.set_scope(scope);
+            window.focus(self.search_everywhere.focus_handle());
+            cx.notify();
+            return;
+        }
+        let return_focus = window.focused(cx);
+        self.ex_line = None;
+        self.keymap.reset();
+        self.chord_hint = None;
+        let entries = self.collect_search_entries();
+        self.search_everywhere
+            .open_with_scope(entries, scope, return_focus);
+        window.focus(self.search_everywhere.focus_handle());
+        cx.notify();
+    }
+
+    /// Opens *Recent Files* (`Cmd+E` / `Ctrl+E`) in MRU order.
+    pub fn open_recent_files(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let return_focus = window.focused(cx);
+        self.ex_line = None;
+        self.keymap.reset();
+        self.chord_hint = None;
+        let entries = self.collect_recent_file_entries();
+        self.search_everywhere
+            .open_recent_files(entries, return_focus);
+        window.focus(self.search_everywhere.focus_handle());
+        cx.notify();
+    }
+
+    fn collect_recent_file_entries(&self) -> Vec<SearchEntry> {
+        let mut seen = HashSet::new();
+        let mut ordered = Vec::new();
+        for path in &self.recent_files {
+            if seen.insert(path.clone()) {
+                ordered.push(path.clone());
+            }
+        }
+        let mut open_paths: Vec<PathBuf> = self.documents.keys().cloned().collect();
+        open_paths.sort();
+        for path in open_paths {
+            if seen.insert(path.clone()) {
+                ordered.push(path);
+            }
+        }
+        ordered
+            .into_iter()
+            .map(|path| {
+                let title = file_title(&path);
+                let subtitle = path
+                    .parent()
+                    .map(|parent| parent.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let match_text = path.to_string_lossy().into_owned();
+                SearchEntry {
+                    kind: SearchEntryKind::File,
+                    title,
+                    subtitle,
+                    match_text,
+                    icon: SearchEntryKind::File.default_icon(),
+                    shortcut_hint: None,
+                    target: SearchTarget::File { path, line: None },
+                }
+            })
+            .collect()
+    }
+
+    fn jump_adjacent_problem(
+        &mut self,
+        next: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let current_file = self
+            .active_document_key()
+            .map(|p| p.to_string_lossy().into_owned());
+        let (line, col) = self
+            .active_editor()
+            .map_or((1, 1), |e| e.read(cx).primary_cursor_position());
+        let target = if next {
+            self.bottom_panel
+                .next_problem_index(current_file.as_deref(), line, col)
+        } else {
+            self.bottom_panel
+                .prev_problem_index(current_file.as_deref(), line, col)
+        };
+        let Some(idx) = target else {
+            self.set_notice(
+                StatusKind::Info,
+                "No problems found in project".to_owned(),
+                cx,
+            );
+            return;
+        };
+        self.jump_to_problem(idx, window, cx);
+    }
+
+    /// Opens *Find in Files* (`Cmd+Shift+F` / `Ctrl+Shift+F`) and starts an off-thread scan.
+    pub fn open_find_in_files(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let return_focus = window.focused(cx);
+        self.ex_line = None;
+        self.keymap.reset();
+        self.chord_hint = None;
+        let prefill = self
+            .active_editor()
+            .and_then(|e| e.read(cx).primary_selection_text())
+            .filter(|s| !s.contains('\n'));
+        let generation = self.find_in_files.open(prefill.as_deref(), return_focus);
+        window.focus(self.find_in_files.focus_handle());
+        self.schedule_find_in_files_search(generation, cx);
+        cx.notify();
+    }
+
+    /// Closes *Find in Files*, optionally restoring saved focus.
+    pub(crate) fn close_find_in_files(
+        &mut self,
+        restore_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.find_in_files.is_open() {
+            return;
+        }
+        self.find_in_files_task = None;
+        let return_focus = self.find_in_files.close();
+        if restore_focus {
+            if let Some(handle) = return_focus {
+                window.focus(&handle);
+            } else {
+                self.focus_active_editor(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_find_in_files_case_sensitive(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let generation = self.find_in_files.state_mut().toggle_case_sensitive();
+        window.focus(self.find_in_files.focus_handle());
+        self.schedule_find_in_files_search(generation, cx);
+        cx.notify();
+    }
+
+    fn handle_find_in_files_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match self.find_in_files.handle_key(keystroke) {
+            FindInFilesKeyOutcome::Close => self.close_find_in_files(true, window, cx),
+            FindInFilesKeyOutcome::Activate { index, split } => {
+                self.activate_find_in_files_hit(index, split, window, cx);
+            }
+            FindInFilesKeyOutcome::QueryChanged => {
+                let generation = self.find_in_files.state_mut().begin_search();
+                self.schedule_find_in_files_search(generation, cx);
+                cx.notify();
+            }
+            FindInFilesKeyOutcome::Consumed => cx.notify(),
+            FindInFilesKeyOutcome::Ignored => {}
+        }
+    }
+
+    fn schedule_find_in_files_search(&mut self, generation: u64, cx: &mut Context<'_, Self>) {
+        let query = self.find_in_files.state().query().text().to_owned();
+        if query.is_empty() {
+            self.find_in_files_task = None;
+            return;
+        }
+        let case_sensitive = self.find_in_files.state().case_sensitive();
+        let open_buffers: Vec<(PathBuf, String)> = self
+            .documents
+            .iter()
+            .map(|(path, buf)| (path.clone(), buf.snapshot().text()))
+            .collect();
+        let project_root = self.project.root_owned();
+        let workspace_files: Vec<PathBuf> = self
+            .project_tree
+            .file_paths()
+            .map(Path::to_path_buf)
+            .collect();
+
+        let search = cx.background_executor().spawn(async move {
+            search_text_in_buffers_and_paths(
+                &query,
+                case_sensitive,
+                &open_buffers,
+                project_root.as_deref(),
+                &workspace_files,
+            )
+        });
+        self.find_in_files_task = Some(cx.spawn(async move |this, cx| {
+            let hits = search.await;
+            this.update(cx, |this, cx| {
+                if this.find_in_files.state_mut().set_results(generation, hits) {
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Opens the *Find in Files* hit at `index` and closes the modal.
+    pub(crate) fn activate_find_in_files_hit(
+        &mut self,
+        index: usize,
+        split: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(hit) = self.find_in_files.hit(index).cloned() else {
+            return;
+        };
+        self.find_in_files_task = None;
+        drop(self.find_in_files.close());
+        if split {
+            self.split_active_pane(SplitAxis::Horizontal, window, cx);
+        }
+        self.open_path(&hit.path, Some((hit.line, hit.col)), window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn render_find_in_files_rows(
+        &mut self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Vec<Stateful<Div>> {
+        let theme = cx.global::<KovaTheme>().clone();
+        let selected = self.find_in_files.state().selected();
+        let hits = self.find_in_files.state().hits();
+        range
+            .filter_map(|row| {
+                hits.get(row)
+                    .map(|hit| render_find_in_files_row(row, hit, row == selected, &theme, cx))
+            })
+            .collect()
+    }
+
+    fn render_find_in_files_overlay(&self, cx: &Context<'_, Self>) -> Option<Stateful<Div>> {
+        if !self.find_in_files.is_open() {
+            return None;
+        }
+        Some(
+            self.find_in_files
+                .render(cx.global::<KovaTheme>(), self.viewport_px, cx),
+        )
+    }
+
     /// Closes *Search Everywhere*, optionally restoring the saved [`FocusHandle`].
     pub(crate) fn close_search_everywhere(
         &mut self,
@@ -2761,7 +3259,10 @@ impl WorkspaceShell {
             let Some(action) = ShellAction::from_action_id(&desc.id) else {
                 continue;
             };
-            if action == ShellAction::OpenSearchEverywhere {
+            if matches!(
+                action,
+                ShellAction::OpenSearchEverywhere | ShellAction::EditorEscape
+            ) {
                 continue;
             }
             let shortcut_hint = keymap_layer
@@ -3386,6 +3887,13 @@ impl WorkspaceShell {
             ExCommand::GoToLine(line) => {
                 if let Some(editor) = self.active_editor().cloned() {
                     editor.update(cx, |editor, cx| editor.go_to_line_column(line, None, cx));
+                }
+            }
+            ExCommand::GoToLineColumn(line, col) => {
+                if let Some(editor) = self.active_editor().cloned() {
+                    editor.update(cx, |editor, cx| {
+                        editor.go_to_line_column(line, Some(col), cx);
+                    });
                 }
             }
             ExCommand::NoHighlight => self.clear_notice(cx),
@@ -5087,6 +5595,10 @@ impl Render for WorkspaceShell {
             None => root,
         };
         let root = match self.render_search_everywhere_overlay(cx) {
+            Some(overlay) => root.child(overlay),
+            None => root,
+        };
+        let root = match self.render_find_in_files_overlay(cx) {
             Some(overlay) => root.child(overlay),
             None => root,
         };

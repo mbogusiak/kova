@@ -3,6 +3,7 @@
 
 pub mod actions;
 pub mod element;
+pub mod find;
 pub mod folding;
 pub mod highlight;
 pub mod ime;
@@ -31,6 +32,7 @@ use kova_tools::git::{GitRepository, gutter_hunks};
 use smallvec::SmallVec;
 
 use crate::editor::element::EditorCanvasElement;
+use crate::editor::find::{FindBarField, FindBarState, FindKeyOutcome, render_find_bar};
 use crate::editor::folding::{FoldMap, VisualLineMapping};
 use crate::editor::input::{EditorKeyCommand, InputLatencyStats, KeyMods, map_editor_key};
 use crate::editor::line_cache::ShapedLineCache;
@@ -212,6 +214,8 @@ pub struct EditorView {
     git_diff_task: Option<Task<()>>,
     language_hint: SourceLanguageKind,
     hover_link: HoverLinkState,
+    find_bar: FindBarState,
+    find_focus_handle: FocusHandle,
 }
 
 impl EditorView {
@@ -260,6 +264,8 @@ impl EditorView {
             git_diff_task: None,
             language_hint: SourceLanguageKind::Unknown,
             hover_link: HoverLinkState::default(),
+            find_bar: FindBarState::new(),
+            find_focus_handle: cx.focus_handle(),
         }
     }
 
@@ -351,22 +357,32 @@ impl EditorView {
             .map(|slice| slice.to_string())
     }
 
-    /// Entry point to debug: the one on the caret line, else the file's `main`, else its
-    /// test class (`KOVA-041`).
+    /// Entry point to debug/run: the one on the caret line, else for `.http` files the
+    /// enclosing/first HTTP request, else the file's `main`, else its test class (`KOVA-041`/`KOVA-053`).
     #[must_use]
     pub fn debug_entry_point(&self) -> Option<EntryPoint> {
         let syntax = self.syntax.as_ref()?;
         let row = self.state.primary_point().0;
+        if let Some(at_caret) = syntax.entry_point_at(row) {
+            return Some(at_caret.clone());
+        }
+        if syntax.language() == kova_theme::SyntaxLanguage::Http {
+            return syntax
+                .entry_points()
+                .iter()
+                .rev()
+                .find(|e| e.kind == kova_syntax::EntryPointKind::HttpRequest && e.line <= row)
+                .or_else(|| syntax.entry_points().first())
+                .cloned();
+        }
         syntax
-            .entry_point_at(row)
-            .or_else(|| {
-                syntax.entry_points().iter().find(|e| {
-                    matches!(
-                        e.kind,
-                        kova_syntax::EntryPointKind::JavaMain
-                            | kova_syntax::EntryPointKind::KotlinMain
-                    )
-                })
+            .entry_points()
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    kova_syntax::EntryPointKind::JavaMain | kova_syntax::EntryPointKind::KotlinMain
+                )
             })
             .or_else(|| {
                 syntax
@@ -1030,6 +1046,327 @@ impl EditorView {
         self.run_edit(window, cx, |state, _| state.add_next_occurrence());
     }
 
+    /// `Ctrl+Shift+G` (macOS) / `Alt+Shift+J` (Linux): remove the last added occurrence.
+    pub fn unselect_occurrence(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.run_edit(window, cx, |state, _| state.unselect_occurrence());
+    }
+
+    /// `Ctrl+Cmd+G` (macOS) / `Ctrl+Alt+Shift+J` (Linux): select all occurrences in the file.
+    pub fn select_all_occurrences(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.run_edit(window, cx, |state, _| state.select_all_occurrences());
+    }
+
+    /// `Cmd+Backspace` (macOS) / `Ctrl+Y` (Linux): delete the full line(s) at active cursors.
+    pub fn delete_lines(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.run_edit(window, cx, |state, _| state.delete_lines());
+    }
+
+    /// `Cmd+Alt+/` (macOS) / `Ctrl+Shift+/` (Linux): toggle block comment around selection/caret.
+    pub fn toggle_block_comment(
+        &mut self,
+        open: &str,
+        close: &str,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.run_edit(window, cx, |state, _| {
+            state.toggle_block_comment(open, close)
+        });
+    }
+
+    /// `Alt+Shift+Up/Down`: swap current line or selected block with adjacent line.
+    pub fn move_lines(&mut self, up: bool, window: &Window, cx: &mut Context<'_, Self>) {
+        self.run_edit(window, cx, |state, _| state.move_lines(up));
+    }
+
+    /// `Alt+Up` (macOS) / `Ctrl+W` (Linux): expand selection outward using AST/fallback.
+    pub fn extend_selection(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        let syntax = self.syntax.clone();
+        self.run_edit(window, cx, |state, _| {
+            state.extend_selection(syntax.as_deref())
+        });
+    }
+
+    /// `Alt+Down` (macOS) / `Ctrl+Shift+W` (Linux): shrink selection back to previous scope.
+    pub fn shrink_selection(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.run_edit(window, cx, |state, _| state.shrink_selection());
+    }
+
+    /// `Cmd+Alt+L` (macOS) / `Ctrl+Alt+L` (Linux): reformat code indentation & trailing spaces.
+    pub fn reformat_code(
+        &mut self,
+        indent_width: usize,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let lang = self.language_hint;
+        let is_json = self
+            .syntax
+            .as_ref()
+            .is_some_and(|s| s.language() == kova_theme::SyntaxLanguage::Json);
+        self.run_edit(window, cx, |state, _| {
+            if is_json {
+                state.reformat_code_with_braces(true, indent_width)
+            } else {
+                state.reformat_code(lang, indent_width)
+            }
+        });
+    }
+
+    /// Collapse the fold region at the primary caret (`Cmd+-` / `Ctrl+-`).
+    pub fn fold_region(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.fold_command(window, cx, |map, row, candidates| {
+            map.fold_at(row, candidates)
+        });
+    }
+
+    /// Expand the fold region at the primary caret (`Cmd+=` / `Ctrl+=`).
+    pub fn unfold_region(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.fold_command(window, cx, |map, row, _| map.unfold_at(row));
+    }
+
+    /// Collapse all fold regions in the file (`Cmd+Shift+-` / `Ctrl+Shift+-`).
+    pub fn fold_all(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.fold_command(window, cx, |map, _, candidates| map.fold_all(candidates));
+    }
+
+    /// Expand all fold regions in the file (`Cmd+Shift+=` / `Ctrl+Shift+=`).
+    pub fn unfold_all(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.fold_command(window, cx, |map, _, _| map.unfold_all());
+    }
+
+    /// Closes an open Find/Replace bar, or collapses multi-cursors/selection.
+    pub fn escape_editor(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.find_bar.is_open() {
+            self.close_find_bar(true, window, cx);
+            return;
+        }
+        self.run_edit(window, cx, |state, _| {
+            state.escape();
+            false
+        });
+    }
+
+    // --------------------------------------------------------- inline Find / Replace
+
+    /// Whether the inline Find/Replace bar is currently open.
+    #[must_use]
+    pub const fn is_find_bar_open(&self) -> bool {
+        self.find_bar.is_open()
+    }
+
+    /// Whether keyboard focus currently sits inside the inline Find/Replace bar.
+    #[must_use]
+    pub fn has_find_bar_focus(&self, window: &Window) -> bool {
+        self.find_bar.is_open() && self.find_focus_handle.is_focused(window)
+    }
+
+    /// Returns the headless Find/Replace bar state.
+    #[must_use]
+    pub const fn find_bar(&self) -> &FindBarState {
+        &self.find_bar
+    }
+
+    /// Opens the inline Find (`replace = false`) or Replace (`replace = true`) bar.
+    pub fn open_find_bar(
+        &mut self,
+        replace: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let prefill = self.primary_selection_text().filter(|s| !s.contains('\n'));
+        let snapshot = self.state.snapshot();
+        let caret = self.state.primary_head();
+        self.find_bar
+            .open(replace, prefill.as_deref(), &snapshot, caret);
+        window.focus(&self.find_focus_handle);
+        cx.notify();
+    }
+
+    /// Closes the inline Find/Replace bar, optionally restoring focus to the editor canvas.
+    pub fn close_find_bar(
+        &mut self,
+        restore_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.find_bar.close();
+        if restore_focus {
+            window.focus(&self.focus_handle);
+        }
+        cx.notify();
+    }
+
+    /// Focuses either the `Find` or `Replace` field inside the inline bar.
+    pub(crate) fn focus_find_field(
+        &mut self,
+        field: FindBarField,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.find_bar.set_focus_field(field);
+        window.focus(&self.find_focus_handle);
+        cx.notify();
+    }
+
+    /// Toggles `Aa` case sensitivity and jumps to the nearest match.
+    pub(crate) fn toggle_find_case_sensitive(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let snapshot = self.state.snapshot();
+        let caret = self.state.primary_head();
+        self.find_bar.toggle_case_sensitive(&snapshot, caret);
+        if let Some(range) = self.find_bar.current_match_range() {
+            self.select_find_range(range);
+        }
+        window.focus(&self.find_focus_handle);
+        cx.notify();
+    }
+
+    /// Jumps to the next search match (`Cmd+G` / `F3`).
+    pub fn find_next(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) {
+        let snapshot = self.state.snapshot();
+        let caret = self.state.primary_head();
+        if let Some(range) = self.find_bar.step(true, &snapshot, caret) {
+            self.select_find_range(range);
+        }
+        cx.notify();
+    }
+
+    /// Jumps to the previous search match (`Cmd+Shift+G` / `Shift+F3`).
+    pub fn find_prev(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) {
+        let snapshot = self.state.snapshot();
+        let caret = self.state.primary_head();
+        if let Some(range) = self.find_bar.step(false, &snapshot, caret) {
+            self.select_find_range(range);
+        }
+        cx.notify();
+    }
+
+    /// Replaces the currently active match and advances to the next match.
+    pub fn replace_current_match(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.state.is_read_only() {
+            return;
+        }
+        let snapshot = self.state.snapshot();
+        let caret = self.state.primary_head();
+        let target = self
+            .find_bar
+            .current_match_range()
+            .or_else(|| self.find_bar.step(true, &snapshot, caret));
+        let Some(range) = target else {
+            return;
+        };
+        let replacement = self.find_bar.replace_input().text().to_owned();
+        let next_prefer = range.start + replacement.len();
+        self.run_edit(window, cx, |state, _| {
+            state.apply_edits(
+                &[kova_buffer::TextEdit::new(range, replacement.as_str())],
+                kova_buffer::EditOrigin::Compound,
+            )
+        });
+        let post = self.state.snapshot();
+        self.find_bar.recompute(&post, next_prefer);
+        if let Some(next_range) = self.find_bar.current_match_range() {
+            self.select_find_range(next_range);
+        }
+        cx.notify();
+    }
+
+    /// Replaces every match in the document in a single undo transaction.
+    pub fn replace_all_matches(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.state.is_read_only() {
+            return;
+        }
+        let snapshot = self.state.snapshot();
+        self.find_bar
+            .recompute(&snapshot, self.state.primary_head());
+        if self.find_bar.matches().is_empty() {
+            return;
+        }
+        let replacement = self.find_bar.replace_input().text().to_owned();
+        let edits: Vec<kova_buffer::TextEdit> = self
+            .find_bar
+            .matches()
+            .iter()
+            .cloned()
+            .map(|r| kova_buffer::TextEdit::new(r, replacement.as_str()))
+            .collect();
+        self.run_edit(window, cx, |state, _| {
+            state.apply_edits(&edits, kova_buffer::EditOrigin::Compound)
+        });
+        let post = self.state.snapshot();
+        self.find_bar.recompute(&post, self.state.primary_head());
+        cx.notify();
+    }
+
+    /// Handles a keystroke while the inline Find/Replace bar holds focus.
+    pub fn handle_find_bar_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if !self.find_bar.is_open() {
+            return false;
+        }
+        let prev_query = self.find_bar.find_input().text().to_owned();
+        match self
+            .find_bar
+            .handle_key(keystroke, cfg!(target_os = "macos"))
+        {
+            FindKeyOutcome::Ignored => false,
+            FindKeyOutcome::Close => {
+                self.close_find_bar(true, window, cx);
+                true
+            }
+            FindKeyOutcome::OpenFind => {
+                self.open_find_bar(false, window, cx);
+                true
+            }
+            FindKeyOutcome::OpenReplace => {
+                self.open_find_bar(true, window, cx);
+                true
+            }
+            FindKeyOutcome::FindNext => {
+                self.find_next(window, cx);
+                true
+            }
+            FindKeyOutcome::FindPrev => {
+                self.find_prev(window, cx);
+                true
+            }
+            FindKeyOutcome::ReplaceCurrent => {
+                self.replace_current_match(window, cx);
+                true
+            }
+            FindKeyOutcome::ReplaceAll => {
+                self.replace_all_matches(window, cx);
+                true
+            }
+            FindKeyOutcome::Consumed => {
+                if self.find_bar.find_input().text() != prev_query {
+                    let snapshot = self.state.snapshot();
+                    let caret = self.state.primary_head();
+                    self.find_bar.recompute(&snapshot, caret);
+                    if let Some(range) = self.find_bar.current_match_range() {
+                        self.select_find_range(range);
+                    }
+                }
+                cx.notify();
+                true
+            }
+        }
+    }
+
+    fn select_find_range(&mut self, range: Range<usize>) {
+        self.state.set_selection(range.start, range.end);
+        self.reveal_cursors();
+        self.ensure_primary_cursor_visible();
+    }
+
     pub(crate) const fn is_cursor_visible(&self) -> bool {
         self.cursor_visible
     }
@@ -1257,6 +1594,10 @@ impl EditorView {
         let version = self.state.snapshot().version();
         if version != self.last_emitted_version {
             self.last_emitted_version = version;
+            if self.find_bar.is_open() {
+                let snap = self.state.snapshot();
+                self.find_bar.recompute(&snap, self.state.primary_head());
+            }
             self.schedule_git_diff(cx);
             cx.emit(EditorEvent::Edited);
         }
@@ -1419,10 +1760,6 @@ impl EditorView {
                 self.run_edit(window, cx, |state, _| state.delete_forward());
             }
             EditorKeyCommand::Move { motion, extend } => self.motion(motion, extend, window, cx),
-            EditorKeyCommand::AddCursor { up } => self.run_edit(window, cx, |state, _| {
-                state.add_cursor_vertical(up);
-                true
-            }),
             EditorKeyCommand::Page { down, extend } => self.page(down, extend, window, cx),
         }
         cx.stop_propagation();
@@ -1727,10 +2064,14 @@ impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         // A sibling split may have edited the shared document since the last frame.
         if self.state.sync_external_edits() {
-            self.last_emitted_version = self.state.snapshot().version();
+            let snap = self.state.snapshot();
+            self.last_emitted_version = snap.version();
+            if self.find_bar.is_open() {
+                self.find_bar.recompute(&snap, self.state.primary_head());
+            }
             self.schedule_git_diff(cx);
         }
-        div()
+        let mut container = div()
             .size_full()
             .relative()
             .key_context(actions::EDITOR_KEY_CONTEXT)
@@ -1764,7 +2105,17 @@ impl Render for EditorView {
             .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
             .on_mouse_move(cx.listener(Self::handle_hover_move))
-            .child(EditorCanvasElement::new(cx.entity()))
+            .child(EditorCanvasElement::new(cx.entity()));
+        if self.find_bar.is_open() {
+            container = container.child(render_find_bar(
+                &self.find_bar,
+                &self.find_focus_handle,
+                self.state.is_read_only(),
+                cx.global::<crate::theme::KovaTheme>(),
+                cx,
+            ));
+        }
+        container
     }
 }
 
