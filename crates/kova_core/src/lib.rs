@@ -40,8 +40,9 @@ pub use markdown::{
     TableAlignment, TableBlock, is_markdown_path, parse_markdown,
 };
 pub use navigation::{
-    NavLocation, NavigationHistory, ResolvedLocation, SourceLanguageKind, SymbolQuery,
-    extract_symbol_query, navigable_identifier_at_byte, resolve_local_definition,
+    ExternalTargetCandidates, NavLocation, NavigationHistory, ResolvedLocation, SourceLanguageKind,
+    SymbolQuery, extract_symbol_query, navigable_identifier_at_byte,
+    resolve_external_fqcn_candidates, resolve_local_definition,
 };
 pub use project::{
     ActiveProject, BuildSystemKind, DEFAULT_MAX_ENTRIES, MAX_RECENT_FILES,

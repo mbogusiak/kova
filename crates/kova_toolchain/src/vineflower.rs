@@ -1,6 +1,7 @@
 //! On-demand `.class` decompilation through Vineflower with a persistent source cache
 //! in `~/.cache/kova/decompiled/<artifact_key>/<package path>/<Outer>.java`.
 
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -13,8 +14,9 @@ use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 use crate::error::ToolchainError;
-use crate::jdk::JdkInstallation;
-use crate::omakase::installer::{has_extension, unique_suffix};
+use crate::jdk::{JdkInstallation, select_tool_runtime_jdk};
+use crate::omakase::installer::{OmakaseManager, has_extension, unique_suffix};
+use crate::omakase::manifest::{OmakaseManifest, OmakaseTool};
 
 /// Header preceding the ZIP stream in JDK `.jmod` files.
 const JMOD_MAGIC: [u8; 4] = [b'J', b'M', 1, 0];
@@ -561,9 +563,261 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), ToolchainError> {
     })
 }
 
+/// Discovers a locally installed `vineflower.jar` (without performing any network calls)
+/// and pairs it with a compatible runtime JDK (`KOVA-061`).
+///
+/// Search order:
+/// 1. `KOVA_VINEFLOWER_JAR` environment variable (if it points to an existing file),
+/// 2. Omakase `installed.toml` record for [`OmakaseTool::Vineflower`],
+/// 3. `<omakase>/vineflower/vineflower.jar` or the first `vineflower*.jar` in that directory.
+#[must_use]
+pub fn discover_vineflower_decompiler(
+    paths: &KovaPaths,
+    jdks: &[JdkInstallation],
+) -> Option<VineflowerDecompiler> {
+    let jar = find_vineflower_jar(paths)?;
+    let jdk = select_tool_runtime_jdk(jdks, 17)
+        .ok()
+        .or_else(|| jdks.first())?
+        .clone();
+    Some(VineflowerDecompiler::for_paths(paths, jar, jdk))
+}
+
+fn find_vineflower_jar(paths: &KovaPaths) -> Option<PathBuf> {
+    if let Some(env_jar) = std::env::var_os("KOVA_VINEFLOWER_JAR")
+        && !env_jar.is_empty()
+    {
+        let candidate = PathBuf::from(env_jar);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    let manager = OmakaseManager::new(paths.clone(), OmakaseManifest::default());
+    if let Ok(state) = manager.inspect_installed()
+        && let Some(record) = state.get(OmakaseTool::Vineflower)
+    {
+        let rel = Path::new(&record.entrypoint_rel_path);
+        if !rel.is_absolute()
+            && !rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            let candidate = paths.omakase_dir().join(rel);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let vineflower_dir = paths.vineflower_dir();
+    let canonical_jar = vineflower_dir.join("vineflower.jar");
+    if canonical_jar.is_file() {
+        return Some(canonical_jar);
+    }
+
+    let mut jars: Vec<PathBuf> = fs::read_dir(&vineflower_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.to_ascii_lowercase().starts_with("vineflower") && has_extension(n, "jar")
+                })
+        })
+        .collect();
+    jars.sort();
+    jars.into_iter().next()
+}
+
+/// Emergency `javap -p -constants` fallback used only when `cafebabe` cannot parse a `.class`
+/// file (for example, bytecode compiled by a future JDK release).
+pub async fn decompile_with_javap_fallback(
+    jdk: &JdkInstallation,
+    archive_path: &Path,
+    entry_name: &str,
+    bytes: &[u8],
+) -> Option<String> {
+    let javap_name = if cfg!(windows) { "javap.exe" } else { "javap" };
+    let javap_bin = jdk.home_dir.join("bin").join(javap_name);
+    if !javap_bin.is_file() {
+        return None;
+    }
+
+    let class_filename = entry_name
+        .rsplit('/')
+        .next()
+        .filter(|s| has_extension(s, "class") && !s.contains(['\\', '\0']))?;
+    let work_dir = std::env::temp_dir().join(format!(
+        "kova-javap-{}-{}",
+        unique_suffix(),
+        WORK_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&work_dir).ok()?;
+    let class_path = work_dir.join(class_filename);
+    if fs::write(&class_path, bytes).is_err() {
+        fs::remove_dir_all(&work_dir).ok();
+        return None;
+    }
+
+    let mut cmd = tokio::process::Command::new(&javap_bin);
+    cmd.arg("-p")
+        .arg("-constants")
+        .arg(&class_path)
+        .env("JAVA_HOME", &jdk.home_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+
+    let output = tokio::time::timeout(Duration::from_secs(2), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    fs::remove_dir_all(&work_dir).ok();
+
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+
+    Some(format_javap_output(&raw, archive_path, entry_name))
+}
+
+fn format_javap_output(raw: &str, archive_path: &Path, entry_name: &str) -> String {
+    let logical = entry_name
+        .strip_prefix("classes/")
+        .unwrap_or_else(|| strip_mr_prefix(entry_name));
+    let fqcn = logical
+        .strip_suffix(".class")
+        .unwrap_or(logical)
+        .replace(['/', '$'], ".");
+    let package = fqcn.rsplit_once('.').map_or("", |(pkg, _)| pkg);
+
+    let mut out = String::with_capacity(raw.len() + 256);
+    out.push_str(
+        "// Decompiled by Kova javap fallback — install Vineflower for full method bodies\n",
+    );
+    let _ = writeln!(out, "// Source: {}!/{entry_name}", archive_path.display());
+    if !package.is_empty() {
+        let _ = writeln!(out, "package {package};\n");
+    }
+
+    let mut in_interface = false;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Compiled from ") || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.contains("interface ") && trimmed.ends_with('{') {
+            in_interface = true;
+        }
+        if !in_interface
+            && line.starts_with("  ")
+            && trimmed.contains('(')
+            && trimmed.ends_with(';')
+            && !trimmed.contains(" abstract ")
+            && !trimmed.starts_with("abstract ")
+            && !trimmed.contains(" native ")
+            && !trimmed.starts_with("native ")
+        {
+            let without_semi = trimmed.trim_end_matches(';');
+            out.push_str("    ");
+            out.push_str(without_semi);
+            out.push_str(" {\n        /* compiled code */\n    }\n");
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn strip_mr_prefix(entry_name: &str) -> &str {
+    if let Some(rest) = entry_name.strip_prefix("META-INF/versions/")
+        && let Some((_, logical)) = rest.split_once('/')
+    {
+        return logical;
+    }
+    entry_name
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jdk::{JavaVersion, JdkSource, JdkVendor};
+    use tempfile::TempDir;
+
+    fn dummy_jdk(home: &Path, major: u16) -> JdkInstallation {
+        JdkInstallation {
+            home_dir: home.to_path_buf(),
+            java_bin: home.join("bin/java"),
+            jmods_dir: None,
+            version: JavaVersion {
+                major,
+                minor: 0,
+                patch: 0,
+                build: None,
+            },
+            vendor: JdkVendor::Unknown("Test".to_owned()),
+            arch: "aarch64".to_owned(),
+            source: JdkSource::EnvJavaHome,
+        }
+    }
+
+    #[test]
+    fn discovers_vineflower_from_omakase_dir_without_network() {
+        let dir = TempDir::new().expect("tempdir");
+        let base = dir.path();
+        let paths =
+            KovaPaths::from_roots(base.join("config"), base.join("data"), base.join("cache"))
+                .expect("paths");
+        let vf_dir = paths.vineflower_dir();
+        fs::create_dir_all(&vf_dir).expect("mkdir");
+        let vf_jar = vf_dir.join("vineflower-1.10.1.jar");
+        fs::write(&vf_jar, b"PK\x03\x04").expect("write jar");
+
+        let jdk_home = base.join("jdk-21");
+        fs::create_dir_all(jdk_home.join("bin")).expect("mkdir bin");
+        fs::write(jdk_home.join("bin/java"), b"").expect("write java");
+        let jdks = vec![dummy_jdk(&jdk_home, 21)];
+
+        // Note: only inspect without KOVA_VINEFLOWER_JAR interference when unset.
+        if std::env::var_os("KOVA_VINEFLOWER_JAR").is_none() {
+            let discovered = discover_vineflower_decompiler(&paths, &jdks)
+                .expect("must discover vineflower jar");
+            assert_eq!(discovered.vineflower_jar, vf_jar);
+            assert_eq!(
+                discovered.cache_root(),
+                paths.cache_dir().join("decompiled")
+            );
+        }
+    }
+
+    #[test]
+    fn format_javap_output_produces_valid_java_skeleton() {
+        let raw = "\
+Compiled from \"Objects.java\"
+public final class java.util.Objects {
+  private java.util.Objects();
+  public static boolean equals(java.lang.Object, java.lang.Object);
+}
+";
+        let formatted = format_javap_output(
+            raw,
+            Path::new("/jdk/jmods/java.base.jmod"),
+            "classes/java/util/Objects.class",
+        );
+        assert!(formatted.contains("package java.util;"), "{formatted}");
+        assert!(
+            formatted.contains("public static boolean equals(java.lang.Object, java.lang.Object) {\n        /* compiled code */\n    }"),
+            "{formatted}"
+        );
+    }
 
     #[test]
     fn entry_name_validation_blocks_traversal() {

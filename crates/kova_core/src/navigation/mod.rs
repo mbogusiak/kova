@@ -8,8 +8,9 @@ pub mod resolver;
 use std::path::PathBuf;
 
 pub use resolver::{
-    ImportEntry, ResolvedLocation, SourceLanguageKind, SymbolQuery, extract_symbol_query,
-    navigable_identifier_at_byte, resolve_local_definition,
+    ExternalTargetCandidates, ImportEntry, ResolvedLocation, SourceLanguageKind, SymbolQuery,
+    extract_symbol_query, navigable_identifier_at_byte, resolve_external_fqcn_candidates,
+    resolve_local_definition,
 };
 
 /// Default maximum number of entries kept in [`NavigationHistory`] `back` / `forward` stacks.
