@@ -428,7 +428,7 @@ pub fn record_recent_workspace(
 /// Returns `true` when `path` is a non-empty relative path composed strictly of `Normal` components
 /// with no NUL bytes.
 #[must_use]
-pub(crate) fn is_safe_relative_path(path: &Path) -> bool {
+pub fn is_safe_relative_path(path: &Path) -> bool {
     let bytes = path.as_os_str().as_encoded_bytes();
     if bytes.is_empty() || bytes.contains(&0) || path.is_absolute() {
         return false;

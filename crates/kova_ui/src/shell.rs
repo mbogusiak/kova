@@ -10,6 +10,7 @@
 //! *Structure* outline / syntax problems are extracted by `kova_syntax` on the background
 //! executor whenever the active document changes.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
@@ -19,9 +20,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, AppContext as _, ClickEvent, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, ScrollStrategy,
+    AnyElement, AppContext as _, Bounds, ClickEvent, Context, Div, Entity, FocusHandle, FontWeight,
+    Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollStrategy,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled, Subscription, Task,
     UniformListScrollHandle, Window, div, px, relative, uniform_list,
 };
@@ -47,6 +48,7 @@ mod debug;
 mod git;
 mod open_project_modal;
 mod project;
+mod project_panel;
 
 pub use open_project_modal::{
     MAX_DIRTY_PREVIEW_ITEMS, OpenProjectButton, OpenProjectDirtyEntry, OpenProjectKeyOutcome,
@@ -56,6 +58,10 @@ pub use project::{
     OpenProjectRequestOutcome, PendingProjectSwitch, SwitchProjectError, SwitchProjectMode,
     canonicalize_or_raw, paths_match,
 };
+use project_panel::NewProjectItemModal;
+pub use project_panel::{
+    NewEntryKind, NewItemKeyOutcome, NewProjectItemState, create_project_item_on_disk,
+};
 
 use crate::app_menu::{OpenProject, SearchEverywhere};
 use crate::debugger::{DebugCommandSink, DebuggerModel};
@@ -63,14 +69,14 @@ use crate::dock::bottom_panel::BOTTOM_TAB_BAR_HEIGHT_PX;
 use crate::dock::focus::{
     LEFT_STRIPE_WIDTH_PX, RIGHT_STRIPE_WIDTH_PX, STATUSBAR_HEIGHT_PX, TITLEBAR_HEIGHT_PX,
 };
-use crate::dock::project_tree::{PROJECT_INDENT_PX, PROJECT_ROW_HEIGHT_PX, lang_hint_for};
+use crate::dock::project_tree::{PROJECT_INDENT_PX, file_icon_kind_for, lang_hint_for};
 use crate::dock::structure::{STRUCTURE_ROW_HEIGHT_PX, kind_icon};
 use crate::dock::{
     BadgeVariant, BottomPanelModel, BottomTab, Direction, DockLayoutState, DockToolId,
-    FocusModeVariant, FocusTilingController, FocusToggle, FocusedRegion, LayoutDensity, PaneId,
-    ProblemEntry, ProblemRow, ProblemSeverity, ProjectNode, ProjectNodeKind, ProjectTreeModel,
-    SplitAxis, SplitTree, StatusBarState, StructureModel, TabGroupModel, TabId, TabItem,
-    TreeActivation, VimModeBadge,
+    FileIconKind, FocusModeVariant, FocusTilingController, FocusToggle, FocusedRegion,
+    LayoutDensity, PaneId, ProblemEntry, ProblemRow, ProblemSeverity, ProjectNode, ProjectNodeKind,
+    ProjectTreeModel, SplitAxis, SplitTree, StatusBarState, StructureModel, TabGroupModel, TabId,
+    TabItem, TreeActivation, VimModeBadge,
 };
 use crate::document::{
     CompletionSink, DefinitionOutcome, DefinitionRequest, DefinitionSink, DefinitionTargetKind,
@@ -129,7 +135,7 @@ const STATUSBAR_RADIUS_PX: f32 = 8.0;
 const STRIPE_INDICATOR_WIDTH_PX: f32 = 2.5;
 /// Split ratio step of one `ResizeSplit` shortcut.
 const RESIZE_SPLIT_STEP: f32 = 0.05;
-const DOCK_HEADER_HEIGHT_PX: f32 = 30.0;
+const DOCK_HEADER_HEIGHT_PX: f32 = 32.0;
 const FILTER_BAR_HEIGHT_PX: f32 = 26.0;
 /// Debounce applied before re-running `kova_syntax` analysis after an edit. Editors keep
 /// painting the previous syntax snapshot (stale fallback) until the new one arrives.
@@ -518,6 +524,18 @@ pub struct WorkspaceShell {
     next_completion_request_id: u64,
     pending_completion_request_id: Option<u64>,
     completion_origin: Option<(PaneId, TabId)>,
+    /// Whether the cursor is currently hovering the left `Project` island (`KOVA-055`).
+    project_dock_hovered: bool,
+    /// Inline `+` (*New File / New Folder*) modal state and bounds (`KOVA-055`).
+    new_item_modal: NewProjectItemModal,
+    /// Whether the `Project` header `Options (⋮)` popover is open (`KOVA-055`).
+    project_options_open: bool,
+    project_options_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    project_options_btn_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Automatically reveal the active editor file in the `Project` tree when switching tabs.
+    always_select_opened_file: bool,
+    /// Draw vertical indent guide lines inside the `Project` tree (off by default).
+    show_indent_guides: bool,
 }
 
 impl fmt::Debug for WorkspaceShell {
@@ -638,6 +656,13 @@ impl WorkspaceShell {
             next_completion_request_id: 1,
             pending_completion_request_id: None,
             completion_origin: None,
+            project_dock_hovered: false,
+            new_item_modal: NewProjectItemModal::default(),
+            project_options_open: false,
+            project_options_bounds: Rc::new(Cell::new(None)),
+            project_options_btn_bounds: Rc::new(Cell::new(None)),
+            always_select_opened_file: false,
+            show_indent_guides: false,
         }
     }
 
@@ -802,8 +827,12 @@ impl WorkspaceShell {
             return;
         };
         let scan = cx.background_executor().spawn(async move {
-            let tree = scan_project(&root, &ProjectScanOptions::default())
-                .map(|tree| ProjectTreeModel::from_project_tree(&tree, 1));
+            let options = ProjectScanOptions {
+                include_git_ignored: true,
+                ..ProjectScanOptions::default()
+            };
+            let tree = scan_project(&root, &options)
+                .map(|tree| ProjectTreeModel::from_project_tree_with_root(&tree, Some(&root), 1));
             let repo = GitRepository::discover(&root).ok().map(Arc::new);
             let branch = repo
                 .as_ref()
@@ -821,7 +850,8 @@ impl WorkspaceShell {
                     return;
                 }
                 match tree {
-                    Ok(tree) => {
+                    Ok(mut tree) => {
+                        tree.set_show_git_ignored(this.project_tree.show_git_ignored());
                         this.test_runner
                             .set_project_files(tree.file_paths().map(Path::to_path_buf).collect());
                         this.project_tree = tree;
@@ -1643,7 +1673,10 @@ impl WorkspaceShell {
         }
         self.refresh_debug_gutters(cx);
         self.record_recent_file(rel_path);
-        self.project_tree.reveal_path(rel_path);
+        if self.always_select_opened_file && self.project_tree.reveal_path(rel_path) {
+            self.project_scroll
+                .scroll_to_item(self.project_tree.selected_index(), ScrollStrategy::Center);
+        }
         self.set_active_pane(pane_id, cx);
         self.dock_layout.focus(FocusedRegion::EditorPane(pane_id));
         self.refresh_analysis(Duration::ZERO, cx);
@@ -1674,6 +1707,10 @@ impl WorkspaceShell {
         };
         if let Some(path) = path {
             self.record_recent_file(&path);
+            if self.always_select_opened_file && self.project_tree.reveal_path(&path) {
+                self.project_scroll
+                    .scroll_to_item(self.project_tree.selected_index(), ScrollStrategy::Center);
+            }
         }
         self.set_active_pane(pane, cx);
         self.refresh_analysis(Duration::ZERO, cx);
@@ -2107,17 +2144,6 @@ impl WorkspaceShell {
         );
     }
 
-    fn click_tree_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.project_tree.select_index(row);
-        self.dock_layout.focus(FocusedRegion::ProjectDock);
-        match self.project_tree.activate_selected() {
-            Some(TreeActivation::OpenFile(path)) => self.open_path(&path, None, window, cx),
-            Some(TreeActivation::Toggled) | None => {
-                self.focus_dock(FocusedRegion::ProjectDock, window, cx);
-            }
-        }
-    }
-
     // ---------------------------------------------------------------------------------------
     // Keyboard and mouse handling
     // ---------------------------------------------------------------------------------------
@@ -2193,6 +2219,7 @@ impl WorkspaceShell {
         let modal_open = self.settings_open
             || self.commit_panel_open
             || self.open_project_modal.is_some()
+            || self.new_item_modal.is_open()
             || self.find_in_files.is_open()
             || self.ex_line.is_some()
             || self.debugger.evaluate_modal().is_some();
@@ -2322,6 +2349,10 @@ impl WorkspaceShell {
             return true;
         }
         if self.handle_open_project_modal_key(keystroke, window, cx) {
+            cx.stop_propagation();
+            return true;
+        }
+        if self.handle_new_item_modal_key(keystroke, window, cx) {
             cx.stop_propagation();
             return true;
         }
@@ -4513,7 +4544,7 @@ impl WorkspaceShell {
         )
     }
 
-    fn render_left_dock(&self, p: Palette, cx: &Context<'_, Self>) -> Option<Div> {
+    fn render_left_dock(&self, p: Palette, cx: &Context<'_, Self>) -> Option<AnyElement> {
         let tool = self.dock_layout.left_open?;
         let island = self
             .island(FocusedRegion::ProjectDock, p)
@@ -4528,112 +4559,13 @@ impl WorkspaceShell {
             );
 
         if tool == DockToolId::Commit {
-            return Some(self.render_commit_dock(island, p, cx));
+            return Some(self.render_commit_dock(island, p, cx).into_any_element());
         }
 
-        let detail = if self.project.is_loading() {
-            "Loading…".to_owned()
-        } else {
-            format!("{} items", self.project_tree.visible_len())
-        };
-        let query = self.project_tree.filter_query();
-        let (filter_text, filter_color) = if query.is_empty() {
-            ("Type to filter tree...".to_owned(), p.text_muted)
-        } else {
-            (format!("⌕ {query}"), p.text_primary)
-        };
-
         Some(
-            island
-                .child(Self::dock_header("Project", detail, p))
-                .child(
-                    uniform_list(
-                        "project-tree",
-                        self.project_tree.visible_len(),
-                        cx.processor(Self::render_tree_rows),
-                    )
-                    .track_scroll(self.project_scroll.clone())
-                    .flex_1()
-                    .w_full()
-                    .py(px(4.0)),
-                )
-                .child(
-                    div()
-                        .h(px(FILTER_BAR_HEIGHT_PX))
-                        .flex_none()
-                        .mx(px(6.0))
-                        .mb(px(6.0))
-                        .px(px(8.0))
-                        .flex()
-                        .items_center()
-                        .rounded(px(6.0))
-                        .bg(p.input)
-                        .border_1()
-                        .border_color(p.border_island)
-                        .text_size(px(11.0))
-                        .text_color(filter_color)
-                        .child(filter_text),
-                ),
+            self.render_project_dock(island.id("left-dock-island"), p, cx)
+                .into_any_element(),
         )
-    }
-
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "tree depth is a small u16 that converts exactly to f32"
-    )]
-    fn render_tree_rows(
-        &mut self,
-        range: Range<usize>,
-        _window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) -> Vec<Stateful<Div>> {
-        let p = Palette::from_theme(cx.global::<KovaTheme>());
-        let selected = self.project_tree.selected_index();
-        let dock_focused = self.dock_layout.focused == FocusedRegion::ProjectDock;
-        let open_path = self
-            .panes
-            .get(&self.active_pane)
-            .and_then(|pane| pane.tabs.active_tab())
-            .and_then(|tab| tab.path.clone());
-
-        self.project_tree
-            .visible_range(range)
-            .map(|(row, node)| {
-                let is_selected = row == selected && dock_focused;
-                let is_open = open_path.as_deref() == Some(node.path.as_path());
-                let indent = 8.0 + f32::from(node.depth) * PROJECT_INDENT_PX;
-                let mut el = div()
-                    .id(("tree-row", row))
-                    .relative()
-                    .h(px(PROJECT_ROW_HEIGHT_PX))
-                    .w_full()
-                    .pl(px(indent))
-                    .pr(px(8.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .text_size(px(12.0))
-                    .hover(|s| s.bg(p.hover))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.click_tree_row(row, window, cx);
-                    }));
-                if is_selected || is_open {
-                    el = el.bg(p.active);
-                }
-                for level in 0..node.depth {
-                    el = el.child(
-                        div()
-                            .absolute()
-                            .top(px(0.0))
-                            .bottom(px(0.0))
-                            .left(px(8.0 + f32::from(level) * PROJECT_INDENT_PX + 4.0))
-                            .w(px(1.0))
-                            .bg(p.border_subtle),
-                    );
-                }
-                el.child(tree_icon(node, p)).child(tree_label(node, p))
-            })
-            .collect()
     }
 
     fn render_right_dock(&self, p: Palette, cx: &Context<'_, Self>) -> Option<Div> {
@@ -5738,7 +5670,10 @@ impl Render for WorkspaceShell {
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
-            .capture_any_mouse_down(cx.listener(Self::handle_completion_outside_click))
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.handle_completion_outside_click(event, window, cx);
+                this.handle_project_overlay_outside_click(event, window, cx);
+            }))
             .child(self.render_titlebar(p))
             .child(workspace);
         let root = match self.render_completion_overlay(cx) {
@@ -5890,43 +5825,6 @@ fn placeholder(text: &'static str, p: Palette) -> Div {
         .child(text)
 }
 
-fn tree_icon(node: &ProjectNode, p: Palette) -> Div {
-    let color = match &node.kind {
-        ProjectNodeKind::Directory { .. } => p.text_muted,
-        ProjectNodeKind::File { lang_hint } => file_badge_color(lang_hint.as_str(), p),
-    };
-    div()
-        .w(px(14.0))
-        .flex_none()
-        .text_size(px(10.0))
-        .font_weight(FontWeight::BOLD)
-        .text_color(color)
-        .child(node.icon().to_owned())
-}
-
-fn tree_label(node: &ProjectNode, p: Palette) -> Div {
-    let label = div().text_color(p.text_primary).child(node.name.clone());
-    if node.is_kova_config {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .child(label.font_weight(FontWeight::SEMIBOLD))
-            .child(
-                div()
-                    .px(px(4.0))
-                    .rounded(px(3.0))
-                    .border_1()
-                    .border_color(p.warning)
-                    .text_size(px(9.0))
-                    .text_color(p.warning)
-                    .child("project config"),
-            )
-    } else {
-        label
-    }
-}
-
 fn file_title(path: &Path) -> String {
     path.file_name()
         .map_or_else(|| path.to_string_lossy(), |name| name.to_string_lossy())
@@ -6047,49 +5945,63 @@ fn analyze_document(
 /// In-memory demo project (`kova-orders`) shown until a real project directory is scanned.
 fn demo_project_nodes() -> Vec<ProjectNode> {
     let entries: [(&str, u16, bool); 18] = [
-        ("src", 0, true),
-        ("src/main", 1, true),
-        ("src/main/java", 2, true),
-        ("src/main/java/dev", 3, true),
-        ("src/main/java/dev/kova", 4, true),
-        ("src/main/java/dev/kova/demo", 5, true),
-        (WELCOME_DOCUMENT_PATH, 6, false),
-        ("src/main/java/dev/kova/demo/OrderApp.java", 6, false),
-        ("src/main/java/dev/kova/demo/OrderService.java", 6, false),
-        ("src/test", 1, true),
-        ("src/test/java", 2, true),
-        ("src/test/java/OrderServiceTest.java", 3, false),
-        ("http", 0, true),
-        ("http/orders.http", 1, false),
-        ("build", 0, true),
-        ("build.gradle.kts", 0, false),
-        ("settings.gradle.kts", 0, false),
-        ("kova.toml", 0, false),
+        ("src", 1, true),
+        ("src/main", 2, true),
+        ("src/main/java", 3, true),
+        ("src/main/java/dev", 4, true),
+        ("src/main/java/dev/kova", 5, true),
+        ("src/main/java/dev/kova/demo", 6, true),
+        (WELCOME_DOCUMENT_PATH, 7, false),
+        ("src/main/java/dev/kova/demo/OrderApp.java", 7, false),
+        ("src/main/java/dev/kova/demo/OrderService.java", 7, false),
+        ("src/test", 2, true),
+        ("src/test/java", 3, true),
+        ("src/test/java/OrderServiceTest.java", 4, false),
+        ("http", 1, true),
+        ("http/orders.http", 2, false),
+        ("build", 1, true),
+        ("build.gradle.kts", 1, false),
+        ("settings.gradle.kts", 1, false),
+        ("kova.toml", 1, false),
     ];
-    entries
-        .iter()
-        .enumerate()
-        .map(|(idx, (path, depth, is_dir))| {
-            let path_buf = PathBuf::from(path);
-            let name = file_title(&path_buf);
-            ProjectNode {
-                node_id: idx as u64 + 1,
-                kind: if *is_dir {
-                    ProjectNodeKind::Directory {
-                        expanded: name != "build",
-                    }
-                } else {
-                    ProjectNodeKind::File {
-                        lang_hint: lang_hint_for(&name).to_owned(),
-                    }
-                },
-                is_kova_config: name == "kova.toml",
-                path: path_buf,
-                name,
-                depth: *depth,
-            }
-        })
-        .collect()
+    let mut nodes = Vec::with_capacity(entries.len() + 1);
+    nodes.push(ProjectNode {
+        node_id: 0,
+        path: PathBuf::new(),
+        name: "kova-orders".to_owned(),
+        depth: 0,
+        kind: ProjectNodeKind::Directory { expanded: true },
+        is_kova_config: false,
+        is_root: true,
+        root_path_hint: Some("~/projects/kova-orders".to_owned()),
+        is_git_ignored: false,
+        icon_kind: FileIconKind::Generic,
+    });
+    for (idx, (path, depth, is_dir)) in entries.iter().enumerate() {
+        let path_buf = PathBuf::from(path);
+        let name = file_title(&path_buf);
+        nodes.push(ProjectNode {
+            node_id: idx as u64 + 1,
+            kind: if *is_dir {
+                ProjectNodeKind::Directory {
+                    expanded: name != "build",
+                }
+            } else {
+                ProjectNodeKind::File {
+                    lang_hint: lang_hint_for(&name).to_owned(),
+                }
+            },
+            is_kova_config: name == "kova.toml",
+            icon_kind: file_icon_kind_for(&name),
+            path: path_buf,
+            name,
+            depth: *depth,
+            is_root: false,
+            root_path_hint: None,
+            is_git_ignored: false,
+        });
+    }
+    nodes
 }
 
 #[cfg(test)]
