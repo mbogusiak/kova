@@ -1,4 +1,4 @@
-//! Headless input helpers: UTF-16 ↔ UTF-8 conversion, cursor shapes, multi-cursor paste, and latency stats.
+//! Headless input helpers: UTF-16 ↔ UTF-8 conversion, multi-cursor paste, and latency stats.
 
 use std::ops::Range;
 use std::time::Duration;
@@ -6,18 +6,6 @@ use std::time::Duration;
 use kova_buffer::Motion;
 use kova_core::perf::budgets::INPUT_LATENCY_MAX;
 use kova_core::perf::{BudgetKind, check_duration_budget};
-
-/// Visual shape of an editor caret (`editor_ux_guidelines.md` §4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CursorShape {
-    /// Default Phase 0 vertical bar (`2px` wide, `1px` corner radius).
-    #[default]
-    Bar,
-    /// Full-cell block cursor (prepared for Phase 1 Vim Normal mode).
-    Block,
-    /// Bottom underline cursor (prepared for Phase 1 Vim Replace/Pending mode).
-    Underline,
-}
 
 /// Tracks input-dispatch latency against [`INPUT_LATENCY_MAX`] (`5 ms`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

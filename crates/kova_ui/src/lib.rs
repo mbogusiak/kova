@@ -6,6 +6,7 @@
 pub mod dock;
 pub mod document;
 pub mod editor;
+pub mod keymap;
 pub mod shell;
 pub mod theme;
 

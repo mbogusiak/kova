@@ -33,10 +33,14 @@ use kova_syntax::{LanguageRegistry, SyntaxEngine, SyntaxEngineConfig, detect_lan
 use kova_theme::SyntaxLanguage;
 
 use crate::dock::bottom_panel::BOTTOM_TAB_BAR_HEIGHT_PX;
+use crate::dock::focus::{
+    LEFT_STRIPE_WIDTH_PX, RIGHT_STRIPE_WIDTH_PX, STATUSBAR_HEIGHT_PX, TITLEBAR_HEIGHT_PX,
+};
 use crate::dock::project_tree::{PROJECT_INDENT_PX, PROJECT_ROW_HEIGHT_PX, lang_hint_for};
 use crate::dock::structure::{STRUCTURE_ROW_HEIGHT_PX, kind_icon};
 use crate::dock::{
-    BadgeVariant, BottomPanelModel, BottomTab, DockLayoutState, DockToolId, FocusedRegion, PaneId,
+    BadgeVariant, BottomPanelModel, BottomTab, Direction, DockLayoutState, DockToolId,
+    FocusModeVariant, FocusTilingController, FocusToggle, FocusedRegion, LayoutDensity, PaneId,
     ProblemEntry, ProblemRow, ProblemSeverity, ProjectNode, ProjectNodeKind, ProjectTreeModel,
     SplitAxis, SplitTree, StatusBarState, StructureModel, TabGroupModel, TabId, TabItem,
     TreeActivation, VimModeBadge,
@@ -45,21 +49,24 @@ use crate::document::{
     DocumentState, SAVE_PATH_REQUIRED_MESSAGE, SaveAction, SaveSink, SaveTicket, StatusKind,
 };
 use crate::editor::actions::{Save, WORKSPACE_KEY_CONTEXT};
+use crate::editor::vim::VimKeyResult;
 use crate::editor::{EditorEvent, EditorView, SharedBuffer};
+use crate::keymap::{
+    CHORD_TIMEOUT, DispatchContext, DispatchOutcome, ExCommand, ExCommandLine, ExLineEvent,
+    KeyDispatchLayer, KeyRoute, RouteFlags, ShellAction, is_text_composition, key_route,
+    parse_ex_command, shortcut_stroke, vim_stroke,
+};
 use crate::theme::{KovaTheme, hsla_from_rgba};
 
 /// Canonical Islands UI layout geometry (`KOVA-025` spec §FR-1, `new_ui_dock_mockup.svg`).
-const SHELL_OUTER_PADDING_PX: f32 = 10.0;
-const SHELL_ISLAND_GAP_PX: f32 = 8.0;
-const TITLEBAR_HEIGHT_PX: f32 = 36.0;
+/// Outer margin, island gap and focus ring width come from [`LayoutDensity`] (`KOVA-026`);
+/// the title bar, status bar and stripe sizes are shared with [`crate::dock::focus`].
 const ISLAND_RADIUS_PX: f32 = 10.0;
 const TAB_BAR_HEIGHT_PX: f32 = 34.0;
-const STATUSBAR_HEIGHT_PX: f32 = 28.0;
 const STATUSBAR_RADIUS_PX: f32 = 8.0;
-const LEFT_STRIPE_WIDTH_PX: f32 = 32.0;
-const RIGHT_STRIPE_WIDTH_PX: f32 = 30.0;
 const STRIPE_INDICATOR_WIDTH_PX: f32 = 2.5;
-const FOCUS_BORDER_WIDTH_PX: f32 = 1.2;
+/// Split ratio step of one `ResizeSplit` shortcut.
+const RESIZE_SPLIT_STEP: f32 = 0.05;
 const DOCK_HEADER_HEIGHT_PX: f32 = 30.0;
 const FILTER_BAR_HEIGHT_PX: f32 = 26.0;
 /// Debounce applied before re-running `kova_syntax` analysis after an edit.
@@ -300,6 +307,10 @@ struct AnalysisResult {
 }
 
 /// Root GPUI view rendering the *Kova Islands* `IntelliJ` New UI workspace.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent startup, loading and Vim flags of the root view"
+)]
 pub struct WorkspaceShell {
     process_start: Instant,
     metrics: StartupMetrics,
@@ -334,6 +345,20 @@ pub struct WorkspaceShell {
     syntax_engine: Option<Arc<SyntaxEngine>>,
     analysis_task: Option<Task<()>>,
     project_task: Option<Task<()>>,
+    /// Focus Mode snapshot and Islands / Tiling density (`KOVA-026`).
+    focus_tiling: FocusTilingController,
+    /// `JetBrains` keymap bridge with the chord session (`KOVA-026`).
+    keymap: KeyDispatchLayer,
+    /// Status bar hint of a pending chord prefix (`ctrl+w …`).
+    chord_hint: Option<String>,
+    /// Open Vim Ex / search command line.
+    ex_line: Option<ExCommandLine>,
+    /// Whether modal Vim editing is enabled for every editor.
+    vim_enabled: bool,
+    /// Last rendered window size in logical pixels (for directional focus navigation).
+    viewport_px: (f32, f32),
+    /// Document whose tabs `:wq` closes once its save succeeds.
+    close_after_save: Option<PathBuf>,
 }
 
 impl fmt::Debug for WorkspaceShell {
@@ -433,6 +458,13 @@ impl WorkspaceShell {
             syntax_engine: None,
             analysis_task: None,
             project_task: None,
+            focus_tiling: FocusTilingController::new(),
+            keymap: KeyDispatchLayer::new(kova_core::Platform::current()),
+            chord_hint: None,
+            ex_line: None,
+            vim_enabled: false,
+            viewport_px: (1440.0, 900.0),
+            close_after_save: None,
         }
     }
 
@@ -799,7 +831,12 @@ impl WorkspaceShell {
             }
             tab
         } else {
-            let editor = cx.new(|cx| EditorView::with_shared_buffer(buffer, cx));
+            let vim_enabled = self.vim_enabled;
+            let editor = cx.new(|cx| {
+                let mut editor = EditorView::with_shared_buffer(buffer, cx);
+                editor.set_vim_enabled(vim_enabled, cx);
+                editor
+            });
             let Some(pane) = self.panes.get_mut(&pane_id) else {
                 return;
             };
@@ -1017,6 +1054,7 @@ impl WorkspaceShell {
         else {
             return;
         };
+        let saved = result.is_ok();
         let resave = self
             .doc_states
             .get_mut(&key)
@@ -1026,10 +1064,41 @@ impl WorkspaceShell {
             self.dispatch_save(&key, cx);
         }
         self.sync_dirty_flag(&key);
+        if self.close_after_save.as_deref() == Some(key.as_path()) && !resave {
+            self.close_after_save = None;
+            if saved {
+                self.close_document_tabs(&key, cx);
+            }
+        }
         cx.notify();
     }
 
+    /// Closes every tab showing `key` (the `:wq` close that waits for the save to succeed).
+    fn close_document_tabs(&mut self, key: &Path, cx: &mut Context<'_, Self>) {
+        let tabs: Vec<(PaneId, TabId)> = self
+            .panes
+            .iter()
+            .filter_map(|(pane, state)| state.tabs.find_by_path(key).map(|tab| (*pane, tab.id)))
+            .collect();
+        for (pane, tab) in tabs {
+            self.detach_tab(pane, tab);
+        }
+        if !self.split_tree.contains(self.active_pane) {
+            let first = self.split_tree.first_pane();
+            self.set_active_pane(first, cx);
+        }
+        self.dock_layout
+            .focus(FocusedRegion::EditorPane(self.active_pane));
+        self.drop_unused_documents();
+        self.refresh_analysis(Duration::ZERO, cx);
+    }
+
     fn save_action(&mut self, _: &Save, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.save_active(window, cx);
+    }
+
+    /// Saves the active document (`Cmd+S`, `:w`), asking for a path when it has none.
+    fn save_active(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(key) = self.active_document_key() else {
             return;
         };
@@ -1160,6 +1229,8 @@ impl WorkspaceShell {
     }
 
     fn toggle_tool(&mut self, tool: DockToolId, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // An explicit tool window request leaves Focus Mode deterministically (FR-1.2).
+        self.focus_tiling.exit_for_explicit_tool();
         self.dock_layout.toggle_tool(tool, self.active_pane);
         match self.dock_layout.focused {
             FocusedRegion::EditorPane(_) => self.focus_active_editor(window, cx),
@@ -1213,6 +1284,501 @@ impl WorkspaceShell {
     // Keyboard and mouse handling
     // ---------------------------------------------------------------------------------------
 
+    /// Capture-phase key router (`KOVA-026` FR-3): runs before the editor sees the key, in the
+    /// order `Ex line → chord continuation → Vim → IME guard → JetBrains keymap`
+    /// ([`key_route`]). Keys nobody claims propagate to the editor and the IME unchanged.
+    fn handle_key_capture(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if self.ex_line.is_some() {
+            self.handle_ex_key(keystroke, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        let editor = self
+            .active_editor()
+            .filter(|editor| editor.read(cx).focus_handle().is_focused(window))
+            .cloned();
+        let (vim_status, vim_owns_keys) = editor.as_ref().map_or((None, false), |editor| {
+            let editor = editor.read(cx);
+            (editor.vim_status(), editor.vim_owns_keys())
+        });
+        let accepts_text = editor.is_some() && !vim_owns_keys;
+        let flags = RouteFlags {
+            command_line_open: false,
+            chord_pending: self.keymap.has_pending(),
+            vim_owns_keys,
+            text_composition: accepts_text
+                && is_text_composition(keystroke, self.keymap.platform()),
+        };
+        let leaf = match (&editor, &vim_status) {
+            (Some(_), Some(status)) => status.focus,
+            (Some(_), None) => kova_core::FocusContext::EditorText,
+            (None, _) => match self.dock_layout.focused {
+                FocusedRegion::ProjectDock => kova_core::FocusContext::ProjectTree,
+                FocusedRegion::StructureDock => kova_core::FocusContext::StructureView,
+                FocusedRegion::BottomPanel => kova_core::FocusContext::ToolWindow,
+                FocusedRegion::EditorPane(_) => kova_core::FocusContext::Workspace,
+            },
+        };
+        let ctx = DispatchContext {
+            leaf,
+            vim_enabled: self.vim_enabled,
+        };
+
+        match key_route(flags) {
+            KeyRoute::TextInput | KeyRoute::CommandLine => {}
+            KeyRoute::VimThenKeymap => {
+                if let (Some(editor), Some(stroke)) = (&editor, vim_stroke(keystroke)) {
+                    let result =
+                        editor.update(cx, |editor, cx| editor.handle_vim_key(stroke, window, cx));
+                    match result {
+                        VimKeyResult::Handled { .. } => {
+                            cx.stop_propagation();
+                            cx.notify();
+                            return;
+                        }
+                        VimKeyResult::OpenCommandLine(prefix) => {
+                            self.ex_line = Some(ExCommandLine::new(prefix));
+                            cx.stop_propagation();
+                            cx.notify();
+                            return;
+                        }
+                        VimKeyResult::PassThrough => {}
+                    }
+                }
+                self.dispatch_keymap(keystroke, ctx, window, cx);
+            }
+            KeyRoute::ChordContinuation | KeyRoute::Keymap => {
+                // Vim INSERT: keys that leave the mode go to Vim before the keymap.
+                if !flags.chord_pending
+                    && let Some(editor) = &editor
+                    && vim_status.is_some()
+                    && is_vim_insert_exit(keystroke)
+                    && let Some(stroke) = vim_stroke(keystroke)
+                {
+                    editor.update(cx, |editor, cx| editor.handle_vim_key(stroke, window, cx));
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                self.dispatch_keymap(keystroke, ctx, window, cx);
+            }
+        }
+    }
+
+    /// Resolves `keystroke` against the `JetBrains` keymap and runs the matched shell action.
+    fn dispatch_keymap(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        ctx: DispatchContext,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(stroke) = shortcut_stroke(keystroke) else {
+            return;
+        };
+        match self.keymap.dispatch(stroke, ctx, Instant::now()) {
+            DispatchOutcome::Action(action) => {
+                self.chord_hint = None;
+                cx.stop_propagation();
+                self.run_shell_action(action, window, cx);
+                cx.notify();
+            }
+            DispatchOutcome::Pending { hint, epoch } => {
+                self.chord_hint = Some(hint);
+                Self::schedule_chord_timeout(epoch, window, cx);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            DispatchOutcome::Cancelled => {
+                self.chord_hint = None;
+                cx.stop_propagation();
+                cx.notify();
+            }
+            DispatchOutcome::Delegated(_) | DispatchOutcome::Unhandled => {
+                if self.chord_hint.take().is_some() {
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Clears the chord prefix after [`CHORD_TIMEOUT`] unless a newer key arrived (epoch).
+    fn schedule_chord_timeout(epoch: u64, window: &Window, cx: &mut Context<'_, Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(CHORD_TIMEOUT).await;
+            this.update(cx, |shell, cx| {
+                if shell.keymap.expire(epoch) {
+                    shell.chord_hint = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Runs one keymap-resolved shell command.
+    fn run_shell_action(
+        &mut self,
+        action: ShellAction,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match action {
+            ShellAction::ToggleTool(tool) => self.toggle_tool(tool, window, cx),
+            ShellAction::ToggleFocusMode(variant) => self.toggle_focus_mode(variant, window, cx),
+            ShellAction::ToggleTilingMode => {
+                self.focus_tiling.toggle_density();
+            }
+            ShellAction::ToggleVimMode => self.set_vim_enabled(!self.vim_enabled, cx),
+            ShellAction::FocusDirection(dir) => self.focus_direction(dir, window, cx),
+            ShellAction::MoveTabToSplit(dir) => self.move_tab_to_split(dir, window, cx),
+            ShellAction::ResizeSplit(dir) => {
+                let axis = if dir.is_horizontal() {
+                    SplitAxis::Horizontal
+                } else {
+                    SplitAxis::Vertical
+                };
+                let delta = if dir.is_backward() {
+                    -RESIZE_SPLIT_STEP
+                } else {
+                    RESIZE_SPLIT_STEP
+                };
+                self.split_tree.resize_pane(self.active_pane, axis, delta);
+            }
+            ShellAction::Split(axis) => self.split_active_pane(axis, window, cx),
+            ShellAction::CloseActiveTab => self.close_active_tab(window, cx),
+            ShellAction::CycleTab(forward) => self.cycle_tab(forward, window, cx),
+            ShellAction::Save => self.save_active(window, cx),
+            ShellAction::DuplicateLine => {
+                if let Some(editor) = self.active_editor().cloned() {
+                    editor.update(cx, |editor, cx| editor.duplicate_lines(window, cx));
+                }
+            }
+            ShellAction::ToggleLineComment => {
+                let prefix = line_comment_prefix(self.active_document_key().as_deref());
+                if let Some(editor) = self.active_editor().cloned() {
+                    editor.update(cx, |editor, cx| {
+                        editor.toggle_line_comment(prefix, window, cx);
+                    });
+                }
+            }
+            ShellAction::AddNextOccurrence => {
+                if let Some(editor) = self.active_editor().cloned() {
+                    editor.update(cx, |editor, cx| editor.add_next_occurrence(window, cx));
+                }
+            }
+            ShellAction::OpenSearchEverywhere => self.set_notice(
+                StatusKind::Info,
+                "Search Everywhere arrives with KOVA-028".to_owned(),
+                cx,
+            ),
+            ShellAction::OpenSettings => self.set_notice(
+                StatusKind::Info,
+                "Settings dialog arrives with KOVA-029".to_owned(),
+                cx,
+            ),
+        }
+    }
+
+    /// Enables or disables modal Vim editing in every open editor (`ToggleVimMode`).
+    /// Buffers, scroll offsets, cursors and undo history are kept.
+    pub fn set_vim_enabled(&mut self, enabled: bool, cx: &mut Context<'_, Self>) {
+        self.vim_enabled = enabled;
+        if !enabled {
+            self.ex_line = None;
+        }
+        for pane in self.panes.values() {
+            for editor in pane.editors.values() {
+                editor.update(cx, |editor, cx| editor.set_vim_enabled(enabled, cx));
+            }
+        }
+        self.keymap.reset();
+        self.chord_hint = None;
+        cx.notify();
+    }
+
+    /// Whether modal Vim editing is enabled.
+    #[must_use]
+    pub const fn is_vim_enabled(&self) -> bool {
+        self.vim_enabled
+    }
+
+    /// Sets the island spacing preset (`UiSettings::focus_mode` = [`LayoutDensity::Tiling`]).
+    pub fn set_layout_density(&mut self, density: LayoutDensity, cx: &mut Context<'_, Self>) {
+        if self.focus_tiling.density() != density {
+            self.focus_tiling.toggle_density();
+            cx.notify();
+        }
+    }
+
+    /// Focus Mode and density state.
+    #[must_use]
+    pub const fn focus_tiling(&self) -> &FocusTilingController {
+        &self.focus_tiling
+    }
+
+    /// Toggles Focus Mode (`Cmd+Shift+F12` hides the docks, `Ctrl+Alt+Z` / `:only` also hides
+    /// the stripes) and restores the saved docks and focus on the second press.
+    pub fn toggle_focus_mode(
+        &mut self,
+        variant: FocusModeVariant,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let split_tree = &self.split_tree;
+        let result = self.focus_tiling.toggle_focus_mode(
+            variant,
+            &mut self.dock_layout,
+            self.active_pane,
+            |pane| split_tree.contains(pane),
+        );
+        match result {
+            FocusToggle::Entered(_) | FocusToggle::VariantChanged(_) => {
+                self.focus_active_editor(window, cx);
+            }
+            FocusToggle::Restored(FocusedRegion::EditorPane(pane)) => {
+                self.set_active_pane(pane, cx);
+                self.focus_active_editor(window, cx);
+            }
+            FocusToggle::Restored(region) => self.focus_dock(region, window, cx),
+        }
+    }
+
+    /// On-screen rectangles of every visible island, mirroring [`Self::render`].
+    fn region_rects(&self) -> Vec<(FocusedRegion, crate::dock::LayoutRect)> {
+        crate::dock::compute_region_rects(
+            self.viewport_px.0,
+            self.viewport_px.1,
+            &self.dock_layout,
+            &self.split_tree,
+            self.focus_tiling.density(),
+            !self.focus_tiling.hides_stripes(),
+        )
+    }
+
+    /// Moves keyboard focus to the neighbouring island in `dir` (no wrap-around).
+    fn focus_direction(&mut self, dir: Direction, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let rects = self.region_rects();
+        match crate::dock::find_neighbor_pane(&rects, self.dock_layout.focused, dir) {
+            Some(FocusedRegion::EditorPane(pane)) => {
+                self.set_active_pane(pane, cx);
+                self.focus_active_editor(window, cx);
+            }
+            Some(region) => self.focus_dock(region, window, cx),
+            None => {}
+        }
+    }
+
+    /// Moves the active tab into the neighbouring split in `dir`, creating that split when
+    /// there is none (and the pane keeps at least one other tab).
+    fn move_tab_to_split(
+        &mut self,
+        dir: Direction,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let source = self.active_pane;
+        let Some((tab, path)) = self
+            .panes
+            .get(&source)
+            .and_then(|pane| pane.tabs.active_tab())
+            .and_then(|tab| tab.path.clone().map(|path| (tab.id, path)))
+        else {
+            return;
+        };
+        let Some(buffer) = self.documents.get(&path).cloned() else {
+            return;
+        };
+        let position = self
+            .active_editor()
+            .map(|editor| editor.read(cx).primary_cursor_position());
+        let editor_rects: Vec<_> = self
+            .region_rects()
+            .into_iter()
+            .filter(|(region, _)| matches!(region, FocusedRegion::EditorPane(_)))
+            .collect();
+        let neighbour =
+            crate::dock::find_neighbor_pane(&editor_rects, FocusedRegion::EditorPane(source), dir);
+        let target = if let Some(FocusedRegion::EditorPane(pane)) = neighbour {
+            pane
+        } else {
+            let tab_count = self.panes.get(&source).map_or(0, |p| p.tabs.tab_count());
+            if tab_count < 2 {
+                return;
+            }
+            let new_id = PaneId(self.split_tree.max_pane_id() + 1);
+            let axis = if dir.is_horizontal() {
+                SplitAxis::Horizontal
+            } else {
+                SplitAxis::Vertical
+            };
+            let split = if dir.is_backward() {
+                self.split_tree.split_pane_before(source, axis, new_id)
+            } else {
+                self.split_tree.split_pane(source, axis, new_id)
+            };
+            if !split {
+                return;
+            }
+            self.panes.insert(new_id, PaneState::new(new_id));
+            new_id
+        };
+        self.active_pane = target;
+        self.show_document(&path, buffer, position, window, cx);
+        self.detach_tab(source, tab);
+        self.set_active_pane(target, cx);
+        self.drop_unused_documents();
+        cx.notify();
+    }
+
+    /// Removes `tab` from `pane` without moving focus; closes the pane when it becomes empty.
+    fn detach_tab(&mut self, pane: PaneId, tab: TabId) {
+        let Some(state) = self.panes.get_mut(&pane) else {
+            return;
+        };
+        state.tabs.close_tab(tab);
+        state.editors.remove(&tab);
+        state.subscriptions.remove(&tab);
+        if state.tabs.tab_count() == 0 && self.split_tree.close(pane) {
+            self.panes.remove(&pane);
+        }
+    }
+
+    fn close_active_tab(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let pane = self.active_pane;
+        if let Some(tab) = self.panes.get(&pane).and_then(|p| p.tabs.active_tab_id()) {
+            self.close_tab(pane, tab, window, cx);
+        }
+    }
+
+    /// Handles one key while the Ex / search command line is open.
+    fn handle_ex_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(line) = self.ex_line.as_mut() else {
+            return;
+        };
+        let m = &keystroke.modifiers;
+        let event = if m.control || m.platform {
+            if m.control && matches!(keystroke.key.as_str(), "c" | "[") {
+                ExLineEvent::Cancelled
+            } else {
+                ExLineEvent::Ignored
+            }
+        } else {
+            match keystroke.key_char.as_deref() {
+                Some(text)
+                    if !text.is_empty()
+                        && !text.chars().any(char::is_control)
+                        && keystroke.key != "enter" =>
+                {
+                    line.insert(text)
+                }
+                _ => line.handle_named_key(&keystroke.key),
+            }
+        };
+        match event {
+            ExLineEvent::Submitted { prefix, text } => {
+                self.ex_line = None;
+                self.run_ex_line(prefix, &text, window, cx);
+            }
+            ExLineEvent::Cancelled => {
+                self.ex_line = None;
+                if let Some(editor) = self.active_editor().cloned() {
+                    editor.update(cx, EditorView::force_vim_normal);
+                }
+            }
+            ExLineEvent::Edited | ExLineEvent::Ignored => {}
+        }
+        cx.notify();
+    }
+
+    /// Executes a submitted `:` command (search prompts report that search is not available).
+    fn run_ex_line(
+        &mut self,
+        prefix: char,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(editor) = self.active_editor().cloned() {
+            editor.update(cx, EditorView::force_vim_normal);
+        }
+        if prefix != ':' {
+            self.set_notice(
+                StatusKind::Info,
+                format!("Search ({prefix}) is not available yet"),
+                cx,
+            );
+            return;
+        }
+        let command = match parse_ex_command(text) {
+            Ok(command) => command,
+            Err(err) => {
+                self.set_notice(StatusKind::Error, err.to_string(), cx);
+                return;
+            }
+        };
+        match command {
+            ExCommand::Write => self.save_active(window, cx),
+            ExCommand::Quit => {
+                if self.is_active_document_dirty() {
+                    self.set_notice(
+                        StatusKind::Warning,
+                        "E37: No write since last change (add ! to override)".to_owned(),
+                        cx,
+                    );
+                } else {
+                    self.close_active_tab(window, cx);
+                }
+            }
+            ExCommand::ForceQuit => self.close_active_tab(window, cx),
+            ExCommand::WriteQuit => {
+                let key = self.active_document_key();
+                let has_path = key
+                    .as_ref()
+                    .and_then(|key| self.doc_states.get(key))
+                    .is_some_and(|doc| doc.path.is_some());
+                if !self.is_active_document_dirty() {
+                    self.close_active_tab(window, cx);
+                } else if has_path {
+                    // Close only once the asynchronous save succeeds (a failure keeps the tab).
+                    self.close_after_save = key;
+                    self.save_active(window, cx);
+                } else {
+                    self.set_notice(
+                        StatusKind::Warning,
+                        "E32: No file name — save it first (Cmd+S), then :q".to_owned(),
+                        cx,
+                    );
+                    self.save_active(window, cx);
+                }
+            }
+            ExCommand::Split(axis) => self.split_active_pane(axis, window, cx),
+            ExCommand::GoToLine(line) => {
+                if let Some(editor) = self.active_editor().cloned() {
+                    editor.update(cx, |editor, cx| editor.go_to_line_column(line, None, cx));
+                }
+            }
+            ExCommand::NoHighlight => self.clear_notice(cx),
+            ExCommand::Only => {
+                if !self.focus_tiling.is_focus_mode() {
+                    self.toggle_focus_mode(FocusModeVariant::Zen, window, cx);
+                }
+            }
+        }
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -1223,7 +1789,17 @@ impl WorkspaceShell {
         let mods = &keystroke.modifiers;
         let key = keystroke.key.as_str();
 
-        if mods.alt && !mods.platform && !mods.control {
+        // Keys the keymap did not claim. macOS keeps the `Alt+1..7` tool window aliases, but
+        // only while no editor accepts text there (`Option+digit` types characters).
+        let text_editor_focused = self.active_editor().is_some_and(|editor| {
+            let editor = editor.read(cx);
+            editor.focus_handle().is_focused(window) && !editor.vim_owns_keys()
+        });
+        if mods.alt
+            && !mods.platform
+            && !mods.control
+            && (!cfg!(target_os = "macos") || !text_editor_focused)
+        {
             let tool = match key {
                 "1" => Some(DockToolId::Project),
                 "0" => Some(DockToolId::Commit),
@@ -1238,56 +1814,18 @@ impl WorkspaceShell {
                 cx.stop_propagation();
                 return;
             }
-            // Reached only when the editor did not consume `Alt+←/→` (word motion) itself.
-            if key == "left" || key == "right" {
-                self.cycle_tab(key == "right", window, cx);
-                cx.stop_propagation();
-                return;
-            }
         }
 
-        // `Cmd+Shift+[` / `Cmd+Shift+]`: previous / next tab, also while the editor has focus.
-        if mods.platform && mods.shift && !mods.alt && !mods.control {
-            let forward = match key {
-                "]" | "}" => Some(true),
-                "[" | "{" => Some(false),
-                _ => None,
+        // `Cmd+\` / `Cmd+Shift+\`: split right / down (not part of the `JetBrains` preset).
+        if mods.platform && !mods.alt && !mods.control && matches!(key, "\\" | "|") {
+            let axis = if mods.shift {
+                SplitAxis::Vertical
+            } else {
+                SplitAxis::Horizontal
             };
-            if let Some(forward) = forward {
-                self.cycle_tab(forward, window, cx);
-                cx.stop_propagation();
-                return;
-            }
-        }
-
-        if mods.platform && !mods.alt && !mods.control {
-            let handled = match key {
-                "7" => {
-                    self.toggle_tool(DockToolId::Structure, window, cx);
-                    true
-                }
-                "\\" => {
-                    let axis = if mods.shift {
-                        SplitAxis::Vertical
-                    } else {
-                        SplitAxis::Horizontal
-                    };
-                    self.split_active_pane(axis, window, cx);
-                    true
-                }
-                "w" => {
-                    let pane = self.active_pane;
-                    if let Some(tab) = self.panes.get(&pane).and_then(|p| p.tabs.active_tab_id()) {
-                        self.close_tab(pane, tab, window, cx);
-                    }
-                    true
-                }
-                _ => false,
-            };
-            if handled {
-                cx.stop_propagation();
-                return;
-            }
+            self.split_active_pane(axis, window, cx);
+            cx.stop_propagation();
+            return;
         }
 
         if !self.focus_handle.is_focused(window) || mods.platform || mods.control || mods.alt {
@@ -1489,7 +2027,7 @@ impl WorkspaceShell {
             .h(px(TITLEBAR_HEIGHT_PX))
             .w_full()
             .pl(px(TITLEBAR_LEFT_PADDING_PX))
-            .pr(px(SHELL_OUTER_PADDING_PX))
+            .pr(px(self.focus_tiling.density().outer_margin_px()))
             .flex()
             .items_center()
             .justify_between()
@@ -1607,6 +2145,7 @@ impl WorkspaceShell {
 
     fn island(&self, region: FocusedRegion, p: Palette) -> Div {
         let focused = self.dock_layout.focused == region;
+        let focus_border = self.focus_tiling.density().focus_border_px();
         let base = div()
             .flex()
             .flex_col()
@@ -1614,8 +2153,7 @@ impl WorkspaceShell {
             .rounded(px(ISLAND_RADIUS_PX))
             .bg(p.island);
         if focused {
-            base.border(px(FOCUS_BORDER_WIDTH_PX))
-                .border_color(p.border_focus)
+            base.border(px(focus_border)).border_color(p.border_focus)
         } else {
             base.border_1().border_color(p.border_island)
         }
@@ -1650,13 +2188,14 @@ impl WorkspaceShell {
         id: &'static str,
         vertical: bool,
         target: DragTarget,
+        gap: f32,
         cx: &Context<'_, Self>,
     ) -> Stateful<Div> {
         let base = div().id(id).flex_none();
         let base = if vertical {
-            base.w(px(SHELL_ISLAND_GAP_PX)).h_full().cursor_col_resize()
+            base.w(px(gap)).h_full().cursor_col_resize()
         } else {
-            base.h(px(SHELL_ISLAND_GAP_PX)).w_full().cursor_row_resize()
+            base.h(px(gap)).w_full().cursor_row_resize()
         };
         base.on_mouse_down(
             MouseButton::Left,
@@ -2109,7 +2648,7 @@ impl WorkspaceShell {
                     .size_full()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
-                    .gap(px(SHELL_ISLAND_GAP_PX));
+                    .gap(px(self.focus_tiling.density().island_gap_px()));
                 match axis {
                     SplitAxis::Horizontal => container
                         .flex_row()
@@ -2140,7 +2679,7 @@ impl WorkspaceShell {
             .rounded(px(ISLAND_RADIUS_PX))
             .bg(editor_bg);
         let base = if is_active && editor_focused {
-            base.border(px(FOCUS_BORDER_WIDTH_PX))
+            base.border(px(self.focus_tiling.density().focus_border_px()))
                 .border_color(p.border_focus)
         } else {
             base.border_1().border_color(p.border_island)
@@ -2328,8 +2867,54 @@ impl WorkspaceShell {
             status.cursor_line = line;
             status.cursor_col = col;
             status.cursor_count = editor.cursor_count();
+            if self.vim_enabled {
+                let vim = editor.vim_status();
+                status.vim_mode = VimModeBadge::from_status(vim.as_ref());
+                status.vim_sequence = vim.map(|v| v.pending).unwrap_or_default();
+            }
+        }
+        if self.ex_line.is_some() {
+            status.vim_mode = VimModeBadge::CommandLine;
+        }
+        if let Some(hint) = &self.chord_hint {
+            status.vim_sequence.clone_from(hint);
         }
         status
+    }
+
+    /// Compact Ex / search prompt (`surfaces.input` with a `borders.focus` ring).
+    fn render_ex_line(line: &ExCommandLine, p: Palette, cx: &Context<'_, Self>) -> Div {
+        let theme = cx.global::<KovaTheme>();
+        let (before, after) = line.split_at_cursor();
+        div()
+            .h(px(20.0))
+            .min_w(px(260.0))
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .rounded(px(4.0))
+            .bg(hsla_from_rgba(theme.surfaces().input))
+            .border_1()
+            .border_color(p.border_focus)
+            .text_color(p.text_primary)
+            .font_family("JetBrains Mono")
+            .child(format!("{}{before}", line.prefix()))
+            .child(
+                div()
+                    .w(px(2.0))
+                    .h(px(14.0))
+                    .bg(hsla_from_rgba(theme.editor().cursor)),
+            )
+            .child(after.to_owned())
+    }
+
+    /// Layout label: `Focus` / `Zen` while Focus Mode hides docks, otherwise the density.
+    fn layout_label(&self) -> &'static str {
+        match self.focus_tiling.focus_variant() {
+            Some(FocusModeVariant::HideDocks) => "Focus",
+            Some(FocusModeVariant::Zen) => "Zen",
+            None => self.focus_tiling.density().label(),
+        }
     }
 
     /// Renders the Vim mode pill (`NORMAL` / `INSERT` / `VISUAL` / `COMMAND`, `EDIT` when off).
@@ -2355,6 +2940,51 @@ impl WorkspaceShell {
             .child(vim_label)
     }
 
+    /// Left part of the status bar: Vim pill plus either the Ex line or the file context.
+    fn render_status_left(
+        &self,
+        status: &StatusBarState,
+        vim_pill: Div,
+        p: Palette,
+        cx: &Context<'_, Self>,
+    ) -> Div {
+        let left = div().flex().items_center().gap(px(12.0)).child(vim_pill);
+        if let Some(line) = &self.ex_line {
+            return left.child(Self::render_ex_line(line, p, cx));
+        }
+        let (doc_status_kind, doc_status_text) = self.document_status();
+        let kind_color = |kind: StatusKind| match kind {
+            StatusKind::Info => p.text_secondary,
+            StatusKind::Warning => p.warning,
+            StatusKind::Error => p.error,
+        };
+        let config_notice = self
+            .config_notice
+            .clone()
+            .map(|(kind, text)| div().text_color(kind_color(kind)).child(text));
+        left.child(
+            div()
+                .text_color(p.text_secondary)
+                .child(format!("git: {}", status.git_branch)),
+        )
+        .child(
+            div()
+                .text_color(p.text_primary)
+                .child(status.active_file.clone()),
+        )
+        .child(
+            div()
+                .text_color(p.text_muted)
+                .child(status.focused_region.label()),
+        )
+        .child(
+            div()
+                .text_color(kind_color(doc_status_kind))
+                .child(doc_status_text),
+        )
+        .children(config_notice)
+    }
+
     fn render_statusbar(&self, p: Palette, cx: &Context<'_, Self>) -> Div {
         let status = self.current_status(cx);
         let vim_pill = Self::vim_pill(&status);
@@ -2363,17 +2993,6 @@ impl WorkspaceShell {
         } else {
             p.run_icon
         };
-        let (doc_status_kind, doc_status_text) = self.document_status();
-        let kind_color = |kind: StatusKind| match kind {
-            StatusKind::Info => p.text_secondary,
-            StatusKind::Warning => p.warning,
-            StatusKind::Error => p.error,
-        };
-        let doc_status_color = kind_color(doc_status_kind);
-        let config_notice = self
-            .config_notice
-            .clone()
-            .map(|(kind, text)| div().text_color(kind_color(kind)).child(text));
         let start_color = match self.metrics.cold_start_within_budget {
             Some(true) => p.run_icon,
             Some(false) => p.warning,
@@ -2395,30 +3014,7 @@ impl WorkspaceShell {
                 cx.global::<KovaTheme>().surfaces().statusbar,
             ))
             .text_size(px(11.0))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.0))
-                    .child(vim_pill)
-                    .child(
-                        div()
-                            .text_color(p.text_secondary)
-                            .child(format!("git: {}", status.git_branch)),
-                    )
-                    .child(
-                        div()
-                            .text_color(p.text_primary)
-                            .child(status.active_file.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_color(p.text_muted)
-                            .child(status.focused_region.label()),
-                    )
-                    .child(div().text_color(doc_status_color).child(doc_status_text))
-                    .children(config_notice),
-            )
+            .child(self.render_status_left(&status, vim_pill, p, cx))
             .child(
                 div()
                     .flex()
@@ -2426,9 +3022,10 @@ impl WorkspaceShell {
                     .gap(px(14.0))
                     .child(
                         div()
-                            .text_color(p.tab_indicator)
+                            .text_color(p.text_secondary)
                             .child(status.vim_sequence.clone()),
                     )
+                    .child(div().text_color(p.text_muted).child(self.layout_label()))
                     .child(
                         div()
                             .text_color(p.text_primary)
@@ -2454,6 +3051,8 @@ impl WorkspaceShell {
     }
 
     fn render_workspace(&self, p: Palette, cx: &Context<'_, Self>) -> Div {
+        let gap = self.focus_tiling.density().island_gap_px();
+        let stripes = !self.focus_tiling.hides_stripes();
         let mut center = div()
             .flex_1()
             .h_full()
@@ -2475,30 +3074,30 @@ impl WorkspaceShell {
                     "bottom-splitter",
                     false,
                     DragTarget::BottomPanel,
+                    gap,
                     cx,
                 ))
                 .child(bottom);
         }
 
-        let mut row = div()
-            .flex_1()
-            .w_full()
-            .min_h(px(0.0))
-            .flex()
-            .flex_row()
-            .child(self.render_stripe(
-                LEFT_STRIPE_WIDTH_PX,
-                &[DockToolId::Project, DockToolId::Commit, DockToolId::Run],
-                &[DockToolId::Problems, DockToolId::Terminal],
-                p,
-                cx,
-            ))
-            .child(div().w(px(SHELL_ISLAND_GAP_PX)).flex_none());
+        let mut row = div().flex_1().w_full().min_h(px(0.0)).flex().flex_row();
+        if stripes {
+            row = row
+                .child(self.render_stripe(
+                    LEFT_STRIPE_WIDTH_PX,
+                    &[DockToolId::Project, DockToolId::Commit, DockToolId::Run],
+                    &[DockToolId::Problems, DockToolId::Terminal],
+                    p,
+                    cx,
+                ))
+                .child(div().w(px(gap)).flex_none());
+        }
         if let Some(left) = self.render_left_dock(p, cx) {
             row = row.child(left).child(Self::splitter(
                 "left-splitter",
                 true,
                 DragTarget::LeftDock,
+                gap,
                 cx,
             ));
         }
@@ -2509,12 +3108,23 @@ impl WorkspaceShell {
                     "right-splitter",
                     true,
                     DragTarget::RightDock,
+                    gap,
                     cx,
                 ))
                 .child(right);
         }
-        row.child(div().w(px(SHELL_ISLAND_GAP_PX)).flex_none())
-            .child(self.render_stripe(RIGHT_STRIPE_WIDTH_PX, &[DockToolId::Structure], &[], p, cx))
+        if stripes {
+            row = row
+                .child(div().w(px(gap)).flex_none())
+                .child(self.render_stripe(
+                    RIGHT_STRIPE_WIDTH_PX,
+                    &[DockToolId::Structure],
+                    &[],
+                    p,
+                    cx,
+                ));
+        }
+        row
     }
 }
 
@@ -2531,6 +3141,9 @@ impl Render for WorkspaceShell {
             self.window_title = title;
         }
 
+        let viewport = window.viewport_size();
+        self.viewport_px = (f32::from(viewport.width), f32::from(viewport.height));
+        let density = self.focus_tiling.density();
         let p = Palette::from_theme(cx.global::<KovaTheme>());
 
         div()
@@ -2542,6 +3155,7 @@ impl Render for WorkspaceShell {
             .key_context(WORKSPACE_KEY_CONTEXT)
             .on_action(cx.listener(Self::save_action))
             .track_focus(&self.focus_handle)
+            .capture_key_down(cx.listener(Self::handle_key_capture))
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
@@ -2553,12 +3167,39 @@ impl Render for WorkspaceShell {
                     .min_h(px(0.0))
                     .flex()
                     .flex_col()
-                    .px(px(SHELL_OUTER_PADDING_PX))
-                    .pb(px(SHELL_OUTER_PADDING_PX))
-                    .gap(px(SHELL_ISLAND_GAP_PX))
+                    .px(px(density.outer_margin_px()))
+                    .pb(px(density.outer_margin_px()))
+                    .gap(px(density.island_gap_px()))
                     .child(self.render_workspace(p, cx))
                     .child(self.render_statusbar(p, cx)),
             )
+    }
+}
+
+/// Keys that leave Vim `INSERT` mode (`Escape`, `Ctrl+[`, `Ctrl+C`).
+fn is_vim_insert_exit(keystroke: &gpui::Keystroke) -> bool {
+    let m = &keystroke.modifiers;
+    if m.alt || m.platform {
+        return false;
+    }
+    match keystroke.key.as_str() {
+        "escape" => !m.control,
+        "[" | "c" => m.control && !m.shift,
+        _ => false,
+    }
+}
+
+/// Line comment prefix for `Cmd+/` by file type (`#` for TOML, YAML, properties, shell and
+/// `.http` files; `//` otherwise).
+fn line_comment_prefix(path: Option<&Path>) -> &'static str {
+    let ext = path
+        .and_then(Path::extension)
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+    match ext {
+        "toml" | "yaml" | "yml" | "properties" | "sh" | "bash" | "zsh" | "http" | "rest" | "py"
+        | "gitignore" => "#",
+        _ => "//",
     }
 }
 

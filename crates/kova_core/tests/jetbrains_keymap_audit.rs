@@ -195,6 +195,21 @@ const EXPECTED_REQUIRED_IDS: &[&str] = &[
     ids::GIT_UPDATE_PROJECT,
     ids::GIT_ROLLBACK,
     ids::VIM_TOGGLE,
+    ids::VIEW_TOGGLE_TILING_MODE,
+    ids::WINDOW_FOCUS_LEFT,
+    ids::WINDOW_FOCUS_RIGHT,
+    ids::WINDOW_FOCUS_UP,
+    ids::WINDOW_FOCUS_DOWN,
+    ids::WINDOW_MOVE_TAB_LEFT,
+    ids::WINDOW_MOVE_TAB_RIGHT,
+    ids::WINDOW_MOVE_TAB_UP,
+    ids::WINDOW_MOVE_TAB_DOWN,
+    ids::WINDOW_SPLIT_RIGHT,
+    ids::WINDOW_SPLIT_DOWN,
+    ids::WINDOW_RESIZE_LEFT,
+    ids::WINDOW_RESIZE_RIGHT,
+    ids::WINDOW_RESIZE_UP,
+    ids::WINDOW_RESIZE_DOWN,
 ];
 
 #[test]
