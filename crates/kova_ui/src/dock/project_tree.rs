@@ -195,6 +195,14 @@ impl ProjectTreeModel {
         self.nodes.len()
     }
 
+    /// Project-relative paths of every file node (used to resolve stack frames, `KOVA-040`).
+    pub fn file_paths(&self) -> impl Iterator<Item = &Path> + '_ {
+        self.nodes
+            .iter()
+            .filter(|n| !n.is_dir())
+            .map(|n| n.path.as_path())
+    }
+
     /// Returns the current keyboard filter query.
     #[must_use]
     pub fn filter_query(&self) -> &str {

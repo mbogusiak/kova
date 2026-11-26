@@ -10,6 +10,7 @@
 
 pub mod cli;
 pub mod io;
+pub mod test_runs;
 pub mod theme_watch;
 
 use std::io::Write as _;
@@ -146,6 +147,20 @@ pub enum AppEvent {
     SettingsWritten(Result<(), String>),
     /// The configuration watcher could not be started.
     ConfigUnavailable(String),
+    /// A batch of `JUnit` *Test Runner* events for run `run_id` (`KOVA-040`).
+    TestEvents {
+        /// Run identifier from the shell's request.
+        run_id: u64,
+        /// Events in arrival order.
+        events: Vec<kova_tools::junit::TestEvent>,
+    },
+    /// Compile diagnostics of one file reported by the build server (`KOVA-040`).
+    BuildProblems {
+        /// Project-relative file.
+        file: String,
+        /// Problems (empty clears the file).
+        problems: Vec<kova_ui::ProblemEntry>,
+    },
 }
 
 /// Builds the `tokio` runtime used for editor I/O ([`IO_WORKER_THREADS`] workers).
@@ -305,6 +320,10 @@ pub fn handle_app_event(
             format!("Live config reload unavailable: {message}"),
             cx,
         ),
+        AppEvent::TestEvents { run_id, events } => shell.apply_test_events(run_id, events, cx),
+        AppEvent::BuildProblems { file, problems } => {
+            shell.set_build_problems(&file, problems, cx);
+        }
     }
 }
 
@@ -381,6 +400,7 @@ pub fn run_cli(
 
         let sink = save_sink(runtime_handle.clone(), events_tx.clone());
         let settings_sink = settings_write_sink(&runtime_handle, events_tx.clone());
+        let test_sink = test_runs::test_run_sink(runtime_handle.clone(), events_tx.clone());
         let open_result = cx.open_window(default_window_options(cx), move |_, cx| {
             cx.activate(true);
             cx.new(move |cx| {
@@ -400,6 +420,7 @@ pub fn run_cli(
                 );
                 shell.set_save_sink(sink);
                 shell.set_settings_sink(settings_sink);
+                shell.set_test_run_sink(test_sink);
                 match project_root {
                     Some(root) => shell.with_project_root(root),
                     None => shell,

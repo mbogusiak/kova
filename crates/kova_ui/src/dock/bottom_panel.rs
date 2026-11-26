@@ -1,4 +1,4 @@
-//! Bottom panel model (`Problems`, `Run`, `Terminal`).
+//! Bottom panel model (`Problems`, `Run`, `Tests`, `Terminal`).
 //!
 //! The active tab is not stored here: it is derived from
 //! [`DockLayoutState::bottom_open`](crate::dock::DockLayoutState::bottom_open) so the stripe icons,
@@ -18,11 +18,13 @@ pub enum BottomTab {
     Run,
     /// Integrated PTY terminal (`Alt+F12`, `KOVA-039`).
     Terminal,
+    /// `JUnit` Test Runner (`Alt+8`, `KOVA-040`).
+    Tests,
 }
 
 impl BottomTab {
     /// All bottom panel tabs in display order.
-    pub const ALL: [Self; 3] = [Self::Problems, Self::Run, Self::Terminal];
+    pub const ALL: [Self; 4] = [Self::Problems, Self::Run, Self::Tests, Self::Terminal];
 
     /// Returns the display title of this bottom panel tab.
     #[must_use]
@@ -31,6 +33,7 @@ impl BottomTab {
             Self::Problems => "Problems",
             Self::Run => "Run",
             Self::Terminal => "Terminal",
+            Self::Tests => "Tests",
         }
     }
 
@@ -41,6 +44,7 @@ impl BottomTab {
             Self::Problems => DockToolId::Problems,
             Self::Run => DockToolId::Run,
             Self::Terminal => DockToolId::Terminal,
+            Self::Tests => DockToolId::Tests,
         }
     }
 
@@ -51,6 +55,7 @@ impl BottomTab {
             DockToolId::Problems => Some(Self::Problems),
             DockToolId::Run => Some(Self::Run),
             DockToolId::Terminal => Some(Self::Terminal),
+            DockToolId::Tests => Some(Self::Tests),
             DockToolId::Project | DockToolId::Commit | DockToolId::Structure => None,
         }
     }
@@ -99,6 +104,10 @@ pub enum ProblemRow<'a> {
 pub struct BottomPanelModel {
     /// Diagnostic entries for `Problems`, kept grouped by file.
     problems: Vec<ProblemEntry>,
+    /// Editor analysis diagnostics (replaced on every analysis pass).
+    analysis_problems: Vec<ProblemEntry>,
+    /// Compile diagnostics reported by the build server, keyed by file (`KOVA-040`).
+    build_problems: std::collections::BTreeMap<String, Vec<ProblemEntry>>,
     /// Log lines for `Run`.
     pub run_logs: Vec<String>,
     selected_problem: usize,
@@ -107,20 +116,40 @@ pub struct BottomPanelModel {
 impl BottomPanelModel {
     /// Creates a model from diagnostics, sorting them by file, line and column for grouping.
     #[must_use]
-    pub fn with_problems(mut problems: Vec<ProblemEntry>) -> Self {
-        problems.sort_by(|a, b| (&a.file, a.line, a.col).cmp(&(&b.file, b.line, b.col)));
-        Self {
-            problems,
-            run_logs: Vec::new(),
-            selected_problem: 0,
-        }
+    pub fn with_problems(problems: Vec<ProblemEntry>) -> Self {
+        let mut model = Self {
+            analysis_problems: problems,
+            ..Self::default()
+        };
+        model.rebuild_problems();
+        model
     }
 
-    /// Replaces the diagnostics list (re-grouped by file).
+    /// Replaces the editor analysis diagnostics (re-grouped by file, build diagnostics kept).
     pub fn set_problems(&mut self, problems: Vec<ProblemEntry>) {
-        let logs = std::mem::take(&mut self.run_logs);
-        *self = Self::with_problems(problems);
-        self.run_logs = logs;
+        self.analysis_problems = problems;
+        self.selected_problem = 0;
+        self.rebuild_problems();
+    }
+
+    /// Replaces the build-server compile diagnostics of `file` (`KOVA-040`); an empty list
+    /// clears them.
+    pub fn set_build_problems(&mut self, file: &str, problems: Vec<ProblemEntry>) {
+        if problems.is_empty() {
+            self.build_problems.remove(file);
+        } else {
+            self.build_problems.insert(file.to_owned(), problems);
+        }
+        self.rebuild_problems();
+        self.select_problem(self.selected_problem);
+    }
+
+    fn rebuild_problems(&mut self) {
+        let mut problems = self.analysis_problems.clone();
+        problems.extend(self.build_problems.values().flatten().cloned());
+        problems.sort_by(|a, b| (&a.file, a.line, a.col).cmp(&(&b.file, b.line, b.col)));
+        problems.dedup();
+        self.problems = problems;
     }
 
     /// Returns all diagnostics, grouped by file.
@@ -244,6 +273,17 @@ mod tests {
         assert_eq!(model.selected_problem().map(|p| p.line), Some(9));
         model.move_selection(false);
         assert_eq!(model.selected_problem_index(), 0);
+    }
+
+    #[test]
+    fn build_problems_survive_analysis_refresh() {
+        let mut model = BottomPanelModel::default();
+        model.set_build_problems("B.java", vec![entry("B.java", 2, ProblemSeverity::Error)]);
+        model.set_problems(vec![entry("A.java", 1, ProblemSeverity::Warning)]);
+        assert_eq!(model.problems().len(), 2);
+        assert_eq!(model.error_count(), 1);
+        model.set_build_problems("B.java", Vec::new());
+        assert_eq!(model.problems().len(), 1);
     }
 
     #[test]

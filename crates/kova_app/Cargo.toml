@@ -21,8 +21,11 @@ gpui.workspace        = true
 kova_buffer.workspace = true
 kova_config.workspace = true
 kova_core.workspace   = true
+kova_lsp_dap.workspace = true
 kova_theme.workspace  = true
+kova_tools.workspace  = true
 kova_ui.workspace     = true
+lsp-types.workspace   = true
 thiserror.workspace   = true
 tokio = { workspace = true, features = ["io-util", "rt-multi-thread"] }
 
