@@ -1,0 +1,18 @@
+# Kotlin LSP — optional Kotlin language pack (KOVA-048).
+# Installed outside the Kova core; the core ships no Kotlin tooling.
+id          = "kova-kotlin-lsp"
+name        = "Kotlin (Kotlin LSP)"
+version     = "0.1.0"
+entrypoint  = "kova_kotlin_lsp.wasm"
+api_version = "0.1.0"
+description = "Optional Kotlin language pack: Kotlin LSP adapter, commands and status Tool Window."
+
+[permissions]
+# Detects Kotlin buffers from the active editor snapshot.
+editor_read   = true
+editor_write  = false
+network       = false
+fs_read       = false
+fs_write      = false
+# The server is described as data; launching it is left to a host-side launcher.
+process_spawn = false

@@ -14,6 +14,10 @@ members = [
     "crates/kova_plugin_host",  # Sandbox Wasmtime + kontrakty WIT + mostek deklaratywnego UI
     "crates/kova_ui",           # Komponenty GPUI: IntelliJ New UI Dock, Focus/Tiling Layout, Edytor, Okno Ustawień
     "sdk/kova_plugin_rs",       # Oficjalne SDK w Rust do pisania wtyczek WASM
+    "plugins/kova-ai",          # Wtyczka referencyjna: opcjonalny asystent AI (BYOK / Ollama / ACP)
+    "plugins/kova-database",    # Wtyczka referencyjna: eksplorator schematów i podgląd wyników zapytań
+    "plugins/kova-kotlin-lsp",  # Opcjonalny pakiet językowy: Kotlin LSP
+    "plugins/kova-scala-metals", # Opcjonalny pakiet językowy: Scala (Metals)
 ]
 
 [workspace.package]
@@ -80,6 +84,7 @@ url                  = "2"
 wasmtime             = { version = "51.0", default-features = false, features = ["async", "cache", "component-model", "cranelift", "parallel-compilation", "runtime", "std", "wat"] }
 wasmtime-wasi        = { version = "51.0", default-features = false, features = ["p2"] }
 wat                  = "1.263"
+wit-bindgen          = { version = "0.57.1", default-features = false, features = ["macros", "realloc", "std"] }
 wit-component        = "0.263"
 wit-parser           = "0.263"
 zip                  = { version = "2", default-features = false, features = ["deflate"] }

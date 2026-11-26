@@ -1,0 +1,17 @@
+# Kova Database — reference plugin (KOVA-048).
+# Database clients are not part of the Kova core; this plugin is optional.
+id          = "kova-database"
+name        = "Kova Database"
+version     = "0.1.0"
+entrypoint  = "kova_database.wasm"
+api_version = "0.1.0"
+description = "Schema explorer (Tree), SQL query editor (Form + CodeBlock) and virtualized result Table."
+
+[permissions]
+# Explicit allowlist: local PostgreSQL and MySQL ports only.
+network       = ["localhost:5432", "localhost:3306"]
+editor_read   = false
+editor_write  = false
+fs_read       = false
+fs_write      = false
+process_spawn = false

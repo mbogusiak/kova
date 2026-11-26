@@ -1,0 +1,19 @@
+# Kova AI — optional reference plugin (KOVA-048).
+# The Kova core ships no AI code: this plugin is installed and enabled by choice.
+id          = "kova-ai"
+name        = "Kova AI"
+version     = "0.1.0"
+entrypoint  = "kova_ai.wasm"
+api_version = "0.1.0"
+description = "Optional AI assistant Tool Window: chat about the active file with BYOK providers, a local Ollama or an ACP agent."
+
+[permissions]
+# Reads the active file, language and AST symbols as chat context.
+editor_read   = true
+# Never edits buffers: suggestions are shown as code blocks.
+editor_write  = false
+# Explicit allowlist: local Ollama plus the two BYOK HTTPS endpoints.
+network       = ["localhost:11434", "api.openai.com:443", "api.anthropic.com:443"]
+fs_read       = false
+fs_write      = false
+process_spawn = false
