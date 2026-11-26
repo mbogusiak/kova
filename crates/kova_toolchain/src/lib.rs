@@ -6,6 +6,9 @@
 pub mod download;
 pub mod error;
 pub mod jdk;
+pub mod jdtls;
+pub mod omakase;
+pub mod vineflower;
 
 pub use download::{
     ArchiveFormat, ArtifactTransport, DEFAULT_MAX_JDK_UNPACKED_BYTES,
@@ -19,6 +22,12 @@ pub use jdk::{
     TemurinPlatform, discover_jdks, inspect_jdk_dir, parse_jdk_requirement, parse_release_file,
     provision_temurin, select_project_jdk, select_tool_runtime_jdk,
 };
+pub use jdtls::{JdtlsLaunchOptions, JdtlsLaunchSpec, build_jdtls_launch_spec};
+pub use omakase::{
+    InstalledJdtlsPaths, InstalledOmakaseState, InstalledToolRecord, OmakaseManager,
+    OmakaseManifest, OmakasePackageFormat, OmakaseTool, OmakaseToolkit, PinnedArtifactSpec,
+};
+pub use vineflower::{DecompileResult, DecompileTarget, VineflowerDecompiler};
 
 /// Name of this crate as declared in its `Cargo.toml`.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
