@@ -2,6 +2,17 @@
 //!
 //! This crate belongs to the **Headless Core**: it must compile and pass its
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
+//!
+//! The [`lsp`] module (KOVA-036) provides:
+//! - [`lsp::transport`]: JSON-RPC 2.0 `Content-Length` framing over any async stream,
+//! - [`lsp::session`]: the request/response multiplexer with timeouts and `$/cancelRequest`,
+//! - [`lsp::lifecycle`]: the [`lsp::JdtlsClient`] state machine (`initialize` -> `Ready` -> `shutdown`),
+//! - [`lsp::sync`]: incremental `textDocument/*` synchronisation driven by `kova_buffer::EditLog`.
+
+pub mod error;
+pub mod lsp;
+
+pub use error::LspDapError;
 
 /// Name of this crate as declared in its `Cargo.toml`.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

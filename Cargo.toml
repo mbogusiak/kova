@@ -46,6 +46,7 @@ crc32fast    = "1"
 flate2       = "1"
 gpui         = { version = "0.2.2", default-features = false, features = ["font-kit"] }
 ignore       = "0.4"
+lsp-types    = "0.97"
 memory-stats = "1.2"
 notify       = "7"
 postcard     = { version = "1", features = ["use-std"] }
@@ -70,6 +71,7 @@ tree-sitter-kotlin-ng = "1.1"
 tree-sitter-toml-ng   = "0.7"
 unicode-segmentation = "1"
 unicode-width        = "0.2"
+url                  = "2"
 zip                  = { version = "2", default-features = false, features = ["deflate"] }
 nucleo-matcher = "0.3"
 
