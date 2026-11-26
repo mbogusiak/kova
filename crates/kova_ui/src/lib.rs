@@ -4,6 +4,7 @@
 //! on windowing (`kova_ui` and `kova_app`).
 
 pub mod controls;
+pub mod debugger;
 pub mod dock;
 pub mod document;
 pub mod editor;
@@ -14,6 +15,11 @@ pub mod terminal;
 pub mod test_runner;
 pub mod theme;
 
+pub use debugger::{
+    BreakpointIcon, BreakpointSpec, DebugCommand, DebugCommandSink, DebugLaunchRequest, DebugStep,
+    DebugUpdate, DebuggerModel, DebuggerStatus, EvaluateTarget, FrameItem, ThreadItem,
+    VariableItem,
+};
 pub use dock::{
     BadgeVariant, BottomPanelModel, BottomTab, DockLayoutState, DockSide, DockToolId,
     FocusedRegion, PaneId, PaneRect, ProblemEntry, ProblemRow, ProblemSeverity, ProjectNode,

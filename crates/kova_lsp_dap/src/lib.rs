@@ -18,8 +18,13 @@
 //!
 //! The [`bsp`] module (KOVA-040) talks to Gradle / Maven build servers: test runs stream
 //! [`bsp::BspEvent`]s feeding the headless `kova_tools::junit::TestRun` tree.
+//!
+//! The [`dap`] module (KOVA-041) is the JVM debugger client: a Debug Adapter Protocol
+//! session with `java-debug` (breakpoints, conditional breakpoints, logpoints, stepping,
+//! threads, frames, lazily paged variables and *Evaluate Expression*).
 
 pub mod bsp;
+pub mod dap;
 pub mod error;
 pub mod lsp;
 

@@ -15,6 +15,7 @@ use kova_syntax::{GutterIconRole, HighlightSpan};
 use kova_theme::{RgbaColor, SyntaxTokens};
 use smallvec::SmallVec;
 
+use crate::debugger::BreakpointIcon;
 use crate::editor::highlight::{build_line_text_runs, segment_line_styles};
 use crate::editor::line_cache::LineCacheKey;
 use crate::editor::syntax::EditorSyntax;
@@ -214,6 +215,10 @@ pub struct EditorPrepaintState {
     shaped_lines: Vec<(usize, ShapedLine, f32)>,
     shaped_gutter_numbers: Vec<(usize, ShapedLine)>,
     gutter_markers: Vec<GutterMarker>,
+    /// Breakpoint icons by visual row (`KOVA-041`).
+    breakpoints: Vec<(usize, BreakpointIcon)>,
+    /// Visual row of the debugger execution point.
+    execution_visual_row: Option<usize>,
     fold_pills: Vec<FoldPill>,
     gutter_hitbox: Hitbox,
     overlays: Overlays,
@@ -341,6 +346,21 @@ impl Element for EditorCanvasElement {
                 .filter(|&&row| !editor.fold_map().is_hidden(row))
                 .map(|&row| editor.fold_map().visual_row_of(row))
                 .collect();
+
+            let debug_gutter = editor.debug_gutter();
+            let breakpoints: Vec<(usize, BreakpointIcon)> = rows
+                .iter()
+                .filter_map(|&(visual, row)| {
+                    debug_gutter
+                        .breakpoints
+                        .get(&row)
+                        .map(|icon| (visual, *icon))
+                })
+                .collect();
+            let execution_visual_row = debug_gutter
+                .execution_row
+                .filter(|&row| row < total_lines && !editor.fold_map().is_hidden(row))
+                .map(|row| editor.fold_map().visual_row_of(row));
 
             let syntax_revision = editor.syntax_revision();
             editor.line_cache_mut().sync_context(
@@ -471,6 +491,8 @@ impl Element for EditorCanvasElement {
                 shaped_lines,
                 shaped_gutter_numbers,
                 gutter_markers,
+                breakpoints,
+                execution_visual_row,
                 fold_pills,
                 gutter_hitbox,
                 overlays,
@@ -536,6 +558,8 @@ impl Element for EditorCanvasElement {
                     window.paint_quad(fill(row_bounds, line_highlight));
                 }
             }
+            // Layer 1b: debugger execution point (`KOVA-041`).
+            paint_execution_line(prepaint, window);
 
             // Layers 2-6: selections, code lines, IME underline and carets (content area only).
             window.with_content_mask(
@@ -566,6 +590,8 @@ impl Element for EditorCanvasElement {
                     }
                     // Layer 7c: fold chevrons and `▶` run icons in their reserved slots.
                     paint_gutter_markers(prepaint, &theme, window);
+                    // Layer 7e: breakpoints over the line numbers, execution arrow (`KOVA-041`).
+                    paint_debug_markers(prepaint, f32::from(digits_right_x), window);
                 },
             );
 
@@ -668,6 +694,113 @@ fn paint_gutter_markers(prepaint: &EditorPrepaintState, theme: &KovaTheme, windo
                 paint_chevron(window, cx, center_y, collapsed, fold_color);
             }
         }
+    }
+}
+
+/// Breakpoint red (`#E05252`).
+fn breakpoint_color() -> Hsla {
+    gpui::rgb(0x00E0_5252).into()
+}
+
+/// Logpoint orange (`#E08855`).
+fn logpoint_color() -> Hsla {
+    gpui::rgb(0x00E0_8855).into()
+}
+
+/// Translucent blue of the execution line (`#2D5BA8` at 45 %).
+fn execution_line_color() -> Hsla {
+    let mut color: Hsla = gpui::rgb(0x002D_5BA8).into();
+    color.a = 0.45;
+    color
+}
+
+/// Paints the full-width background of the debugger execution line (`KOVA-041`).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "visible row index fits cleanly within f32"
+)]
+fn paint_execution_line(prepaint: &EditorPrepaintState, window: &mut Window) {
+    let Some(row) = prepaint.execution_visual_row else {
+        return;
+    };
+    if !prepaint.visible_range.contains(&row) {
+        return;
+    }
+    let bounds = prepaint.bounds;
+    let y = bounds.origin.y + px(row as f32 * prepaint.line_height_px - prepaint.scroll_y);
+    window.paint_quad(fill(
+        Bounds::new(
+            point(bounds.origin.x, y),
+            size(bounds.size.width, px(prepaint.line_height_px)),
+        ),
+        execution_line_color(),
+    ));
+}
+
+/// Paints breakpoint icons over the line numbers and the `▶` execution arrow (`KOVA-041`).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "visible row index fits cleanly within f32"
+)]
+fn paint_debug_markers(prepaint: &EditorPrepaintState, digits_right_x: f32, window: &mut Window) {
+    let lh = prepaint.line_height_px;
+    let origin_y = f32::from(prepaint.bounds.origin.y);
+    let radius = (lh * 0.32).clamp(4.0, 7.0);
+    let cx = digits_right_x - radius - 1.0;
+    for &(visual_row, icon) in &prepaint.breakpoints {
+        let cy = origin_y + visual_row as f32 * lh - prepaint.scroll_y + lh / 2.0;
+        let dot = Bounds::new(
+            point(px(cx - radius), px(cy - radius)),
+            size(px(radius * 2.0), px(radius * 2.0)),
+        );
+        match icon {
+            BreakpointIcon::Line | BreakpointIcon::Conditional => {
+                let mut quad = fill(dot, breakpoint_color());
+                quad.corner_radii = px(radius).into();
+                window.paint_quad(quad);
+                if icon == BreakpointIcon::Conditional {
+                    // Small dark notch marks a condition (IntelliJ shows `?`).
+                    let notch = radius * 0.45;
+                    let mut inner = fill(
+                        Bounds::new(
+                            point(px(cx - notch), px(cy - notch)),
+                            size(px(notch * 2.0), px(notch * 2.0)),
+                        ),
+                        gpui::rgb(0x001E_1F22),
+                    );
+                    inner.corner_radii = px(notch).into();
+                    window.paint_quad(inner);
+                }
+            }
+            BreakpointIcon::Logpoint => {
+                let mut builder = PathBuilder::fill();
+                builder.move_to(point(px(cx), px(cy - radius)));
+                builder.line_to(point(px(cx + radius), px(cy)));
+                builder.line_to(point(px(cx), px(cy + radius)));
+                builder.line_to(point(px(cx - radius), px(cy)));
+                builder.close();
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, logpoint_color());
+                }
+            }
+            BreakpointIcon::Invalid => {
+                let mut quad = gpui::outline(dot, breakpoint_color(), gpui::BorderStyle::Solid);
+                quad.corner_radii = px(radius).into();
+                window.paint_quad(quad);
+            }
+        }
+    }
+    if let Some(row) = prepaint.execution_visual_row {
+        let (run_slot, _) = ViewportMetrics::gutter_slot_ranges(prepaint.gutter_width_px);
+        let cy = origin_y + row as f32 * lh - prepaint.scroll_y + lh / 2.0;
+        let x = f32::from(prepaint.bounds.origin.x) + run_slot.start + 3.0;
+        paint_run_triangle(
+            window,
+            x,
+            cy,
+            RUN_ICON_SIZE_PX,
+            gpui::rgb(0x0054_8AF7).into(),
+        );
     }
 }
 

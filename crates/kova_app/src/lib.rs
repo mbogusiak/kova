@@ -9,6 +9,7 @@
 //! All background work starts only after the first frame, keeping cold start `< 120 ms`.
 
 pub mod cli;
+pub mod debug_sessions;
 pub mod io;
 pub mod test_runs;
 pub mod theme_watch;
@@ -160,6 +161,13 @@ pub enum AppEvent {
         file: String,
         /// Problems (empty clears the file).
         problems: Vec<kova_ui::ProblemEntry>,
+    },
+    /// An update of JVM debug session `session_id` (`KOVA-041`).
+    Debug {
+        /// Session identifier from the shell's start request.
+        session_id: u64,
+        /// Update for the *Debugger* dock.
+        update: kova_ui::DebugUpdate,
     },
 }
 
@@ -324,6 +332,9 @@ pub fn handle_app_event(
         AppEvent::BuildProblems { file, problems } => {
             shell.set_build_problems(&file, problems, cx);
         }
+        AppEvent::Debug { session_id, update } => {
+            shell.apply_debug_update(session_id, update, window, cx);
+        }
     }
 }
 
@@ -401,6 +412,8 @@ pub fn run_cli(
         let sink = save_sink(runtime_handle.clone(), events_tx.clone());
         let settings_sink = settings_write_sink(&runtime_handle, events_tx.clone());
         let test_sink = test_runs::test_run_sink(runtime_handle.clone(), events_tx.clone());
+        let debug_sink =
+            debug_sessions::debug_command_sink(runtime_handle.clone(), events_tx.clone());
         let open_result = cx.open_window(default_window_options(cx), move |_, cx| {
             cx.activate(true);
             cx.new(move |cx| {
@@ -421,6 +434,7 @@ pub fn run_cli(
                 shell.set_save_sink(sink);
                 shell.set_settings_sink(settings_sink);
                 shell.set_test_run_sink(test_sink);
+                shell.set_debug_sink(debug_sink);
                 match project_root {
                     Some(root) => shell.with_project_root(root),
                     None => shell,

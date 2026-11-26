@@ -40,6 +40,8 @@ pub enum DockToolId {
     Terminal,
     /// `JUnit` Test Runner tool window (`Alt+8`, `KOVA-040`).
     Tests,
+    /// JVM Debugger tool window (`Alt+5`, `KOVA-041`).
+    Debug,
 }
 
 impl DockToolId {
@@ -54,6 +56,7 @@ impl DockToolId {
             Self::Structure => "Structure",
             Self::Terminal => "Terminal",
             Self::Tests => "Tests",
+            Self::Debug => "Debug",
         }
     }
 
@@ -68,6 +71,7 @@ impl DockToolId {
             Self::Structure => "STR",
             Self::Terminal => "TRM",
             Self::Tests => "TST",
+            Self::Debug => "DBG",
         }
     }
 
@@ -82,6 +86,7 @@ impl DockToolId {
             Self::Structure => "Alt+7",
             Self::Terminal => "Alt+F12",
             Self::Tests => "Alt+8",
+            Self::Debug => "Alt+5",
         }
     }
 
@@ -91,7 +96,9 @@ impl DockToolId {
         match self {
             Self::Project | Self::Commit => DockSide::Left,
             Self::Structure => DockSide::Right,
-            Self::Run | Self::Problems | Self::Terminal | Self::Tests => DockSide::Bottom,
+            Self::Run | Self::Problems | Self::Terminal | Self::Tests | Self::Debug => {
+                DockSide::Bottom
+            }
         }
     }
 }
