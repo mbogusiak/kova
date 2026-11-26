@@ -89,6 +89,28 @@ pub enum LspDapError {
         reason: String,
     },
 
+    /// A caller-supplied argument was rejected before contacting the server (KOVA-037).
+    #[error("invalid argument: {reason}")]
+    InvalidArgument {
+        /// Why the argument was rejected.
+        reason: String,
+    },
+
+    /// A modification targeted a read-only document such as `jdt://` or the decompiled-source
+    /// cache (KOVA-037).
+    #[error("document `{uri}` is read-only")]
+    ReadOnlyDocument {
+        /// URI of the read-only document.
+        uri: String,
+    },
+
+    /// A `WorkspaceEdit` could not be normalised (e.g. overlapping ranges) (KOVA-037).
+    #[error("invalid workspace edit: {reason}")]
+    InvalidWorkspaceEdit {
+        /// Why the edit was rejected.
+        reason: String,
+    },
+
     /// An I/O operation failed.
     #[error("I/O error at `{path}`: {message}")]
     Io {

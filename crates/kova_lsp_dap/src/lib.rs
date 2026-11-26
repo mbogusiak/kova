@@ -8,6 +8,13 @@
 //! - [`lsp::session`]: the request/response multiplexer with timeouts and `$/cancelRequest`,
 //! - [`lsp::lifecycle`]: the [`lsp::JdtlsClient`] state machine (`initialize` -> `Ready` -> `shutdown`),
 //! - [`lsp::sync`]: incremental `textDocument/*` synchronisation driven by `kova_buffer::EditLog`.
+//!
+//! On top of it, KOVA-037 adds the Java semantics:
+//! - [`lsp::diagnostics`]: the [`lsp::DiagnosticsStore`] fed by `publishDiagnostics`, with
+//!   snapshots for hibernation,
+//! - [`lsp::features`]: completion with auto-imports, inlay hints, hover, *Quick Fixes*
+//!   (`Alt+Enter`), *Rename* (`Shift+F6`) and [`lsp::NormalizedWorkspaceEdit`],
+//! - [`lsp::definition`]: *Go to Definition* with automatic Vineflower decompilation.
 
 pub mod error;
 pub mod lsp;

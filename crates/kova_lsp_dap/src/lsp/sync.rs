@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use kova_buffer::{BufferId, BufferSnapshot, BufferVersion, EditLog, Utf16Range, VersionChanges};
+use kova_buffer::{
+    BufferId, BufferSnapshot, BufferVersion, EditLog, Utf16Point, Utf16Range, VersionChanges,
+};
 use lsp_types::{Position, Range, TextDocumentContentChangeEvent, Uri};
 use serde_json::json;
 use url::Url;
@@ -42,7 +44,8 @@ fn lsp_version(version: BufferVersion) -> i32 {
     i32::try_from(version.as_u64()).unwrap_or(i32::MAX)
 }
 
-fn lsp_position(row: usize, column: usize) -> Result<Position, LspDapError> {
+/// Converts a zero-based `(row, UTF-16 column)` pair to an LSP [`Position`].
+pub(crate) fn lsp_position(row: usize, column: usize) -> Result<Position, LspDapError> {
     let convert = |value: usize| {
         u32::try_from(value).map_err(|_| LspDapError::SerializationError {
             reason: format!("position component {value} exceeds u32"),
@@ -51,11 +54,23 @@ fn lsp_position(row: usize, column: usize) -> Result<Position, LspDapError> {
     Ok(Position::new(convert(row)?, convert(column)?))
 }
 
-fn lsp_range(range: Utf16Range) -> Result<Range, LspDapError> {
+/// Converts a [`Utf16Range`] to an LSP [`Range`].
+pub(crate) fn lsp_range(range: Utf16Range) -> Result<Range, LspDapError> {
     Ok(Range::new(
         lsp_position(range.start.row, range.start.column)?,
         lsp_position(range.end.row, range.end.column)?,
     ))
+}
+
+/// Converts an LSP [`Position`] to a [`Utf16Point`].
+pub(crate) fn utf16_point(position: Position) -> Utf16Point {
+    let widen = |value: u32| usize::try_from(value).unwrap_or(usize::MAX);
+    Utf16Point::new(widen(position.line), widen(position.character))
+}
+
+/// Converts an LSP [`Range`] to a [`Utf16Range`].
+pub(crate) fn utf16_range(range: Range) -> Utf16Range {
+    Utf16Range::new(utf16_point(range.start), utf16_point(range.end))
 }
 
 /// State of a document opened in the language server.
