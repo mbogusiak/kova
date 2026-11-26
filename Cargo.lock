@@ -4497,7 +4497,9 @@ version = "0.1.0"
 dependencies = [
  "kova_buffer",
  "kova_config",
+ "kova_theme",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -4588,6 +4590,7 @@ dependencies = [
  "kova_buffer",
  "kova_config",
  "kova_core",
+ "kova_plugin_host",
  "kova_syntax",
  "kova_theme",
  "kova_tools",

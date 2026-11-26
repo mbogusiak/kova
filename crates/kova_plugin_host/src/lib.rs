@@ -9,6 +9,7 @@ pub mod host_impl;
 pub mod manager;
 pub mod manifest;
 pub mod sandbox;
+pub mod ui;
 
 pub use bindings::{
     AstSymbol, BadgeProps, ButtonProps, CodeBlockProps, CommandDescriptor, EditorSnapshot,
