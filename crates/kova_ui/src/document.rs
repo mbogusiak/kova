@@ -290,6 +290,18 @@ impl DocumentState {
         self.generation
     }
 
+    /// Returns the [`SaveTicket`] currently in flight for this document, if any.
+    #[must_use]
+    pub const fn in_flight_ticket(&self) -> Option<SaveTicket> {
+        match self.save_in_flight {
+            Some(revision) => Some(SaveTicket {
+                generation: self.generation,
+                revision,
+            }),
+            None => None,
+        }
+    }
+
     /// Returns `true` when `current_revision` differs from the last saved revision.
     #[must_use]
     pub const fn is_dirty(&self, current_revision: u64) -> bool {

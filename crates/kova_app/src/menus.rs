@@ -1,5 +1,5 @@
-//! Native menu bar wiring (`KOVA-049`): `cx.set_menus`, the process-level menu commands
-//! (Quit, Open Project, Open File, Recent Projects) and `Recent Projects` persistence.
+//! Native menu bar wiring (`KOVA-049`, `KOVA-054`): `cx.set_menus`, the process-level menu
+//! commands (Quit, Open Project, Open File, Recent Projects) and `Recent Projects` persistence.
 //!
 //! The menu tree and key bindings come from [`kova_ui::app_menu`]; the recent-projects list
 //! is the headless [`RecentProjectsStore`] from `kova_core`, read and written only on the
@@ -7,18 +7,18 @@
 
 use std::path::PathBuf;
 
-use gpui::{App, PathPromptOptions, WindowHandle};
+use gpui::{App, PathPromptOptions, WindowHandle, WindowId};
 use kova_config::KovaPaths;
 use kova_core::{MAX_RECENT_PROJECTS_IN_MENU, RecentProject, RecentProjectsStore};
 use kova_ui::app_menu::{
     ClearRecentProjects, OpenFile, OpenProject, OpenRecentProject, Quit, app_menus, bind_menu_keys,
 };
-use kova_ui::{StatusKind, SwitchProjectError, WorkspaceShell};
+use kova_ui::{StatusKind, WorkspaceShell};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
-use crate::AppEvent;
 use crate::cli::FileTarget;
+use crate::{AppEvent, AppHostState, ProcessEvent};
 
 /// A change to the persisted `Recent Projects` list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,13 +56,13 @@ pub fn apply_recent_update(
     Ok(store.menu_entries(MAX_RECENT_PROJECTS_IN_MENU))
 }
 
-/// Runs `update` on the blocking pool and reports [`AppEvent::RecentProjects`].
+/// Runs `update` on the blocking pool and reports [`ProcessEvent::RecentProjects`].
 pub fn spawn_recent_update(
     runtime: &Handle,
-    events: &mpsc::UnboundedSender<AppEvent>,
+    process_events: &mpsc::UnboundedSender<ProcessEvent>,
     update: RecentProjectsUpdate,
 ) {
-    let events = events.clone();
+    let process_events = process_events.clone();
     runtime.spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             let paths = KovaPaths::resolve().map_err(|err| err.to_string())?;
@@ -70,41 +70,37 @@ pub fn spawn_recent_update(
         })
         .await
         .unwrap_or_else(|err| Err(err.to_string()));
-        drop(events.send(AppEvent::RecentProjects(result)));
+        drop(process_events.send(ProcessEvent::RecentProjects(result)));
     });
 }
 
 /// Installs the menu bar (with an empty `Recent Projects` list until the background load
-/// finishes), its key bindings and the process-level command handlers for `window`.
-pub fn install(
-    window: WindowHandle<WorkspaceShell>,
-    runtime: &Handle,
-    events: &mpsc::UnboundedSender<AppEvent>,
-    cx: &mut App,
-) {
+/// finishes), its key bindings and the process-level command handlers targeting the active
+/// [`WorkspaceShell`] window dynamically (`KOVA-054`).
+pub fn install(cx: &mut App) {
     bind_menu_keys(cx);
     cx.set_menus(app_menus(&[]));
 
     cx.on_action(|_: &Quit, cx| cx.quit());
 
-    let (rt, tx) = (runtime.clone(), events.clone());
-    cx.on_action(move |_: &OpenProject, cx| {
-        prompt_and_open_project(window, rt.clone(), tx.clone(), cx);
+    cx.on_action(|_: &OpenProject, cx| {
+        prompt_and_open_project(cx);
     });
 
-    let (rt, tx) = (runtime.clone(), events.clone());
-    cx.on_action(move |action: &OpenRecentProject, cx| {
-        open_project(window, action.path.clone(), &rt, &tx, cx);
+    cx.on_action(|action: &OpenRecentProject, cx| {
+        open_project(action.path.clone(), None, cx);
     });
 
-    let (rt, tx) = (runtime.clone(), events.clone());
-    cx.on_action(move |_: &ClearRecentProjects, _| {
-        spawn_recent_update(&rt, &tx, RecentProjectsUpdate::Clear);
+    cx.on_action(|_: &ClearRecentProjects, cx| {
+        let (runtime, process_tx) = {
+            let host = cx.global::<AppHostState>();
+            (host.runtime.clone(), host.process_tx.clone())
+        };
+        spawn_recent_update(&runtime, &process_tx, RecentProjectsUpdate::Clear);
     });
 
-    let (rt, tx) = (runtime.clone(), events.clone());
-    cx.on_action(move |_: &OpenFile, cx| {
-        prompt_and_open_file(window, rt.clone(), tx.clone(), cx);
+    cx.on_action(|_: &OpenFile, cx| {
+        prompt_and_open_file(cx);
     });
 }
 
@@ -113,33 +109,56 @@ pub fn refresh_menus(recent: &[RecentProject], cx: &mut App) {
     cx.set_menus(app_menus(recent));
 }
 
-/// Switches `window` to `root` and records it; a vanished recent project is forgotten.
-fn open_project(
-    window: WindowHandle<WorkspaceShell>,
-    root: PathBuf,
-    runtime: &Handle,
-    events: &mpsc::UnboundedSender<AppEvent>,
-    cx: &mut App,
-) {
-    let outcome = window.update(cx, |shell, window, cx| {
-        shell.switch_project(root.clone(), window, cx)
+/// Routes a project open request for `root` across open windows (`KOVA-054`).
+pub fn open_project(root: PathBuf, preferred_window: Option<WindowId>, cx: &mut App) {
+    crate::prune_closed_windows(cx);
+    let preferred = preferred_window.and_then(|id| {
+        cx.global::<AppHostState>()
+            .registry
+            .slot_for(id)
+            .map(|slot| slot.window)
     });
-    match outcome {
-        Ok(Ok(())) => spawn_recent_update(runtime, events, RecentProjectsUpdate::Record(root)),
-        Ok(Err(SwitchProjectError::NotADirectory(root))) => {
-            spawn_recent_update(runtime, events, RecentProjectsUpdate::Remove(root));
+    let target_window = preferred.or_else(|| crate::resolve_target_window(cx).map(|(w, _)| w));
+    let (runtime, process_tx) = {
+        let host = cx.global::<AppHostState>();
+        (host.runtime.clone(), host.process_tx.clone())
+    };
+
+    if !root.is_dir() {
+        spawn_recent_update(
+            &runtime,
+            &process_tx,
+            RecentProjectsUpdate::Remove(root.clone()),
+        );
+        if let Some(window) = target_window {
+            drop(window.update(cx, |shell, window, cx| {
+                shell.request_open_project(root, window, cx);
+            }));
         }
-        Ok(Err(SwitchProjectError::UnsavedChanges(_))) | Err(_) => {}
+        return;
+    }
+
+    if let Some(existing) = crate::find_window_by_project_root(&root, cx)
+        && target_window.is_none_or(|target| target.window_id() != existing.window_id())
+    {
+        drop(existing.update(cx, |_, window, _| window.activate_window()));
+        spawn_recent_update(&runtime, &process_tx, RecentProjectsUpdate::Record(root));
+        return;
+    }
+
+    if let Some(window) = target_window {
+        drop(window.update(cx, |shell, window, cx| {
+            shell.request_open_project(root, window, cx);
+        }));
+    } else if crate::open_workspace_window(Some(root.clone()), cx).is_ok() {
+        spawn_recent_update(&runtime, &process_tx, RecentProjectsUpdate::Record(root));
     }
 }
 
 /// Shows the native directory picker (`NSOpenPanel` on macOS) and opens the choice.
-fn prompt_and_open_project(
-    window: WindowHandle<WorkspaceShell>,
-    runtime: Handle,
-    events: mpsc::UnboundedSender<AppEvent>,
-    cx: &mut App,
-) {
+fn prompt_and_open_project(cx: &mut App) {
+    let preferred_window = crate::resolve_target_window(cx).map(|(w, _)| w);
+    let preferred_id = preferred_window.map(|w| w.window_id());
     let picked = cx.prompt_for_paths(PathPromptOptions {
         files: false,
         directories: true,
@@ -147,22 +166,27 @@ fn prompt_and_open_project(
         prompt: Some("Open Project".into()),
     });
     cx.spawn(async move |cx| {
-        let Some(root) = first_picked(window, picker_outcome(picked.await), cx) else {
-            return;
-        };
-        cx.update(|cx| open_project(window, root, &runtime, &events, cx))
-            .ok();
+        let outcome = picker_outcome(picked.await);
+        cx.update(|cx| {
+            let notice_window =
+                preferred_window.or_else(|| crate::resolve_target_window(cx).map(|(w, _)| w));
+            let Some(root) = first_picked_in_app(notice_window, outcome, cx) else {
+                return;
+            };
+            open_project(root, preferred_id, cx);
+        })
+        .ok();
     })
     .detach();
 }
 
-/// Shows the native file picker and loads the choice into the editor off-thread.
-fn prompt_and_open_file(
-    window: WindowHandle<WorkspaceShell>,
-    runtime: Handle,
-    events: mpsc::UnboundedSender<AppEvent>,
-    cx: &mut App,
-) {
+/// Shows the native file picker and loads the choice into the active window off-thread.
+fn prompt_and_open_file(cx: &mut App) {
+    let target = crate::resolve_target_window(cx);
+    let runtime = cx.global::<AppHostState>().runtime.clone();
+    let Some((window, events)) = target else {
+        return;
+    };
     let picked = cx.prompt_for_paths(PathPromptOptions {
         files: true,
         directories: false,
@@ -170,7 +194,12 @@ fn prompt_and_open_file(
         prompt: Some("Open".into()),
     });
     cx.spawn(async move |cx| {
-        let Some(path) = first_picked(window, picker_outcome(picked.await), cx) else {
+        let outcome = picker_outcome(picked.await);
+        let path = cx
+            .update(|cx| first_picked_in_app(Some(window), outcome, cx))
+            .ok()
+            .flatten();
+        let Some(path) = path else {
             return;
         };
         runtime.spawn(async move {
@@ -198,24 +227,24 @@ fn picker_outcome<E: std::fmt::Display, C>(
         .map(|result| result.map_err(|err| err.to_string()))
 }
 
-/// First path of a picker result; a picker error is shown in the status bar.
-fn first_picked(
-    window: WindowHandle<WorkspaceShell>,
+/// First path of a picker result; a picker error is shown in `window`'s status bar.
+fn first_picked_in_app(
+    window: Option<WindowHandle<WorkspaceShell>>,
     picked: PickerResult,
-    cx: &mut gpui::AsyncApp,
+    cx: &mut App,
 ) -> Option<PathBuf> {
     match picked {
         Some(Ok(Some(paths))) => paths.into_iter().next(),
         Some(Err(err)) => {
-            window
-                .update(cx, |shell, _, cx| {
+            if let Some(window) = window {
+                drop(window.update(cx, |shell, _, cx| {
                     shell.set_notice(
                         StatusKind::Error,
                         format!("Cannot show the file picker: {err}"),
                         cx,
                     );
-                })
-                .ok();
+                }));
+            }
             None
         }
         Some(Ok(None)) | None => None,

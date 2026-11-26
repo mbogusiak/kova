@@ -42,7 +42,12 @@ pub use git::{
     CheckState, CommitPanel, CommitPanelEvent, CommitPanelModel, EditorGitState, StageOp,
 };
 pub use plugin_ui::{PluginToolWindow, PluginUiEventSink};
-pub use shell::{StartupMetrics, SwitchProjectError, WorkspaceShell};
+pub use shell::{
+    OpenProjectButton, OpenProjectDirtyEntry, OpenProjectKeyOutcome, OpenProjectModal,
+    OpenProjectModalMode, OpenProjectRequestOutcome, PendingProjectSwitch, ProjectHostCommand,
+    ProjectHostSink, StartupMetrics, SwitchProjectError, SwitchProjectMode, WorkspaceShell,
+    canonicalize_or_raw, paths_match,
+};
 pub use terminal::{TerminalDock, TerminalLaunch, TerminalView};
 pub use test_runner::{TestRunRequest, TestRunSink, TestRunnerAction, TestRunnerModel};
 pub use theme::{KovaTheme, ThemeState, apply_live_theme, hsla_from_rgba, rgba_to_gpui};
