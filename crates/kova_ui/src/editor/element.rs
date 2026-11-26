@@ -235,6 +235,7 @@ pub struct EditorPrepaintState {
     inline_blame: Option<(gpui::Point<Pixels>, ShapedLine)>,
     fold_pills: Vec<FoldPill>,
     gutter_hitbox: Hitbox,
+    hover_link_hitbox: Option<Hitbox>,
     overlays: Overlays,
     scrollbar_thumb: Option<(f32, f32)>,
     scrollbar_active: bool,
@@ -495,6 +496,20 @@ impl Element for EditorCanvasElement {
 
             let focused = editor.focus_handle().is_focused(window);
             let mut overlays = compute_overlays(editor, &snapshot, geom, focused);
+            let hover_link_hitbox = overlays.hover_link_word_bounds.and_then(|word_bounds| {
+                let min_x = bounds.origin.x + px(gutter_width_px);
+                let max_x = bounds.origin.x + bounds.size.width;
+                let left = word_bounds.origin.x.max(min_x);
+                let right = (word_bounds.origin.x + word_bounds.size.width).min(max_x);
+                if right <= left {
+                    return None;
+                }
+                let clipped = Bounds::new(
+                    point(left, word_bounds.origin.y),
+                    size(right - left, word_bounds.size.height),
+                );
+                Some(window.insert_hitbox(clipped, HitboxBehavior::Normal))
+            });
             if focused {
                 let inverse = hsla_from_rgba(theme.text().inverse);
                 shape_caret_glyphs(
@@ -523,6 +538,7 @@ impl Element for EditorCanvasElement {
                 inline_blame,
                 fold_pills,
                 gutter_hitbox,
+                hover_link_hitbox,
                 overlays,
                 scrollbar_thumb: metrics.vertical_scrollbar_thumb(scroll_y, total_visual),
                 scrollbar_active: editor.is_scrollbar_active(),
@@ -661,6 +677,9 @@ impl Element for EditorCanvasElement {
             }
         });
 
+        if let Some(hitbox) = prepaint.hover_link_hitbox.as_ref() {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
         self.register_input_handlers(bounds, window, cx);
         register_hover_refresh(prepaint, window);
     }
@@ -1094,6 +1113,8 @@ struct Overlays {
     /// Glyphs redrawn above block carets in `text.inverse`, bold.
     caret_glyphs: Vec<(gpui::Point<Pixels>, ShapedLine)>,
     ime_underlines: Vec<Bounds<Pixels>>,
+    hover_link_underline: Option<Bounds<Pixels>>,
+    hover_link_word_bounds: Option<Bounds<Pixels>>,
     caret_kind: CursorRenderKind,
     focused: bool,
     caret_visible: bool,
@@ -1130,6 +1151,10 @@ fn paint_content(
     let ime_color = hsla_from_rgba(theme.borders().focus);
     for &rect in &overlays.ime_underlines {
         window.paint_quad(fill(rect, ime_color));
+    }
+    if let Some(rect) = overlays.hover_link_underline {
+        let link_color = hsla_from_rgba(theme.borders().tab_indicator);
+        window.paint_quad(fill(rect, link_color));
     }
     if overlays.focused && overlays.caret_visible {
         let caret_color = hsla_from_rgba(theme.editor().cursor);
@@ -1201,6 +1226,8 @@ fn compute_overlays(
         block_glyphs: Vec::new(),
         caret_glyphs: Vec::new(),
         ime_underlines: Vec::new(),
+        hover_link_underline: None,
+        hover_link_word_bounds: None,
         caret_kind: editor.cursor_render_kind(),
         focused,
         caret_visible: editor.is_cursor_visible(),
@@ -1276,6 +1303,18 @@ fn compute_overlays(
                 ));
             }
         }
+    }
+    if let Some(link) = editor.hovered_link()
+        && let Some(line) = visible.iter().find(|l| l.row == link.row)
+        && let Some((x1, x2)) = span_x_range(snapshot, line, &link.byte_range, false, geom)
+    {
+        let y = row_y(line.visual_row);
+        out.hover_link_underline = Some(Bounds::new(
+            point(px(x1), px(y + lh - 2.0)),
+            size(px(x2 - x1), px(1.5)),
+        ));
+        out.hover_link_word_bounds =
+            Some(Bounds::new(point(px(x1), px(y)), size(px(x2 - x1), px(lh))));
     }
     out
 }

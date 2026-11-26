@@ -47,6 +47,84 @@ pub struct SaveTicket {
 /// Callback that performs a [`SaveRequest`] off the UI thread.
 pub type SaveSink = Arc<dyn Fn(SaveRequest) + Send + Sync>;
 
+/// Request to resolve the definition of the symbol at `cursor_byte` in `source_path`
+/// (`KOVA-051`), dispatched to a host [`DefinitionSink`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionRequest {
+    /// Monotonic request identifier so stale async replies can be discarded.
+    pub request_id: u64,
+    /// Open workspace root directory, if any.
+    pub project_root: Option<PathBuf>,
+    /// Active document key (project-relative inside workspace, or absolute outside).
+    pub source_path: PathBuf,
+    /// Full text snapshot of the active document.
+    pub source_text: String,
+    /// Byte offset of the identifier under the caret or click.
+    pub cursor_byte: usize,
+    /// 1-based line number of the request origin.
+    pub line: usize,
+    /// 1-based character column of the request origin.
+    pub column: usize,
+    /// In-memory contents of currently open buffers.
+    pub open_buffers: Vec<(PathBuf, String)>,
+    /// Project-relative paths from the workspace tree.
+    pub workspace_files: Vec<PathBuf>,
+}
+
+/// Target document produced by a *Go to Definition* resolution (`KOVA-051`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefinitionTargetKind {
+    /// A source file belonging to the open workspace.
+    WorkspaceFile {
+        /// Project-relative path (or matching open document key).
+        rel_path: PathBuf,
+    },
+    /// An external source file (e.g. attached JDK/library sources).
+    ExternalFile {
+        /// Absolute file path on disk.
+        path: PathBuf,
+        /// Whether the document must be opened read-only.
+        read_only: bool,
+    },
+    /// A compiled library / JDK class decompiled on demand (always read-only).
+    DecompiledClass {
+        /// Fully qualified binary class name (e.g. `java.lang.String`).
+        fqcn: String,
+        /// Persistent cache file under `~/.cache/kova/decompiled/`.
+        cache_file: PathBuf,
+        /// Decompiled Java source text.
+        source_text: String,
+    },
+}
+
+/// Outcome returned by the host [`DefinitionSink`] for a [`DefinitionRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefinitionOutcome {
+    /// A declaration was resolved at 1-based `(line, column)`.
+    Found {
+        /// Target document to open/focus.
+        target: DefinitionTargetKind,
+        /// 1-based line number of the declaration.
+        line: usize,
+        /// 1-based character column of the declaration.
+        column: usize,
+        /// Resolved symbol name.
+        symbol_name: String,
+    },
+    /// Neither Level-1 workspace search nor LSP found a declaration for `symbol_name`.
+    NotFound {
+        /// Identifier that was queried.
+        symbol_name: String,
+    },
+    /// Cursor was not positioned on a navigable identifier.
+    NoSymbolAtCursor,
+    /// Resolution failed with a diagnostic message.
+    Error(String),
+}
+
+/// Callback that resolves a [`DefinitionRequest`] off the UI thread (`KOVA-051`).
+pub type DefinitionSink = Arc<dyn Fn(DefinitionRequest) + Send + Sync>;
+
 /// Severity of the transient status-bar message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {

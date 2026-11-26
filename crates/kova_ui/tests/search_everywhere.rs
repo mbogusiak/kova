@@ -116,7 +116,11 @@ fn double_shift_state_machine_triggers_across_contexts_and_platforms() {
             (FocusContext::SearchEverywhere, false),
         ] {
             let mut layer = KeyDispatchLayer::new(platform);
-            let ctx = DispatchContext { leaf, vim_enabled };
+            let ctx = DispatchContext {
+                leaf,
+                vim_enabled,
+                editor_read_only: false,
+            };
             let t0 = Instant::now();
 
             assert_eq!(
@@ -143,6 +147,7 @@ fn double_shift_never_triggers_for_shift_plus_letter_or_shortcut() {
     let editor_ctx = DispatchContext {
         leaf: FocusContext::EditorText,
         vim_enabled: false,
+        editor_read_only: false,
     };
 
     // Shift↓ -> KeyDown('A') -> Shift↑ -> Shift↓ -> Shift↑ must NOT trigger (only 1 clean tap).

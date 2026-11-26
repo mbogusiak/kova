@@ -24,6 +24,8 @@ pub struct TabItem {
     pub path: Option<PathBuf>,
     /// Whether the document has unsaved modifications (`●`).
     pub is_dirty: bool,
+    /// Whether the document is read-only (e.g. a decompiled library class).
+    pub is_read_only: bool,
     /// Language label shown in the status bar (e.g. `"Java"`, `"TOML"`).
     pub language_label: String,
 }
@@ -123,6 +125,7 @@ impl TabGroupModel {
             title: title.into(),
             path: path.map(Path::to_path_buf),
             is_dirty: false,
+            is_read_only: false,
             language_label: language_label.into(),
         });
         self.activate(id);
@@ -195,6 +198,13 @@ impl TabGroupModel {
     pub fn set_dirty(&mut self, id: TabId, dirty: bool) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
             tab.is_dirty = dirty;
+        }
+    }
+
+    /// Marks `id` as read-only (`[RO]`) or writable.
+    pub fn set_read_only(&mut self, id: TabId, read_only: bool) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.is_read_only = read_only;
         }
     }
 

@@ -162,6 +162,7 @@ pub struct VimEngine {
     insert: Option<InsertState>,
     last_visual: Option<(usize, usize, VimMode)>,
     last_error: Option<BufferError>,
+    pending_outcome: Option<VimOutcome>,
 }
 
 impl VimEngine {
@@ -190,6 +191,7 @@ impl VimEngine {
             insert: None,
             last_visual: None,
             last_error: None,
+            pending_outcome: None,
         }
     }
 
@@ -360,6 +362,7 @@ impl VimEngine {
 
     /// Feeds one normalized key.
     pub fn handle_vim_key(&mut self, key: VimKey) -> VimOutcome {
+        self.pending_outcome = None;
         if let VimKey::Ctrl(c) = key {
             let supported = if self.mode == VimMode::Insert {
                 matches!(c, 'c' | 'h' | 'w')
@@ -375,7 +378,7 @@ impl VimEngine {
         } else {
             self.cmd_key(key);
         }
-        VimOutcome::Handled
+        self.pending_outcome.take().unwrap_or(VimOutcome::Handled)
     }
 
     /// Feeds committed text from an IME or keyboard layout (including multi-byte
@@ -691,6 +694,10 @@ impl VimEngine {
             }
             'J' if self.mode == VimMode::Normal && self.pending.op.is_none() => {
                 self.join(false);
+                true
+            }
+            'd' if self.mode == VimMode::Normal && self.pending.op.is_none() => {
+                self.pending_outcome = Some(VimOutcome::GoToDefinition);
                 true
             }
             _ => true,

@@ -880,3 +880,30 @@ fn replace_buffer_keeps_mode_and_registers_and_clamps_cursor() {
     e.feed(ESC);
     assert_eq!(e.text(), "xyż");
 }
+
+#[test]
+fn gd_triggers_go_to_definition_only_in_idle_normal_mode() {
+    let mut e = VimEngine::from_text("OrderService service;");
+    e.set_cursor(15);
+
+    assert_eq!(e.handle_vim_key(VimKey::Char('g')), VimOutcome::Handled);
+    assert_eq!(e.status_snapshot().pending, "g");
+    assert_eq!(
+        e.handle_vim_key(VimKey::Char('d')),
+        VimOutcome::GoToDefinition
+    );
+    assert_eq!(e.status_snapshot().pending, "");
+    assert_eq!(e.text(), "OrderService service;");
+    assert_eq!(e.cursor(), 15);
+
+    // Operator-pending `dgd` must not trigger GoToDefinition.
+    assert_eq!(e.handle_vim_key(VimKey::Char('d')), VimOutcome::Handled);
+    assert_eq!(e.handle_vim_key(VimKey::Char('g')), VimOutcome::Handled);
+    assert_eq!(e.handle_vim_key(VimKey::Char('d')), VimOutcome::Handled);
+    assert_eq!(e.text(), "OrderService service;");
+
+    // Visual mode `vgd` must not trigger GoToDefinition.
+    assert_eq!(e.handle_vim_key(VimKey::Char('v')), VimOutcome::Handled);
+    assert_eq!(e.handle_vim_key(VimKey::Char('g')), VimOutcome::Handled);
+    assert_eq!(e.handle_vim_key(VimKey::Char('d')), VimOutcome::Handled);
+}

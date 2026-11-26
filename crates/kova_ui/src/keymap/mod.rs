@@ -18,7 +18,7 @@ pub mod ex;
 
 use std::time::Instant;
 
-use kova_core::builtin_actions::ids;
+use kova_core::builtin_actions::{builtin_action_registry_ref, ids};
 use kova_core::keymap::chord::DEFAULT_CHORD_TIMEOUT;
 use kova_core::{
     ActionId, ContextState, FocusContext, FocusStack, KeyCode, KeyDispatch, KeyStep, KeyStroke,
@@ -223,6 +223,12 @@ pub enum ShellAction {
     OpenSettings,
     /// Open or close the Git *Commit* panel (`Cmd+K` / `Ctrl+K`).
     ToggleCommitPanel,
+    /// Jump to symbol declaration at the active caret (`Cmd+B` / `Ctrl+B`).
+    GoToDefinition,
+    /// Step backward in navigation history (`Cmd+[` / `Ctrl+Alt+Left`).
+    NavigateBack,
+    /// Step forward in navigation history (`Cmd+]` / `Ctrl+Alt+Right`).
+    NavigateForward,
     /// JVM debugger command (`KOVA-041`).
     Debug(DebugShellAction),
 }
@@ -282,6 +288,9 @@ impl ShellAction {
             ids::VIEW_CLOSE_TAB => Self::CloseActiveTab,
             ids::NAVIGATION_NEXT_TAB => Self::CycleTab(true),
             ids::NAVIGATION_PREV_TAB => Self::CycleTab(false),
+            ids::NAVIGATION_GO_TO_DECLARATION => Self::GoToDefinition,
+            ids::NAVIGATION_BACK => Self::NavigateBack,
+            ids::NAVIGATION_FORWARD => Self::NavigateForward,
             ids::EDITOR_SAVE => Self::Save,
             ids::EDITOR_DUPLICATE_LINE => Self::DuplicateLine,
             ids::EDITOR_TOGGLE_LINE_COMMENT => Self::ToggleLineComment,
@@ -311,6 +320,8 @@ pub struct DispatchContext {
     pub leaf: FocusContext,
     /// Whether modal Vim editing is enabled.
     pub vim_enabled: bool,
+    /// Whether the focused editor buffer is read-only (e.g. decompiled class).
+    pub editor_read_only: bool,
 }
 
 /// Outcome of feeding one key to the [`KeyDispatchLayer`].
@@ -345,6 +356,8 @@ pub struct KeyDispatchLayer {
     cached_stack: FocusStack,
     state_vim_on: ContextState,
     state_vim_off: ContextState,
+    state_vim_on_ro: ContextState,
+    state_vim_off_ro: ContextState,
     prev_shift: bool,
     prev_capslock: bool,
 }
@@ -370,6 +383,10 @@ impl KeyDispatchLayer {
             cached_stack: FocusStack::from_leaf(FocusContext::Workspace),
             state_vim_on: ContextState::new().with_flag(VIM_ENABLED_FLAG, true),
             state_vim_off: ContextState::new(),
+            state_vim_on_ro: ContextState::new()
+                .with_flag(VIM_ENABLED_FLAG, true)
+                .with_flag("editor_read_only", true),
+            state_vim_off_ro: ContextState::new().with_flag("editor_read_only", true),
             prev_shift: false,
             prev_capslock: false,
         }
@@ -437,17 +454,18 @@ impl KeyDispatchLayer {
     ) -> DispatchOutcome {
         self.update_cached_context(ctx.leaf);
         let had_pending = self.has_pending();
-        let state = if ctx.vim_enabled {
-            &self.state_vim_on
-        } else {
-            &self.state_vim_off
+        let state = match (ctx.vim_enabled, ctx.editor_read_only) {
+            (true, false) => &self.state_vim_on,
+            (false, false) => &self.state_vim_off,
+            (true, true) => &self.state_vim_on_ro,
+            (false, true) => &self.state_vim_off_ro,
         };
         let result =
             self.session
                 .on_key_down(&self.resolver, stroke, &self.cached_stack, state, now);
         self.epoch = self.epoch.wrapping_add(1);
         let cancelled_escape = had_pending && stroke == KeyStroke::unmodified(KeyCode::Escape);
-        self.map_dispatch_result(result, cancelled_escape)
+        self.map_dispatch_result(result, cancelled_escape, state)
     }
 
     /// Feeds a [`gpui::ModifiersChangedEvent`] (macOS `NSFlagsChanged` / X11 modifier edge)
@@ -483,10 +501,11 @@ impl KeyDispatchLayer {
         self.prev_shift = modifiers.shift;
 
         self.update_cached_context(ctx.leaf);
-        let state = if ctx.vim_enabled {
-            &self.state_vim_on
-        } else {
-            &self.state_vim_off
+        let state = match (ctx.vim_enabled, ctx.editor_read_only) {
+            (true, false) => &self.state_vim_on,
+            (false, false) => &self.state_vim_off,
+            (true, true) => &self.state_vim_on_ro,
+            (false, true) => &self.state_vim_off_ro,
         };
         let result = self.session.on_modifier_edge(
             &self.resolver,
@@ -499,7 +518,7 @@ impl KeyDispatchLayer {
         if !matches!(result, KeyDispatch::NotMatched) {
             self.epoch = self.epoch.wrapping_add(1);
         }
-        self.map_dispatch_result(result, false)
+        self.map_dispatch_result(result, false, state)
     }
 
     fn update_cached_context(&mut self, leaf: FocusContext) {
@@ -509,10 +528,25 @@ impl KeyDispatchLayer {
         }
     }
 
-    fn map_dispatch_result(&self, result: KeyDispatch, cancelled_escape: bool) -> DispatchOutcome {
+    fn map_dispatch_result(
+        &self,
+        result: KeyDispatch,
+        cancelled_escape: bool,
+        state: &ContextState,
+    ) -> DispatchOutcome {
         match result {
-            KeyDispatch::Matched { action, .. } => ShellAction::from_action_id(&action)
-                .map_or(DispatchOutcome::Delegated(action), DispatchOutcome::Action),
+            KeyDispatch::Matched { action, .. } => {
+                if state.editor_read_only
+                    && builtin_action_registry_ref()
+                        .get(&action)
+                        .and_then(|desc| desc.default_when.as_ref())
+                        .is_some_and(|expr| !expr.matches(&self.cached_stack, state))
+                {
+                    return DispatchOutcome::Unhandled;
+                }
+                ShellAction::from_action_id(&action)
+                    .map_or(DispatchOutcome::Delegated(action), DispatchOutcome::Action)
+            }
             KeyDispatch::Pending { prefix, .. } => DispatchOutcome::Pending {
                 hint: format_hint(&prefix),
                 epoch: self.epoch,
@@ -600,7 +634,11 @@ mod tests {
     }
 
     fn ctx(leaf: FocusContext, vim_enabled: bool) -> DispatchContext {
-        DispatchContext { leaf, vim_enabled }
+        DispatchContext {
+            leaf,
+            vim_enabled,
+            editor_read_only: false,
+        }
     }
 
     fn press(
@@ -951,6 +989,9 @@ mod tests {
             ids::VIM_TOGGLE,
             ids::TOOL_WINDOW_HIDE_ALL,
             ids::GIT_COMMIT,
+            ids::NAVIGATION_GO_TO_DECLARATION,
+            ids::NAVIGATION_BACK,
+            ids::NAVIGATION_FORWARD,
         ] {
             assert!(
                 ShellAction::from_action_id(&ActionId::from_static(id)).is_some(),
@@ -1156,6 +1197,65 @@ mod tests {
                 editor_ctx,
                 t0 + Duration::from_millis(500),
             ),
+            DispatchOutcome::Unhandled
+        );
+    }
+
+    #[test]
+    fn navigation_shortcuts_and_read_only_context_dispatch() {
+        let now = Instant::now();
+        let mut mac = KeyDispatchLayer::new(Platform::MacOs);
+        assert_eq!(
+            press(&mut mac, "cmd-b", FocusContext::EditorText, false, now),
+            DispatchOutcome::Action(ShellAction::GoToDefinition)
+        );
+        assert_eq!(
+            press(&mut mac, "cmd-[", FocusContext::EditorText, false, now),
+            DispatchOutcome::Action(ShellAction::NavigateBack)
+        );
+        assert_eq!(
+            press(&mut mac, "cmd-]", FocusContext::EditorText, false, now),
+            DispatchOutcome::Action(ShellAction::NavigateForward)
+        );
+
+        let mut linux = KeyDispatchLayer::new(Platform::Linux);
+        assert_eq!(
+            press(&mut linux, "ctrl-b", FocusContext::EditorText, false, now),
+            DispatchOutcome::Action(ShellAction::GoToDefinition)
+        );
+        assert_eq!(
+            press(
+                &mut linux,
+                "ctrl-alt-left",
+                FocusContext::Workspace,
+                false,
+                now
+            ),
+            DispatchOutcome::Action(ShellAction::NavigateBack)
+        );
+        assert_eq!(
+            press(
+                &mut linux,
+                "ctrl-alt-right",
+                FocusContext::Workspace,
+                false,
+                now
+            ),
+            DispatchOutcome::Action(ShellAction::NavigateForward)
+        );
+
+        // Read-only editors still allow GoToDefinition, while EditableText actions like DuplicateLine do not match.
+        let ro_ctx = DispatchContext {
+            leaf: FocusContext::EditorText,
+            vim_enabled: false,
+            editor_read_only: true,
+        };
+        assert_eq!(
+            mac.dispatch(shortcut_stroke(&ks("cmd-b")).unwrap(), ro_ctx, now),
+            DispatchOutcome::Action(ShellAction::GoToDefinition)
+        );
+        assert_eq!(
+            mac.dispatch(shortcut_stroke(&ks("cmd-d")).unwrap(), ro_ctx, now),
             DispatchOutcome::Unhandled
         );
     }

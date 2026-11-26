@@ -104,6 +104,10 @@ impl WorkspaceShell {
 
         self.documents.clear();
         self.doc_states.clear();
+        self.read_only_docs.clear();
+        self.nav_history.clear();
+        self.pending_definition_request = None;
+        self.queued_go_to_definition_byte = None;
         self.doc_notice = None;
         self.close_after_save = None;
         self.ex_line = None;
