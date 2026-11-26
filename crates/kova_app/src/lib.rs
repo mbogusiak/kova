@@ -23,6 +23,7 @@ use gpui::{
     App, AppContext as _, Application, AsyncApp, Bounds, TitlebarOptions,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, point, px, size,
 };
+use kova_ui::settings::{SettingsWriteRequest, SettingsWriteSink};
 use kova_ui::{KovaTheme, SaveRequest, SaveSink, StartupMetrics, StatusKind, WorkspaceShell};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, oneshot};
@@ -141,6 +142,8 @@ pub enum AppEvent {
     },
     /// Theme or configuration update from the config watcher.
     Theme(ThemeWatchEvent),
+    /// A background `settings.toml` write from the Settings view finished (`KOVA-029`).
+    SettingsWritten(Result<(), String>),
     /// The configuration watcher could not be started.
     ConfigUnavailable(String),
 }
@@ -176,6 +179,41 @@ pub fn save_sink(runtime: Handle, events: mpsc::UnboundedSender<AppEvent>) -> Sa
                 .map_err(|err| err.to_string());
             drop(events.send(AppEvent::SaveFinished { ticket, result }));
         });
+    })
+}
+
+/// Creates the [`SettingsWriteSink`] used by the Settings view (`KOVA-029`).
+///
+/// Writes are serialized on one `tokio` task that always persists the latest request
+/// (older queued edits are superseded), so `settings.toml` can never end up with an older
+/// document than the GUI shows. Each write is atomic (`SettingsDocument::save_to_file`) and
+/// runs on a blocking thread; the result comes back as [`AppEvent::SettingsWritten`].
+#[must_use]
+pub fn settings_write_sink(
+    runtime: &Handle,
+    events: mpsc::UnboundedSender<AppEvent>,
+) -> SettingsWriteSink {
+    let (tx, mut rx) = mpsc::unbounded_channel::<SettingsWriteRequest>();
+    runtime.spawn(async move {
+        while let Some(mut request) = rx.recv().await {
+            while let Ok(newer) = rx.try_recv() {
+                request = newer;
+            }
+            let result = tokio::task::spawn_blocking(move || {
+                request
+                    .document
+                    .save_to_file(&request.path)
+                    .map_err(|err| err.to_string())
+            })
+            .await
+            .unwrap_or_else(|err| Err(err.to_string()));
+            if events.send(AppEvent::SettingsWritten(result)).is_err() {
+                break;
+            }
+        }
+    });
+    Arc::new(move |request: SettingsWriteRequest| {
+        drop(tx.send(request));
     })
 }
 
@@ -255,6 +293,13 @@ pub fn handle_app_event(
         AppEvent::Theme(ThemeWatchEvent::Warning(message)) => {
             shell.set_notice(StatusKind::Warning, message, cx);
         }
+        AppEvent::Theme(ThemeWatchEvent::Settings(source)) => {
+            shell.update_settings_source(source, cx);
+        }
+        AppEvent::Theme(ThemeWatchEvent::SettingsInvalid(message)) => {
+            shell.report_settings_error(message, cx);
+        }
+        AppEvent::SettingsWritten(result) => shell.finish_settings_write(result, cx),
         AppEvent::ConfigUnavailable(message) => shell.set_notice(
             StatusKind::Warning,
             format!("Live config reload unavailable: {message}"),
@@ -335,6 +380,7 @@ pub fn run_cli(
         .detach();
 
         let sink = save_sink(runtime_handle.clone(), events_tx.clone());
+        let settings_sink = settings_write_sink(&runtime_handle, events_tx.clone());
         let open_result = cx.open_window(default_window_options(cx), move |_, cx| {
             cx.activate(true);
             cx.new(move |cx| {
@@ -353,6 +399,7 @@ pub fn run_cli(
                     cx,
                 );
                 shell.set_save_sink(sink);
+                shell.set_settings_sink(settings_sink);
                 match project_root {
                     Some(root) => shell.with_project_root(root),
                     None => shell,
@@ -504,8 +551,55 @@ mod tests {
 
     use kova_ui::StartupMetrics;
 
-    use super::{AppLaunchOptions, CRATE_NAME, LaunchRequest, finalize_launch};
+    use kova_config::{SettingUpdate, SettingsDocument};
+    use kova_ui::settings::SettingsWriteRequest;
+    use tokio::sync::mpsc;
+
+    use super::{
+        AppEvent, AppLaunchOptions, CRATE_NAME, LaunchRequest, build_io_runtime, finalize_launch,
+        settings_write_sink,
+    };
     use crate::cli::FileTarget;
+
+    #[test]
+    fn settings_write_sink_persists_the_latest_document_with_comments() {
+        let runtime = build_io_runtime().expect("runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = settings_write_sink(runtime.handle(), tx);
+
+        let mut doc = SettingsDocument::from_toml_str("# keep\n[editor]\ntab_size = 4 # tabs\n")
+            .expect("valid settings");
+        for size in 2..=6_u8 {
+            doc.set_setting(SettingUpdate::EditorTabSize(size))
+                .expect("valid tab size");
+            sink(SettingsWriteRequest {
+                path: path.clone(),
+                document: doc.clone(),
+            });
+        }
+
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(event) = rx.recv().await {
+                    if let AppEvent::SettingsWritten(result) = event {
+                        result.expect("write succeeds");
+                        let text = std::fs::read_to_string(&path).expect("written");
+                        if text.contains("tab_size = 6") {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("latest write lands");
+        });
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("written"),
+            "# keep\n[editor]\ntab_size = 6 # tabs\n"
+        );
+    }
 
     #[test]
     fn crate_name_matches_manifest() {

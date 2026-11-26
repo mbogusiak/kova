@@ -59,7 +59,13 @@ use crate::keymap::{
     KeyDispatchLayer, KeyRoute, RouteFlags, ShellAction, is_text_composition, key_route,
     parse_ex_command, shortcut_stroke, vim_stroke,
 };
+use crate::settings::view::{SettingsClick, SettingsKey};
+use crate::settings::{
+    DebugSink, ReloadOutcome, SettingsKeyOutcome, SettingsSource, SettingsView,
+    SettingsWriteRequest, SettingsWriteSink,
+};
 use crate::theme::{KovaTheme, hsla_from_rgba};
+use kova_config::{KovaSettings, SettingsDocument};
 
 /// Canonical Islands UI layout geometry (`KOVA-025` spec §FR-1, `new_ui_dock_mockup.svg`).
 /// Outer margin, island gap and focus ring width come from [`LayoutDensity`] (`KOVA-026`);
@@ -365,6 +371,20 @@ pub struct WorkspaceShell {
     viewport_px: (f32, f32),
     /// Document whose tabs `:wq` closes once its save succeeds.
     close_after_save: Option<PathBuf>,
+    /// Settings overlay state, created lazily on the first `Cmd+,` (`KOVA-029`).
+    settings_view: Option<SettingsView>,
+    /// Whether the Settings overlay is visible.
+    settings_open: bool,
+    /// Latest `settings.toml` snapshot delivered by the host watcher.
+    settings_source: Option<SettingsSource>,
+    /// Host writer persisting `settings.toml` off the UI thread.
+    settings_sink: Option<DebugSink>,
+    /// Settings currently applied to the workspace (diffed on every change).
+    applied_settings: KovaSettings,
+    /// `ui.show_status_bar`.
+    show_status_bar: bool,
+    /// Last `settings.toml` reload error, kept for a Settings view opened later.
+    settings_error: Option<String>,
 }
 
 impl fmt::Debug for WorkspaceShell {
@@ -471,6 +491,13 @@ impl WorkspaceShell {
             vim_enabled: false,
             viewport_px: (1440.0, 900.0),
             close_after_save: None,
+            settings_view: None,
+            settings_open: false,
+            settings_source: None,
+            settings_sink: None,
+            applied_settings: KovaSettings::default(),
+            show_status_bar: true,
+            settings_error: None,
         }
     }
 
@@ -879,9 +906,11 @@ impl WorkspaceShell {
             tab
         } else {
             let vim_enabled = self.vim_enabled;
+            let (font_family, font_size) = editor_font(&self.applied_settings);
             let editor = cx.new(|cx| {
                 let mut editor = EditorView::with_shared_buffer(buffer, cx);
                 editor.set_vim_enabled(vim_enabled, cx);
+                editor.set_font(&font_family, font_size, cx);
                 editor
             });
             let Some(pane) = self.panes.get_mut(&pane_id) else {
@@ -1341,6 +1370,11 @@ impl WorkspaceShell {
         cx: &mut Context<'_, Self>,
     ) {
         let keystroke = &event.keystroke;
+        if self.settings_open {
+            self.handle_settings_key(keystroke, window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.ex_line.is_some() {
             self.handle_ex_key(keystroke, window, cx);
             cx.stop_propagation();
@@ -1526,12 +1560,296 @@ impl WorkspaceShell {
                 "Search Everywhere arrives with KOVA-028".to_owned(),
                 cx,
             ),
-            ShellAction::OpenSettings => self.set_notice(
-                StatusKind::Info,
-                "Settings dialog arrives with KOVA-029".to_owned(),
+            ShellAction::OpenSettings => self.open_settings(window, cx),
+        }
+    }
+
+    /// Installs the host writer that persists `settings.toml` edits made in the Settings view.
+    pub fn set_settings_sink(&mut self, sink: SettingsWriteSink) {
+        self.settings_sink = Some(DebugSink(sink));
+    }
+
+    /// Whether the Settings overlay is open.
+    #[must_use]
+    pub const fn is_settings_open(&self) -> bool {
+        self.settings_open
+    }
+
+    /// The Settings overlay state, once it has been opened.
+    #[must_use]
+    pub const fn settings_view(&self) -> Option<&SettingsView> {
+        self.settings_view.as_ref()
+    }
+
+    /// Settings currently applied to the workspace.
+    #[must_use]
+    pub const fn applied_settings(&self) -> &KovaSettings {
+        &self.applied_settings
+    }
+
+    /// Opens the Settings overlay (`Cmd+,` / `Ctrl+Alt+S`), building it on first use.
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.settings_view.is_none() {
+            match SettingsView::from_source(self.settings_source.as_ref()) {
+                Ok(mut view) => {
+                    if let Some(message) = self.settings_error.clone() {
+                        view.set_load_error(message);
+                    }
+                    self.settings_view = Some(view);
+                }
+                Err(err) => {
+                    self.set_notice(
+                        StatusKind::Error,
+                        format!("Settings unavailable: {err}"),
+                        cx,
+                    );
+                    return;
+                }
+            }
+        }
+        self.settings_open = true;
+        self.ex_line = None;
+        self.keymap.reset();
+        self.chord_hint = None;
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// Closes the Settings overlay and returns focus to the active editor.
+    pub fn close_settings(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if !self.settings_open {
+            return;
+        }
+        let outcome = self
+            .settings_view
+            .as_mut()
+            .map_or(SettingsKeyOutcome::Ignored, SettingsView::commit_editing);
+        if outcome == SettingsKeyOutcome::Changed {
+            self.persist_settings(cx);
+        }
+        self.settings_open = false;
+        self.focus_active_editor(window, cx);
+        cx.notify();
+    }
+
+    /// Accepts a `settings.toml` snapshot read by the host after a watcher reload (or at
+    /// startup): refreshes the open form (ignoring echoes of our own writes) and applies the
+    /// settings to the workspace.
+    pub fn update_settings_source(&mut self, source: SettingsSource, cx: &mut Context<'_, Self>) {
+        if let Some(view) = self.settings_view.as_mut()
+            && let ReloadOutcome::Invalid(message) = view.apply_source(&source)
+        {
+            self.set_notice(StatusKind::Warning, format!("settings.toml: {message}"), cx);
+        }
+        let parsed = match &source.contents {
+            Some(contents) => {
+                SettingsDocument::from_toml_str(contents).map(|d| d.settings().clone())
+            }
+            None => Ok(KovaSettings::default()),
+        };
+        self.settings_source = Some(source);
+        if let Ok(settings) = parsed {
+            self.settings_error = None;
+            self.apply_settings(settings, cx);
+        }
+        cx.notify();
+    }
+
+    /// Shows a `settings.toml` reload failure in the Settings banner (Last-Known-Good stays).
+    pub fn report_settings_error(&mut self, message: String, cx: &mut Context<'_, Self>) {
+        self.settings_error = Some(message.clone());
+        if let Some(view) = self.settings_view.as_mut() {
+            view.set_load_error(message);
+            cx.notify();
+        }
+    }
+
+    /// Reports the result of a background `settings.toml` write.
+    pub fn finish_settings_write(
+        &mut self,
+        result: Result<(), String>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(view) = self.settings_view.as_mut() {
+            view.set_write_error(result.as_ref().err().cloned());
+        }
+        if let Err(message) = result {
+            self.set_notice(
+                StatusKind::Error,
+                format!("Could not write settings.toml: {message}"),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// Routes a key to the open Settings overlay.
+    fn handle_settings_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let m = &keystroke.modifiers;
+        let command = m.platform || m.control || m.alt;
+        // `Cmd+,` / `Ctrl+,` / `Ctrl+Alt+S` toggle the overlay closed again.
+        let toggle =
+            (command && keystroke.key == ",") || (m.control && m.alt && keystroke.key == "s");
+        if toggle {
+            self.close_settings(window, cx);
+            return;
+        }
+        let Some(view) = self.settings_view.as_mut() else {
+            return;
+        };
+        let outcome = view.handle_key(SettingsKey {
+            key: &keystroke.key,
+            text: keystroke.key_char.as_deref(),
+            shift: m.shift,
+            command,
+        });
+        self.finish_settings_outcome(outcome, window, cx);
+    }
+
+    /// Handles a click inside the Settings overlay.
+    pub(crate) fn settings_click(
+        &mut self,
+        click: SettingsClick,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(view) = self.settings_view.as_mut() else {
+            return;
+        };
+        let outcome = view.click(click);
+        self.finish_settings_outcome(outcome, window, cx);
+    }
+
+    fn finish_settings_outcome(
+        &mut self,
+        outcome: SettingsKeyOutcome,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match outcome {
+            SettingsKeyOutcome::Ignored => return,
+            SettingsKeyOutcome::Handled => {}
+            SettingsKeyOutcome::Changed => self.persist_settings(cx),
+            SettingsKeyOutcome::OpenFile(path) => {
+                self.close_settings(window, cx);
+                self.open_config_file(path, window, cx);
+            }
+            SettingsKeyOutcome::Close => self.close_settings(window, cx),
+        }
+        cx.notify();
+    }
+
+    /// Applies the form's settings to the workspace and hands the document to the host writer.
+    fn persist_settings(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(view) = self.settings_view.as_ref() else {
+            return;
+        };
+        let settings = view.settings().clone();
+        let file_broken = view.model().load_error().is_some();
+        let request = view.settings_path().map(|path| SettingsWriteRequest {
+            path: path.clone(),
+            document: view.model().document().clone(),
+        });
+        match (request, self.settings_sink.as_ref()) {
+            // Never overwrite a hand-edited file that does not parse: the user's edits and
+            // comments would be lost (NFR-1). The change applies to this session only.
+            _ if file_broken => self.set_notice(
+                StatusKind::Warning,
+                "settings.toml has errors — fix the file to save changes from Settings".to_owned(),
+                cx,
+            ),
+            (Some(request), Some(sink)) => (sink.0)(request),
+            _ => self.set_notice(
+                StatusKind::Warning,
+                "settings.toml is not available yet — the change applies to this session only"
+                    .to_owned(),
                 cx,
             ),
         }
+        self.apply_settings(settings, cx);
+    }
+
+    /// Applies the settings that differ from [`Self::applied_settings`] to the live workspace:
+    /// Vim mode, editor font, tiling density, dock sizes and the status bar. The theme is
+    /// switched by the host watcher, which owns the theme registry.
+    pub fn apply_settings(&mut self, settings: KovaSettings, cx: &mut Context<'_, Self>) {
+        let previous = std::mem::replace(&mut self.applied_settings, settings);
+        let next = &self.applied_settings;
+        if next.editor.vim_mode != previous.editor.vim_mode
+            && next.editor.vim_mode != self.vim_enabled
+        {
+            self.set_vim_enabled(next.editor.vim_mode, cx);
+        }
+        let next = &self.applied_settings;
+        if next.ui.focus_mode != previous.ui.focus_mode {
+            let density = if next.ui.focus_mode {
+                LayoutDensity::Tiling
+            } else {
+                LayoutDensity::Islands
+            };
+            self.set_layout_density(density, cx);
+        }
+        let next = &self.applied_settings;
+        if (next.ui.sidebar_width - previous.ui.sidebar_width).abs() > f64::EPSILON {
+            let width = f64_to_f32(next.ui.sidebar_width);
+            self.dock_layout.set_left_width(width);
+            self.dock_layout.set_right_width(width);
+        }
+        if (next.ui.bottom_panel_height - previous.ui.bottom_panel_height).abs() > f64::EPSILON {
+            self.dock_layout
+                .set_bottom_height(f64_to_f32(next.ui.bottom_panel_height));
+        }
+        self.show_status_bar = next.ui.show_status_bar;
+        if next.editor.font_family != previous.editor.font_family
+            || (next.editor.font_size - previous.editor.font_size).abs() > f64::EPSILON
+        {
+            let (family, size) = editor_font(next);
+            for pane in self.panes.values() {
+                for editor in pane.editors.values() {
+                    editor.update(cx, |editor, cx| editor.set_font(&family, size, cx));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Opens an absolute config file (`settings.toml`, `keymap.toml`) in an editor tab; the
+    /// file is read on the background executor.
+    pub fn open_config_file(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let read = cx.background_executor().spawn({
+            let path = path.clone();
+            async move {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => Ok(Some(text)),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(err) => Err(err.to_string()),
+                }
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let text = read.await;
+            this.update_in(cx, |this, window, cx| match text {
+                Ok(text) => {
+                    let buffer = text.map(|t| Buffer::from_text(&t));
+                    this.open_document(path, buffer, None, None, window, cx);
+                }
+                Err(err) => {
+                    this.report_open_error(format!("Cannot open {}: {err}", path.display()), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Enables or disables modal Vim editing in every open editor (`ToggleVimMode`).
@@ -3193,7 +3511,29 @@ impl Render for WorkspaceShell {
         let density = self.focus_tiling.density();
         let p = Palette::from_theme(cx.global::<KovaTheme>());
 
-        div()
+        let settings_overlay = if self.settings_open {
+            self.settings_view
+                .as_ref()
+                .map(|view| view.render(cx.global::<KovaTheme>(), self.viewport_px, cx))
+        } else {
+            None
+        };
+        let mut workspace = div()
+            .flex_1()
+            .w_full()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .px(px(density.outer_margin_px()))
+            .pb(px(density.outer_margin_px()))
+            .gap(px(density.island_gap_px()))
+            .child(self.render_workspace(p, cx));
+        if self.show_status_bar {
+            workspace = workspace.child(self.render_statusbar(p, cx));
+        }
+
+        let root = div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -3207,20 +3547,29 @@ impl Render for WorkspaceShell {
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .child(self.render_titlebar(p))
-            .child(
-                div()
-                    .flex_1()
-                    .w_full()
-                    .min_h(px(0.0))
-                    .flex()
-                    .flex_col()
-                    .px(px(density.outer_margin_px()))
-                    .pb(px(density.outer_margin_px()))
-                    .gap(px(density.island_gap_px()))
-                    .child(self.render_workspace(p, cx))
-                    .child(self.render_statusbar(p, cx)),
-            )
+            .child(workspace);
+        match settings_overlay {
+            Some(overlay) => root.child(overlay),
+            None => root,
+        }
     }
+}
+
+/// `(font_family, font_size_px)` of the editor from `settings`.
+fn editor_font(settings: &KovaSettings) -> (String, f32) {
+    (
+        settings.editor.font_family.clone(),
+        f64_to_f32(settings.editor.font_size),
+    )
+}
+
+/// Narrows a validated `settings.toml` dimension (always far inside `f32` range) to `f32`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "settings dimensions are validated to small ranges (6..=800)"
+)]
+const fn f64_to_f32(value: f64) -> f32 {
+    value as f32
 }
 
 /// Keys that leave Vim `INSERT` mode (`Escape`, `Ctrl+[`, `Ctrl+C`).

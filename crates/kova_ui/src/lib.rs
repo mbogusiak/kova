@@ -3,10 +3,12 @@
 //! GPU presentation layer (GPUI) — one of the only two crates allowed to depend
 //! on windowing (`kova_ui` and `kova_app`).
 
+pub mod controls;
 pub mod dock;
 pub mod document;
 pub mod editor;
 pub mod keymap;
+pub mod settings;
 pub mod shell;
 pub mod theme;
 

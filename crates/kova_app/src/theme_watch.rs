@@ -12,11 +12,13 @@ use std::time::Duration;
 
 use kova_config::{
     ConfigReloadEvent, ConfigWatcher, ConfigWatcherHandle, ConfigWatcherOptions, KovaPaths,
-    PathsError, ReloadTarget, WatcherError,
+    LiveConfigState, PathsError, ReloadTarget, WatcherError,
 };
 use kova_theme::AetherTheme;
+use kova_ui::settings::SettingsSource;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::watch;
 
 /// Debounce applied to bursts of configuration file events (spec: `~100 ms`).
 pub const THEME_RELOAD_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -33,6 +35,11 @@ pub enum ThemeWatchEvent {
     ConfigReloaded,
     /// A configuration file failed to load; the last valid theme stays active.
     Warning(String),
+    /// Fresh `settings.toml` snapshot for the Settings view (`KOVA-029`): sent at startup and
+    /// after every settings or theme reload.
+    Settings(SettingsSource),
+    /// `settings.toml` failed to reload; the Settings view shows the message in its banner.
+    SettingsInvalid(String),
 }
 
 /// Keeps the configuration watcher alive; dropping it stops live reload.
@@ -97,10 +104,21 @@ pub fn start(
         debounce: THEME_RELOAD_DEBOUNCE,
         ..ConfigWatcherOptions::default()
     };
+    let settings_path = paths.settings_file();
+    let keymap_path = paths.keymap_file();
     let handle = ConfigWatcher::start(paths, options)?;
 
     let mut state_rx = handle.subscribe_state();
     let mut events_rx = handle.subscribe_events();
+    let ids_rx = handle.subscribe_state();
+    let snapshot = SourceReader {
+        settings_path,
+        keymap_path,
+        state: ids_rx,
+    };
+    // Initial snapshot: `start` already runs on a blocking thread, so a synchronous read is fine.
+    let initial = std::fs::read_to_string(&snapshot.settings_path).ok();
+    drop(tx.send(ThemeWatchEvent::Settings(snapshot.source(initial))));
 
     let mut active = Arc::clone(&state_rx.borrow_and_update().active_theme);
     drop(tx.send(ThemeWatchEvent::ThemeChanged(Arc::clone(&active))));
@@ -126,20 +144,63 @@ pub fn start(
 
     tokio::spawn(async move {
         loop {
-            let forwarded = match events_rx.recv().await {
-                Ok(event) => warning_for(&event).map_or(ThemeWatchEvent::ConfigReloaded, |m| {
-                    ThemeWatchEvent::Warning(m)
-                }),
+            let event = match events_rx.recv().await {
+                Ok(event) => event,
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             };
-            if tx.send(forwarded).is_err() {
+            let mut forwarded = vec![
+                warning_for(&event)
+                    .map_or(ThemeWatchEvent::ConfigReloaded, ThemeWatchEvent::Warning),
+            ];
+            match &event {
+                ConfigReloadEvent::SettingsReloaded { .. }
+                | ConfigReloadEvent::ThemeReloaded { .. }
+                | ConfigReloadEvent::ThemeRemoved { .. } => {
+                    let contents = tokio::fs::read_to_string(&snapshot.settings_path)
+                        .await
+                        .ok();
+                    forwarded.push(ThemeWatchEvent::Settings(snapshot.source(contents)));
+                }
+                ConfigReloadEvent::ReloadFailed {
+                    target: ReloadTarget::Settings,
+                    message,
+                    ..
+                } => forwarded.push(ThemeWatchEvent::SettingsInvalid(message.clone())),
+                _ => {}
+            }
+            if forwarded.into_iter().any(|event| tx.send(event).is_err()) {
                 break;
             }
         }
     });
 
     Ok(ThemeWatch { handle })
+}
+
+/// Builds [`SettingsSource`] snapshots from the file contents and the live theme registry.
+struct SourceReader {
+    settings_path: PathBuf,
+    keymap_path: PathBuf,
+    state: watch::Receiver<LiveConfigState>,
+}
+
+impl SourceReader {
+    fn source(&self, contents: Option<String>) -> SettingsSource {
+        let theme_ids = self
+            .state
+            .borrow()
+            .theme_registry
+            .ids()
+            .map(str::to_owned)
+            .collect();
+        SettingsSource {
+            settings_path: self.settings_path.clone(),
+            keymap_path: self.keymap_path.clone(),
+            contents,
+            theme_ids,
+        }
+    }
 }
 
 /// Formats a status-bar warning for failed reloads; `None` for successful events.
