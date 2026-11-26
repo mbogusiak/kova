@@ -45,9 +45,17 @@ use kova_theme::SyntaxLanguage;
 mod completion;
 mod debug;
 mod git;
+mod open_project_modal;
 mod project;
 
-pub use project::SwitchProjectError;
+pub use open_project_modal::{
+    MAX_DIRTY_PREVIEW_ITEMS, OpenProjectButton, OpenProjectDirtyEntry, OpenProjectKeyOutcome,
+    OpenProjectModal, OpenProjectModalMode, ProjectHostCommand, ProjectHostSink,
+};
+pub use project::{
+    OpenProjectRequestOutcome, PendingProjectSwitch, SwitchProjectError, SwitchProjectMode,
+    canonicalize_or_raw, paths_match,
+};
 
 use crate::app_menu::{OpenProject, SearchEverywhere};
 use crate::debugger::{DebugCommandSink, DebuggerModel};
@@ -431,6 +439,12 @@ pub struct WorkspaceShell {
     viewport_px: (f32, f32),
     /// Document whose tabs `:wq` closes once its save succeeds.
     close_after_save: Option<PathBuf>,
+    /// Interactive *Open Project* modal state (`KOVA-054`).
+    open_project_modal: Option<OpenProjectModal>,
+    /// Pending *Save & Switch* batch-save state (`KOVA-054`).
+    pending_project_switch: Option<PendingProjectSwitch>,
+    /// Host callback coordinating `Recent Projects` and multi-window opens (`KOVA-054`).
+    project_host_sink: Option<ProjectHostSink>,
     /// Settings overlay state, created lazily on the first `Cmd+,` (`KOVA-029`).
     settings_view: Option<SettingsView>,
     /// Whether the Settings overlay is visible.
@@ -577,6 +591,9 @@ impl WorkspaceShell {
             vim_enabled: false,
             viewport_px: (1440.0, 900.0),
             close_after_save: None,
+            open_project_modal: None,
+            pending_project_switch: None,
+            project_host_sink: None,
             settings_view: None,
             settings_open: false,
             settings_source: None,
@@ -1816,6 +1833,28 @@ impl WorkspaceShell {
         result: Result<(), String>,
         cx: &mut Context<'_, Self>,
     ) {
+        self.finish_save_inner(ticket, result, None, cx);
+    }
+
+    /// Window-aware variant of [`Self::finish_save`] that also restores editor focus when a
+    /// pending *Save & Switch* completes (`KOVA-054`).
+    pub fn finish_save_with_window(
+        &mut self,
+        ticket: SaveTicket,
+        result: Result<(), String>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.finish_save_inner(ticket, result, Some(window), cx);
+    }
+
+    fn finish_save_inner(
+        &mut self,
+        ticket: SaveTicket,
+        result: Result<(), String>,
+        window: Option<&mut Window>,
+        cx: &mut Context<'_, Self>,
+    ) {
         let Some(key) = self
             .doc_states
             .iter()
@@ -1825,6 +1864,7 @@ impl WorkspaceShell {
             return;
         };
         let saved = result.is_ok();
+        let error_message = result.as_ref().err().cloned();
         let resave = self
             .doc_states
             .get_mut(&key)
@@ -1846,6 +1886,14 @@ impl WorkspaceShell {
                 self.close_document_tabs(&key, cx);
             }
         }
+        self.handle_pending_switch_save_finished(
+            &key,
+            ticket,
+            error_message.as_deref().map_or(Ok(()), Err),
+            resave,
+            window,
+            cx,
+        );
         cx.notify();
     }
 
@@ -2138,6 +2186,7 @@ impl WorkspaceShell {
     ) {
         let modal_open = self.settings_open
             || self.commit_panel_open
+            || self.open_project_modal.is_some()
             || self.find_in_files.is_open()
             || self.ex_line.is_some()
             || self.debugger.evaluate_modal().is_some();
@@ -2263,6 +2312,10 @@ impl WorkspaceShell {
     ) -> bool {
         if self.settings_open {
             self.handle_settings_key(keystroke, window, cx);
+            cx.stop_propagation();
+            return true;
+        }
+        if self.handle_open_project_modal_key(keystroke, window, cx) {
             cx.stop_propagation();
             return true;
         }
@@ -5694,6 +5747,10 @@ impl Render for WorkspaceShell {
             None => root,
         };
         let root = match self.render_find_in_files_overlay(cx) {
+            Some(overlay) => root.child(overlay),
+            None => root,
+        };
+        let root = match self.render_open_project_overlay(cx) {
             Some(overlay) => root.child(overlay),
             None => root,
         };
