@@ -71,6 +71,20 @@ pub enum LspDapError {
         project_root: String,
     },
 
+    /// The project is not registered in the `JdtlsSessionManager` (KOVA-038).
+    #[error("project `{project_id}` is not registered in the session manager")]
+    UnknownProject {
+        /// Identifier (workspace hash) of the unknown project.
+        project_id: String,
+    },
+
+    /// The project session was unregistered or shut down while an operation was pending (KOVA-038).
+    #[error("session for `{project_root}` was shut down")]
+    SessionShutDown {
+        /// Project root of the session.
+        project_root: String,
+    },
+
     /// A path or URI could not be converted.
     #[error("invalid document URI `{uri}`: {reason}")]
     InvalidUri {

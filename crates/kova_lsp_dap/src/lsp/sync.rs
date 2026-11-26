@@ -133,6 +133,11 @@ impl DocumentSyncTracker {
         self.documents.is_empty()
     }
 
+    /// Iterates over the open documents and their sync state (arbitrary order).
+    pub fn open_documents(&self) -> impl Iterator<Item = (&Uri, &OpenDocumentState)> {
+        self.documents.iter()
+    }
+
     /// Sends `textDocument/didOpen` with the full snapshot text.
     ///
     /// # Errors

@@ -187,6 +187,14 @@ pub struct DiagnosticSnapshot {
     pub files: Vec<DiagnosticFileSnapshot>,
 }
 
+impl DiagnosticSnapshot {
+    /// Total number of diagnostics across all files in the snapshot.
+    #[must_use]
+    pub fn diagnostics_count(&self) -> usize {
+        self.files.iter().map(|f| f.diagnostics.len()).sum()
+    }
+}
+
 #[derive(Debug, Default)]
 struct DocumentDiagnostics {
     version: Option<i32>,
@@ -331,6 +339,42 @@ impl DiagnosticsStore {
                 },
             );
         }
+    }
+
+    /// Sorted URIs of documents that currently have at least one diagnostic.
+    #[must_use]
+    pub fn uris(&self) -> Vec<String> {
+        let mut uris: Vec<String> = self
+            .read()
+            .iter()
+            .filter(|(_, doc)| !doc.entries.is_empty())
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        uris.sort();
+        uris
+    }
+
+    /// Total number of diagnostics across all documents.
+    #[must_use]
+    pub fn total_count(&self) -> usize {
+        self.read().values().map(|doc| doc.entries.len()).sum()
+    }
+
+    /// Merges one document's diagnostics from a fresh server snapshot without disturbing other
+    /// restored documents.
+    pub(crate) fn merge_file_snapshot(&self, file: DiagnosticFileSnapshot) {
+        let mut documents = self.write();
+        let stored = documents.get(&file.uri).and_then(|doc| doc.version);
+        if matches!((stored, file.version), (Some(current), Some(incoming)) if incoming < current) {
+            return;
+        }
+        documents.insert(
+            file.uri,
+            DocumentDiagnostics {
+                version: file.version,
+                entries: file.diagnostics,
+            },
+        );
     }
 
     /// Forgets the diagnostics (and version) of `uri`.
