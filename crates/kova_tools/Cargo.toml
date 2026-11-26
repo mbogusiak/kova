@@ -9,6 +9,15 @@ license.workspace      = true
 publish.workspace      = true
 
 [dependencies]
+alacritty_terminal = { workspace = true }
+kova_config        = { workspace = true }
+kova_theme         = { workspace = true }
+kova_toolchain     = { workspace = true }
+portable-pty       = { workspace = true }
+thiserror          = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

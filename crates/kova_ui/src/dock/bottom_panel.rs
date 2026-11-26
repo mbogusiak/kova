@@ -16,7 +16,7 @@ pub enum BottomTab {
     Problems,
     /// Run output log stream (`Alt+4`).
     Run,
-    /// Integrated terminal placeholder (`Alt+F12`).
+    /// Integrated PTY terminal (`Alt+F12`, `KOVA-039`).
     Terminal,
 }
 
