@@ -4,6 +4,7 @@
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
 
 pub mod download;
+pub mod env;
 pub mod error;
 pub mod java_debug;
 pub mod jdk;
@@ -15,6 +16,10 @@ pub use download::{
     ArchiveFormat, ArtifactTransport, DEFAULT_MAX_JDK_UNPACKED_BYTES,
     DEFAULT_MAX_TOOL_UNPACKED_BYTES, ProgressCallback, ProgressEvent, ReqwestTransport,
     extract_archive_safe, verify_sha256_file,
+};
+pub use env::{
+    ToolchainEnv, ToolchainEnvOptions, build_augmented_path, resolve_executable,
+    resolve_toolchain_env,
 };
 pub use error::ToolchainError;
 pub use java_debug::{JavaDebugAdapter, JavaDebugStatus, ensure_java_debug, java_debug_status};

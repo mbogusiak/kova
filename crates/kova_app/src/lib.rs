@@ -156,14 +156,23 @@ pub enum AppEvent {
     SettingsWritten(Result<(), String>),
     /// The configuration watcher could not be started.
     ConfigUnavailable(String),
-    /// A batch of `JUnit` *Test Runner* events for run `run_id` (`KOVA-040`).
+    /// A batch of `JUnit` / `Cargo` *Test Runner* events for run `run_id` (`KOVA-040`).
     TestEvents {
         /// Run identifier from the shell's request.
         run_id: u64,
         /// Events in arrival order.
         events: Vec<kova_tools::junit::TestEvent>,
     },
-    /// Compile diagnostics of one file reported by the build server (`KOVA-040`).
+    /// A batch of streamed `Build Project` events for run `run_id` (`KOVA-058`).
+    BuildEvents {
+        /// Run identifier from the shell's build request.
+        run_id: u64,
+        /// Events in arrival order.
+        events: Vec<kova_ui::BuildEvent>,
+    },
+    /// Clears previous compiler/build diagnostics at the start of a build or test run (`KOVA-058`).
+    ClearBuildProblems,
+    /// Compile diagnostics of one file reported by the build server or compiler (`KOVA-040`, `KOVA-058`).
     BuildProblems {
         /// Project-relative file.
         file: String,
@@ -512,6 +521,8 @@ pub fn handle_app_event(
             cx,
         ),
         AppEvent::TestEvents { run_id, events } => shell.apply_test_events(run_id, events, cx),
+        AppEvent::BuildEvents { run_id, events } => shell.apply_build_events(run_id, events, cx),
+        AppEvent::ClearBuildProblems => shell.clear_build_problems(cx),
         AppEvent::BuildProblems { file, problems } => {
             shell.set_build_problems(&file, problems, cx);
         }
@@ -979,7 +990,11 @@ fn install_shell_sinks(
 ) {
     shell.set_save_sink(save_sink(runtime.clone(), events.clone()));
     shell.set_settings_sink(settings_write_sink(runtime, events.clone()));
-    shell.set_test_run_sink(test_runs::test_run_sink(runtime.clone(), events.clone()));
+    let (test_sink, build_sink, cancel_sink) =
+        test_runs::run_sinks(runtime.clone(), events.clone());
+    shell.set_test_run_sink(test_sink);
+    shell.set_build_sink(build_sink);
+    shell.set_cancel_run_sink(cancel_sink);
     shell.set_debug_sink(debug_sessions::debug_command_sink(
         runtime.clone(),
         events.clone(),

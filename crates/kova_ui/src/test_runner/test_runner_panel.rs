@@ -100,7 +100,7 @@ pub fn render_empty(colors: TestRunnerColors) -> Div {
         .p(px(12.0))
         .text_size(px(12.0))
         .text_color(colors.text_muted)
-        .child("No test runs yet. Click ▶ next to a @Test method or class to run it via BSP / Gradle / Maven.")
+        .child("No test runs yet. Click ▶ next to a @Test method or class, or press Tests in the titlebar, to run via BSP / Gradle / Maven / Cargo.")
 }
 
 #[allow(

@@ -27,10 +27,11 @@ pub use debugger::{
     VariableItem,
 };
 pub use dock::{
-    BadgeVariant, BottomPanelModel, BottomTab, DockLayoutState, DockSide, DockToolId, FileIconKind,
-    FocusedRegion, PaneId, PaneRect, ProblemEntry, ProblemRow, ProblemSeverity, ProjectNode,
-    ProjectNodeKind, ProjectTreeModel, SplitAxis, SplitTree, StatusBarState, StructureModel,
-    StructureSymbolItem, TabGroupModel, TabId, TabItem, TreeActivation, VimModeBadge,
+    BadgeVariant, BottomPanelModel, BottomTab, BuildLogKind, BuildLogLine, BuildRunStatus,
+    DockLayoutState, DockSide, DockToolId, FileIconKind, FocusedRegion, PaneId, PaneRect,
+    ProblemEntry, ProblemRow, ProblemSeverity, ProjectNode, ProjectNodeKind, ProjectTreeModel,
+    SplitAxis, SplitTree, StatusBarState, StructureModel, StructureSymbolItem, TabGroupModel,
+    TabId, TabItem, TreeActivation, VimModeBadge,
 };
 pub use document::{
     CompletionOutcome, CompletionRequest, CompletionSink, DefinitionOutcome, DefinitionRequest,
@@ -45,7 +46,8 @@ pub use git::{
 pub use markdown_preview::{MarkdownPreviewEvent, MarkdownPreviewView};
 pub use plugin_ui::{PluginToolWindow, PluginUiEventSink};
 pub use shell::{
-    NewEntryKind, NewItemKeyOutcome, NewProjectItemState, OpenProjectButton, OpenProjectDirtyEntry,
+    BuildEvent, BuildRunRequest, BuildRunSink, CancelRunKind, CancelRunSink, NewEntryKind,
+    NewItemKeyOutcome, NewProjectItemState, OpenProjectButton, OpenProjectDirtyEntry,
     OpenProjectKeyOutcome, OpenProjectModal, OpenProjectModalMode, OpenProjectRequestOutcome,
     PendingProjectSwitch, ProjectHostCommand, ProjectHostSink, StartupMetrics, SwitchProjectError,
     SwitchProjectMode, WorkspaceShell, canonicalize_or_raw, create_project_item_on_disk,

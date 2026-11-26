@@ -13,16 +13,20 @@ pub mod status_bar;
 pub mod structure;
 pub mod tabs;
 
-pub use bottom_panel::{BottomPanelModel, BottomTab, ProblemEntry, ProblemRow, ProblemSeverity};
+pub use bottom_panel::{
+    BottomPanelModel, BottomTab, BuildLogKind, BuildLogLine, BuildRunStatus, ProblemEntry,
+    ProblemRow, ProblemSeverity,
+};
 pub use focus::{
     Direction, DockRestoreSnapshot, FocusModeVariant, FocusTilingController, FocusToggle,
     LayoutDensity, LayoutRect, compute_region_rects, find_neighbor_pane, region_visible,
 };
 pub use layout::{DockLayoutState, DockSide, DockToolId, FocusedRegion};
 pub use project_icons::{
-    ProjectIconPalette, render_chevron, render_collapse_all_icon, render_expand_all_icon,
-    render_file_icon, render_folder_icon, render_header_chevron, render_hide_icon,
-    render_locate_file_icon, render_new_item_icon, render_options_icon,
+    ProjectIconPalette, render_build_hammer_icon, render_chevron, render_collapse_all_icon,
+    render_expand_all_icon, render_file_icon, render_folder_icon, render_header_chevron,
+    render_hide_icon, render_locate_file_icon, render_new_item_icon, render_options_icon,
+    render_run_play_icon, render_run_tests_icon, render_stop_icon,
 };
 pub use project_tree::{
     FileIconKind, ProjectNode, ProjectNodeKind, ProjectTreeModel, TreeActivation,

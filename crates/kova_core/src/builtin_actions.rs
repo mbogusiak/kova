@@ -154,10 +154,14 @@ pub mod ids {
 
     // --- Run & Debug ---
 
+    /// Compile main and test targets of the active project.
+    pub const BUILD_BUILD_PROJECT: &str = "build.build_project";
     /// Run entry point or test at caret context.
     pub const RUN_RUN_CONTEXT: &str = "run.run_context";
     /// Re-run selected or last run configuration.
     pub const RUN_RUN_LAST: &str = "run.run_last";
+    /// Run all tests in the active project.
+    pub const RUN_RUN_ALL_TESTS: &str = "run.run_all_tests";
     /// Debug entry point or test at caret context.
     pub const RUN_DEBUG_CONTEXT: &str = "run.debug_context";
     /// Re-debug selected or last run configuration.
@@ -755,6 +759,13 @@ const BUILTIN_SPECS: &[BuiltinActionSpec] = &[
     ),
     // Run & Debug
     spec(
+        ids::BUILD_BUILD_PROJECT,
+        "Build Project",
+        ActionCategory::RunDebug,
+        "Compile project main and test targets",
+        WhenScope::Workspace,
+    ),
+    spec(
         ids::RUN_RUN_CONTEXT,
         "Run Context Configuration",
         ActionCategory::RunDebug,
@@ -766,6 +777,13 @@ const BUILTIN_SPECS: &[BuiltinActionSpec] = &[
         "Run Selected Configuration",
         ActionCategory::RunDebug,
         "Run the active or most recent run configuration",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::RUN_RUN_ALL_TESTS,
+        "Run All Tests",
+        ActionCategory::RunDebug,
+        "Run all tests in the project",
         WhenScope::Workspace,
     ),
     spec(

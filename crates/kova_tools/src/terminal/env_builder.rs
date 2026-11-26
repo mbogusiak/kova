@@ -11,7 +11,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use kova_config::{EffectiveConfig, KovaPaths, KovaSettings, ProjectConfig};
-use kova_toolchain::{JdkDiscoveryRoots, discover_jdks, select_project_jdk};
+use kova_toolchain::{JdkDiscoveryRoots, build_augmented_path, discover_jdks, select_project_jdk};
 
 /// `TERM` advertised to programs running inside the terminal.
 pub const TERM_VALUE: &str = "xterm-256color";
@@ -46,10 +46,17 @@ impl TerminalEnv {
         env
     }
 
-    /// Builds the overrides from the real process environment.
+    /// Builds the overrides from the real process environment, injecting an augmented `PATH`
+    /// (Homebrew, SDKMAN, Cargo, `<JAVA_HOME>/bin`) consistent with the build/test runners.
     #[must_use]
     pub fn from_process(java_home: Option<&Path>) -> Self {
-        Self::build(java_home, |key| std::env::var_os(key))
+        let mut env = Self::build(java_home, |key| std::env::var_os(key));
+        let base_path = std::env::var_os("PATH");
+        let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+        let augmented =
+            build_augmented_path(java_home, base_path.as_deref(), home_dir.as_deref(), &[]);
+        env.set("PATH", augmented);
+        env
     }
 
     /// Sets (or replaces) one variable.

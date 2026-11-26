@@ -685,3 +685,64 @@ pub fn render_hide_icon(color: Hsla) -> AnyElement {
         stroke_segments(window, 1.35, color, &[&[(3.5, 8.0), (12.5, 8.0)]], ox, oy);
     })
 }
+
+/// Renders a crisp `14×14 px` hammer (`Build Project`) vector icon for the titlebar toolbar.
+#[must_use]
+pub fn render_build_hammer_icon(color: Hsla) -> AnyElement {
+    vector_icon(14.0, 14.0, move |ox, oy, window| {
+        // Angled hammer head + diagonal handle.
+        fill_polygon(
+            window,
+            color,
+            &[(2.2, 5.2), (5.4, 2.0), (8.8, 5.4), (5.6, 8.6)],
+            ox,
+            oy,
+        );
+        fill_polygon(
+            window,
+            color,
+            &[(7.2, 4.0), (9.4, 1.8), (10.5, 2.9), (8.3, 5.1)],
+            ox,
+            oy,
+        );
+        stroke_segments(window, 2.1, color, &[&[(6.8, 6.8), (11.8, 11.8)]], ox, oy);
+    })
+}
+
+/// Renders a crisp `12×12 px` green play triangle (`Run`) vector icon.
+#[must_use]
+pub fn render_run_play_icon(color: Hsla) -> AnyElement {
+    vector_icon(12.0, 12.0, move |ox, oy, window| {
+        fill_polygon(
+            window,
+            color,
+            &[(2.5, 1.8), (10.2, 6.0), (2.5, 10.2)],
+            ox,
+            oy,
+        );
+    })
+}
+
+/// Renders a `14×14 px` `Run All Tests` vector icon (play triangle + check accent).
+#[must_use]
+pub fn render_run_tests_icon(color: Hsla) -> AnyElement {
+    vector_icon(14.0, 14.0, move |ox, oy, window| {
+        fill_polygon(window, color, &[(1.8, 2.2), (8.2, 6.0), (1.8, 9.8)], ox, oy);
+        stroke_segments(
+            window,
+            1.5,
+            color,
+            &[&[(7.2, 10.2), (9.2, 12.2), (12.8, 7.6)]],
+            ox,
+            oy,
+        );
+    })
+}
+
+/// Renders a `12×12 px` stop square (`■`) vector icon.
+#[must_use]
+pub fn render_stop_icon(color: Hsla) -> AnyElement {
+    vector_icon(12.0, 12.0, move |ox, oy, window| {
+        paint_rounded_rect(window, (ox, oy), (2.2, 2.2, 7.6, 7.6), 1.4, color);
+    })
+}

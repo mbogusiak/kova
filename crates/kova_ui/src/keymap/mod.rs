@@ -278,10 +278,14 @@ pub enum ShellAction {
     FindPrev,
     /// Open workspace-wide *Find in Files* modal (`Cmd+Shift+F` / `Ctrl+Shift+F`).
     FindInFiles,
+    /// Compile main and test targets of the active project (`Cmd+F9` / `Ctrl+F9`).
+    BuildProject,
     /// Run entry point at caret context (`Ctrl+Shift+R` / `Ctrl+Shift+F10`).
     RunContext,
     /// Re-run last executed configuration or entry point (`Ctrl+R` / `Shift+F10`).
     RunLast,
+    /// Run all tests in the active project.
+    RunAllTests,
     /// JVM debugger command (`KOVA-041`).
     Debug(DebugShellAction),
 }
@@ -381,8 +385,10 @@ impl ShellAction {
             ids::NAVIGATION_SEARCH_EVERYWHERE => Self::OpenSearchEverywhere,
             ids::VIEW_OPEN_SETTINGS => Self::OpenSettings,
             ids::GIT_COMMIT => Self::ToggleCommitPanel,
+            ids::BUILD_BUILD_PROJECT => Self::BuildProject,
             ids::RUN_RUN_CONTEXT => Self::RunContext,
             ids::RUN_RUN_LAST => Self::RunLast,
+            ids::RUN_RUN_ALL_TESTS => Self::RunAllTests,
             ids::DEBUG_TOGGLE_LINE_BREAKPOINT => Self::Debug(DebugShellAction::ToggleBreakpoint),
             ids::DEBUG_STEP_OVER => Self::Debug(DebugShellAction::StepOver),
             ids::DEBUG_STEP_INTO => Self::Debug(DebugShellAction::StepInto),
