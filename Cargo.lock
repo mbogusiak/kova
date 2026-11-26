@@ -3116,9 +3116,14 @@ name = "kova_app"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "kova_buffer",
+ "kova_config",
  "kova_core",
  "kova_theme",
  "kova_ui",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

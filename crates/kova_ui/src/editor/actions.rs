@@ -10,6 +10,17 @@ use gpui::{App, KeyBinding};
 /// Key context set on the editor root element; default bindings apply only inside it.
 pub const EDITOR_KEY_CONTEXT: &str = "KovaEditor";
 
+/// Key context set on the workspace shell root (window-wide commands such as `Save`).
+pub const WORKSPACE_KEY_CONTEXT: &str = "KovaWorkspace";
+
+gpui::actions!(
+    kova_workspace,
+    [
+        /// Atomically saves the active document (`Cmd+S` / `Ctrl+S`, `KOVA-016`).
+        Save,
+    ]
+);
+
 gpui::actions!(
     kova_editor,
     [
@@ -38,12 +49,15 @@ gpui::actions!(
     ]
 );
 
-/// Returns the Phase 0 platform bindings (`Cmd` on macOS, `Ctrl` elsewhere) for editor actions.
+/// Returns the Phase 0 platform bindings (`Cmd` on macOS, `Ctrl` elsewhere) for editor and
+/// workspace actions.
 #[must_use]
 pub fn default_key_bindings() -> Vec<KeyBinding> {
     let ctx = Some(EDITOR_KEY_CONTEXT);
+    let workspace = Some(WORKSPACE_KEY_CONTEXT);
     if cfg!(target_os = "macos") {
         vec![
+            KeyBinding::new("cmd-s", Save, workspace),
             KeyBinding::new("cmd-c", Copy, ctx),
             KeyBinding::new("cmd-x", Cut, ctx),
             KeyBinding::new("cmd-v", Paste, ctx),
@@ -53,6 +67,7 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         ]
     } else {
         vec![
+            KeyBinding::new("ctrl-s", Save, workspace),
             KeyBinding::new("ctrl-c", Copy, ctx),
             KeyBinding::new("ctrl-x", Cut, ctx),
             KeyBinding::new("ctrl-v", Paste, ctx),

@@ -4,6 +4,7 @@
 //! on windowing (`kova_ui` and `kova_app`).
 
 pub mod dock;
+pub mod document;
 pub mod editor;
 pub mod shell;
 pub mod theme;
@@ -14,10 +15,11 @@ pub use dock::{
     ProjectNodeKind, ProjectTreeModel, SplitAxis, SplitTree, StatusBarState, StructureModel,
     StructureSymbolItem, TabGroupModel, TabId, TabItem, TreeActivation, VimModeBadge,
 };
+pub use document::{DocumentState, SaveRequest, SaveSink, SaveStatus, SaveTicket, StatusKind};
 pub use editor::shared::SharedBuffer;
 pub use editor::{EditorEvent, EditorView};
 pub use shell::{StartupMetrics, WorkspaceShell};
-pub use theme::{KovaTheme, ThemeState, hsla_from_rgba, rgba_to_gpui};
+pub use theme::{KovaTheme, ThemeState, apply_live_theme, hsla_from_rgba, rgba_to_gpui};
 
 /// Name of this crate as declared in its `Cargo.toml`.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

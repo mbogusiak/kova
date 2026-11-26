@@ -158,6 +158,24 @@ impl KovaTheme {
     }
 }
 
+/// Installs `theme` as the global [`KovaTheme`] (bumping its revision) and repaints every
+/// window; editors drop their shaped-line caches on the revision change (`KOVA-016`).
+///
+/// Returns `false` (and does nothing) when `theme` equals the active theme.
+pub fn apply_live_theme(theme: Arc<AetherTheme>, cx: &mut gpui::App) -> bool {
+    let (unchanged, revision) = cx.try_global::<KovaTheme>().map_or((false, 0), |current| {
+        (
+            Arc::ptr_eq(&current.active, &theme) || *current.active == *theme,
+            current.revision.saturating_add(1),
+        )
+    });
+    if unchanged {
+        return false;
+    }
+    cx.set_global(KovaTheme::from_aether(theme, revision));
+    cx.refresh_windows();
+    true
+}
 /// Losslessly converts an 8-bit sRGB [`RgbaColor`] to a normalized [`gpui::Rgba`].
 #[must_use]
 pub fn rgba_to_gpui(color: RgbaColor) -> gpui::Rgba {

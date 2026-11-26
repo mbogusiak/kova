@@ -2,6 +2,15 @@
 //!
 //! This crate is the application entry point and one of the only two crates
 //! allowed to depend on GPU windowing (`kova_ui` and `kova_app`).
+//!
+//! Phase 0 integration (`KOVA-016`): CLI file opening ([`cli`]), non-blocking load and
+//! atomic `Cmd+S` / `Ctrl+S` saves on a 2-worker `tokio` runtime ([`io`]), and live theme
+//! reload from `settings.toml` through `kova_config::ConfigWatcher` ([`theme_watch`]).
+//! All background work starts only after the first frame, keeping cold start `< 120 ms`.
+
+pub mod cli;
+pub mod io;
+pub mod theme_watch;
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -11,13 +20,22 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use gpui::{
-    App, AppContext as _, Application, Bounds, TitlebarOptions, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, point, px, size,
+    App, AppContext as _, Application, AsyncApp, Bounds, TitlebarOptions,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, point, px, size,
 };
-use kova_ui::{KovaTheme, StartupMetrics, WorkspaceShell};
+use kova_ui::{KovaTheme, SaveRequest, SaveSink, StartupMetrics, StatusKind, WorkspaceShell};
+use tokio::runtime::{Handle, Runtime};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::cli::FileTarget;
+use crate::io::{FileLoadError, LoadedFile};
+use crate::theme_watch::ThemeWatchEvent;
 
 /// Name of this crate as declared in its `Cargo.toml`.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// Number of `tokio` worker threads (file I/O + config watcher) kept small for the RAM budget.
+pub const IO_WORKER_THREADS: usize = 2;
 
 const DEFAULT_WINDOW_WIDTH_PX: f32 = 1280.0;
 const DEFAULT_WINDOW_HEIGHT_PX: f32 = 800.0;
@@ -61,15 +79,6 @@ impl AppLaunchOptions {
     }
 }
 
-/// Returns the first non-flag CLI argument naming an existing directory: the project root
-/// shown in the *Project* dock (scanned off-thread after the first frame).
-fn project_root_arg(args: impl IntoIterator<Item = String>) -> Option<PathBuf> {
-    args.into_iter()
-        .find(|arg| !arg.starts_with("--"))
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
-}
-
 fn env_flag_enabled(key: &str) -> bool {
     std::env::var(key).is_ok_and(|value| {
         let trimmed = value.trim();
@@ -82,8 +91,227 @@ pub fn run() -> ExitCode {
     run_with_options(Instant::now(), AppLaunchOptions::from_env_and_args())
 }
 
+/// What the window should open with, as parsed from the command line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchRequest {
+    /// File to open (`None` keeps the built-in welcome document).
+    pub target: Option<FileTarget>,
+    /// Project directory shown in the *Project* dock (`kova <project-dir>`, `KOVA-025`).
+    pub project_root: Option<PathBuf>,
+    /// Configuration directory override (`--config-dir`).
+    pub config_dir_override: Option<PathBuf>,
+}
+
+impl LaunchRequest {
+    /// Builds the request from the parsed positional argument: an existing directory becomes
+    /// the project root (`kova <project-dir>`), anything else the file to open.
+    #[must_use]
+    pub fn from_cli(target: Option<FileTarget>, config_dir_override: Option<PathBuf>) -> Self {
+        match target {
+            Some(dir) if dir.path.is_dir() => Self {
+                target: None,
+                project_root: Some(dir.path),
+                config_dir_override,
+            },
+            target => Self {
+                target,
+                project_root: None,
+                config_dir_override,
+            },
+        }
+    }
+}
+
+/// Results delivered from `tokio` tasks to the GPUI foreground thread.
+#[derive(Debug)]
+pub enum AppEvent {
+    /// The CLI file finished loading (or failed to load).
+    FileLoaded {
+        /// The requested file and cursor position.
+        target: FileTarget,
+        /// Load outcome.
+        result: Result<LoadedFile, FileLoadError>,
+    },
+    /// A background save finished.
+    SaveFinished {
+        /// Ticket of the save request.
+        ticket: kova_ui::SaveTicket,
+        /// `Err` carries a human-readable I/O error.
+        result: Result<(), String>,
+    },
+    /// Theme or configuration update from the config watcher.
+    Theme(ThemeWatchEvent),
+    /// The configuration watcher could not be started.
+    ConfigUnavailable(String),
+}
+
+/// Builds the `tokio` runtime used for editor I/O ([`IO_WORKER_THREADS`] workers).
+///
+/// # Errors
+///
+/// Returns the OS error when worker threads cannot be spawned.
+pub fn build_io_runtime() -> std::io::Result<Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(IO_WORKER_THREADS)
+        .max_blocking_threads(IO_WORKER_THREADS * 2)
+        .thread_name("kova-io")
+        .enable_all()
+        .build()
+}
+
+/// Creates the [`SaveSink`] that writes snapshots atomically on `runtime` and reports
+/// [`AppEvent::SaveFinished`] through `events`.
+#[must_use]
+pub fn save_sink(runtime: Handle, events: mpsc::UnboundedSender<AppEvent>) -> SaveSink {
+    Arc::new(move |request: SaveRequest| {
+        let events = events.clone();
+        runtime.spawn(async move {
+            let SaveRequest {
+                path,
+                snapshot,
+                ticket,
+            } = request;
+            let result = io::atomic_write_snapshot(&path, snapshot)
+                .await
+                .map_err(|err| err.to_string());
+            drop(events.send(AppEvent::SaveFinished { ticket, result }));
+        });
+    })
+}
+
+/// Starts the post-first-frame background work: loading the CLI file and the
+/// configuration watcher bridge. Never blocks the caller.
+pub fn spawn_background_work(
+    runtime: &Handle,
+    request: LaunchRequest,
+    events: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if let Some(target) = request.target {
+        let events = events.clone();
+        runtime.spawn(async move {
+            let result = io::load_file_for_editor(&target.path).await;
+            drop(events.send(AppEvent::FileLoaded { target, result }));
+        });
+    }
+
+    let events = events.clone();
+    let config_dir = request.config_dir_override;
+    runtime.spawn(async move {
+        let paths = match theme_watch::resolve_paths(config_dir.as_deref()) {
+            Ok(paths) => paths,
+            Err(err) => {
+                drop(events.send(AppEvent::ConfigUnavailable(err.to_string())));
+                return;
+            }
+        };
+        let (theme_tx, mut theme_rx) = mpsc::unbounded_channel();
+        // The watcher's initial scan is synchronous disk I/O: keep it off the async workers.
+        let started =
+            tokio::task::spawn_blocking(move || theme_watch::start(paths, theme_tx)).await;
+        let watch = match started {
+            Ok(Ok(watch)) => watch,
+            Ok(Err(err)) => {
+                drop(events.send(AppEvent::ConfigUnavailable(err.to_string())));
+                return;
+            }
+            Err(err) => {
+                drop(events.send(AppEvent::ConfigUnavailable(err.to_string())));
+                return;
+            }
+        };
+        // Keeps `watch` alive for as long as the app listens for events.
+        while let Some(event) = theme_rx.recv().await {
+            if events.send(AppEvent::Theme(event)).is_err() {
+                break;
+            }
+        }
+        drop(watch);
+    });
+}
+
+/// Applies one [`AppEvent`] to the workspace shell on the GPUI thread.
+pub fn handle_app_event(
+    shell: &mut WorkspaceShell,
+    event: AppEvent,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<'_, WorkspaceShell>,
+) {
+    match event {
+        AppEvent::FileLoaded { target, result } => match result {
+            Ok(LoadedFile::Existing { path, buffer }) => {
+                shell.open_document(path, Some(buffer), target.line, target.column, window, cx);
+            }
+            Ok(LoadedFile::NewFile { path }) => {
+                shell.open_document(path, None, target.line, target.column, window, cx);
+            }
+            Err(err) => shell.report_open_error(err.to_string(), cx),
+        },
+        AppEvent::SaveFinished { ticket, result } => shell.finish_save(ticket, result, cx),
+        AppEvent::Theme(ThemeWatchEvent::ThemeChanged(theme)) => {
+            kova_ui::apply_live_theme(theme, cx);
+            shell.clear_notice(cx);
+        }
+        AppEvent::Theme(ThemeWatchEvent::ConfigReloaded) => shell.clear_notice(cx),
+        AppEvent::Theme(ThemeWatchEvent::Warning(message)) => {
+            shell.set_notice(StatusKind::Warning, message, cx);
+        }
+        AppEvent::ConfigUnavailable(message) => shell.set_notice(
+            StatusKind::Warning,
+            format!("Live config reload unavailable: {message}"),
+            cx,
+        ),
+    }
+}
+
+async fn pump_app_events(
+    window: WindowHandle<WorkspaceShell>,
+    first_frame: oneshot::Receiver<()>,
+    runtime: Handle,
+    request: LaunchRequest,
+    events_tx: mpsc::UnboundedSender<AppEvent>,
+    mut events_rx: mpsc::UnboundedReceiver<AppEvent>,
+    cx: &mut AsyncApp,
+) {
+    if first_frame.await.is_err() {
+        return;
+    }
+    spawn_background_work(&runtime, request, &events_tx);
+    drop(events_tx);
+    while let Some(event) = events_rx.recv().await {
+        let applied = window.update(cx, |shell, window, cx| {
+            handle_app_event(shell, event, window, cx);
+        });
+        if applied.is_err() {
+            break;
+        }
+    }
+}
+
 /// Starts the Kova IDE GPUI application using a caller-supplied `process_start` timestamp.
 pub fn run_with_options(process_start: Instant, options: AppLaunchOptions) -> ExitCode {
+    run_cli(process_start, options, LaunchRequest::default())
+}
+
+/// Starts Kova with an explicit [`LaunchRequest`] parsed from the command line.
+///
+/// The window opens immediately with the built-in theme and an empty buffer; the CLI
+/// file and `settings.toml` are loaded on the `tokio` runtime after the first frame.
+pub fn run_cli(
+    process_start: Instant,
+    options: AppLaunchOptions,
+    request: LaunchRequest,
+) -> ExitCode {
+    let runtime = match build_io_runtime() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            write_stderr(&format!("failed to start Kova I/O runtime: {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime_handle = runtime.handle().clone();
+    let (events_tx, events_rx) = mpsc::unbounded_channel::<AppEvent>();
+    let (first_frame_tx, first_frame_rx) = oneshot::channel::<()>();
+
     let report_cell = Arc::new(OnceLock::<StartupMetrics>::new());
     let report_for_shell = Arc::clone(&report_cell);
 
@@ -93,7 +321,7 @@ pub fn run_with_options(process_start: Instant, options: AppLaunchOptions) -> Ex
     let open_failed = Arc::new(AtomicBool::new(false));
     let open_failed_for_app = Arc::clone(&open_failed);
 
-    let project_root = project_root_arg(std::env::args().skip(1));
+    let project_root = request.project_root.clone();
 
     Application::new().run(move |cx: &mut App| {
         cx.set_global(KovaTheme::islands_dark());
@@ -106,10 +334,11 @@ pub fn run_with_options(process_start: Instant, options: AppLaunchOptions) -> Ex
         })
         .detach();
 
+        let sink = save_sink(runtime_handle.clone(), events_tx.clone());
         let open_result = cx.open_window(default_window_options(cx), move |_, cx| {
             cx.activate(true);
             cx.new(move |cx| {
-                let shell = WorkspaceShell::with_probe(
+                let mut shell = WorkspaceShell::with_probe(
                     process_start,
                     options.exit_after_first_frame,
                     Some(Box::new(move |metrics| {
@@ -119,9 +348,11 @@ pub fn run_with_options(process_start: Instant, options: AppLaunchOptions) -> Ex
                             &report_for_shell,
                             &probe_printed_for_shell,
                         );
+                        let _ = first_frame_tx.send(());
                     })),
                     cx,
                 );
+                shell.set_save_sink(sink);
                 match project_root {
                     Some(root) => shell.with_project_root(root),
                     None => shell,
@@ -129,7 +360,23 @@ pub fn run_with_options(process_start: Instant, options: AppLaunchOptions) -> Ex
             })
         });
 
-        if let Err(err) = open_result {
+        match open_result {
+            Ok(window) => {
+                cx.spawn(async move |cx| {
+                    pump_app_events(
+                        window,
+                        first_frame_rx,
+                        runtime_handle,
+                        request,
+                        events_tx,
+                        events_rx,
+                        cx,
+                    )
+                    .await;
+                })
+                .detach();
+            }
+            Err(err) => {
             open_failed_for_app.store(true, Ordering::Release);
             write_stderr(&format!("failed to open Kova window: {err}"));
             #[cfg(target_os = "macos")]
@@ -142,8 +389,12 @@ pub fn run_with_options(process_start: Instant, options: AppLaunchOptions) -> Ex
             }
             #[cfg(not(target_os = "macos"))]
             cx.quit();
+            }
         }
     });
+
+    // Background tasks are cancelled; pending writes finish on their own blocking threads.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
 
     finalize_launch(
         options,
@@ -253,7 +504,8 @@ mod tests {
 
     use kova_ui::StartupMetrics;
 
-    use super::{AppLaunchOptions, CRATE_NAME, finalize_launch, project_root_arg};
+    use super::{AppLaunchOptions, CRATE_NAME, LaunchRequest, finalize_launch};
+    use crate::cli::FileTarget;
 
     #[test]
     fn crate_name_matches_manifest() {
@@ -266,14 +518,25 @@ mod tests {
     }
 
     #[test]
-    fn project_root_arg_skips_flags_and_requires_a_directory() {
-        let dir = env!("CARGO_MANIFEST_DIR").to_owned();
-        let args = vec!["--probe-startup".to_owned(), dir.clone()];
-        assert_eq!(project_root_arg(args), Some(dir.into()));
-        assert_eq!(project_root_arg(vec!["--probe-startup".to_owned()]), None);
+    fn launch_request_maps_a_directory_to_the_project_root() {
+        let target = |path: &str| FileTarget {
+            path: path.into(),
+            line: None,
+            column: None,
+        };
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let request = LaunchRequest::from_cli(Some(target(dir)), Some("/cfg".into()));
+        assert_eq!(request.target, None);
+        assert_eq!(request.project_root, Some(dir.into()));
+        assert_eq!(request.config_dir_override, Some("/cfg".into()));
+
+        let file = target("/definitely/not/a/kova/File.java");
+        let request = LaunchRequest::from_cli(Some(file.clone()), None);
+        assert_eq!(request.target, Some(file));
+        assert_eq!(request.project_root, None);
         assert_eq!(
-            project_root_arg(vec!["/definitely/not/a/kova/dir".to_owned()]),
-            None
+            LaunchRequest::from_cli(None, None),
+            LaunchRequest::default()
         );
     }
 

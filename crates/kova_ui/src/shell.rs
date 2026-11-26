@@ -41,6 +41,10 @@ use crate::dock::{
     SplitAxis, SplitTree, StatusBarState, StructureModel, TabGroupModel, TabId, TabItem,
     TreeActivation, VimModeBadge,
 };
+use crate::document::{
+    DocumentState, SAVE_PATH_REQUIRED_MESSAGE, SaveAction, SaveSink, SaveTicket, StatusKind,
+};
+use crate::editor::actions::{Save, WORKSPACE_KEY_CONTEXT};
 use crate::editor::{EditorEvent, EditorView, SharedBuffer};
 use crate::theme::{KovaTheme, hsla_from_rgba};
 
@@ -316,6 +320,14 @@ pub struct WorkspaceShell {
     panes: HashMap<PaneId, PaneState>,
     active_pane: PaneId,
     documents: HashMap<PathBuf, SharedBuffer>,
+    /// Persistence state per open document, keyed like [`Self::documents`] (`KOVA-016`).
+    doc_states: HashMap<PathBuf, DocumentState>,
+    save_sink: Option<SaveSink>,
+    /// Document-level message (open failure, missing save path); cleared by the next save.
+    doc_notice: Option<(StatusKind, String)>,
+    /// Configuration warning (e.g. invalid `settings.toml`); cleared by the next good reload.
+    config_notice: Option<(StatusKind, String)>,
+    window_title: String,
     status_bar: StatusBarState,
     focus_handle: FocusHandle,
     drag: Option<DragState>,
@@ -375,6 +387,12 @@ impl WorkspaceShell {
 
         let mut panes = HashMap::new();
         panes.insert(root_pane, pane);
+        let mut doc_states = HashMap::new();
+        // The welcome buffer has no file on disk: `Cmd+S` asks for a path (*Save As*).
+        doc_states.insert(
+            welcome_path.clone(),
+            DocumentState::opened(None, welcome_buffer.version().as_u64(), false),
+        );
         let mut documents = HashMap::new();
         documents.insert(welcome_path, welcome_buffer);
 
@@ -401,6 +419,11 @@ impl WorkspaceShell {
             panes,
             active_pane: root_pane,
             documents,
+            doc_states,
+            save_sink: None,
+            doc_notice: None,
+            config_notice: None,
+            window_title: String::new(),
             status_bar: StatusBarState {
                 vim_mode: VimModeBadge::Off,
                 ..StatusBarState::default()
@@ -647,11 +670,7 @@ impl WorkspaceShell {
                     }
                 }
                 if let Some(path) = dirty_path {
-                    for state in self.panes.values_mut() {
-                        if let Some(id) = state.tabs.find_by_path(&path).map(|t| t.id) {
-                            state.tabs.set_dirty(id, true);
-                        }
-                    }
+                    self.sync_dirty_flag(&path);
                 }
                 self.refresh_analysis(ANALYSIS_DEBOUNCE, cx);
                 cx.notify();
@@ -720,12 +739,17 @@ impl WorkspaceShell {
                 rel.display()
             );
             let buffer = SharedBuffer::new(Buffer::from_text(&text));
+            self.doc_states.insert(
+                rel.clone(),
+                DocumentState::opened(None, buffer.version().as_u64(), false),
+            );
             self.documents.insert(rel.clone(), buffer.clone());
             self.show_document(&rel, buffer, position, window, cx);
             return;
         };
+        let abs = root.join(&rel);
         let read = cx.background_executor().spawn({
-            let abs = root.join(&rel);
+            let abs = abs.clone();
             async move { std::fs::read_to_string(abs) }
         });
         cx.spawn_in(window, async move |this, cx| {
@@ -737,6 +761,10 @@ impl WorkspaceShell {
                         .entry(rel.clone())
                         .or_insert_with(|| SharedBuffer::new(Buffer::from_text(&text)))
                         .clone();
+                    let revision = buffer.version().as_u64();
+                    this.doc_states
+                        .entry(rel.clone())
+                        .or_insert_with(|| DocumentState::opened(Some(abs), revision, false));
                     this.show_document(&rel, buffer, position, window, cx);
                 }
                 Err(err) => {
@@ -855,6 +883,251 @@ impl WorkspaceShell {
                 .values()
                 .any(|pane| pane.tabs.find_by_path(path).is_some())
         });
+        let documents = &self.documents;
+        self.doc_states
+            .retain(|path, _| documents.contains_key(path));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Document persistence: CLI open, `Cmd+S` / `Ctrl+S` saves, status notices (`KOVA-016`)
+    // ---------------------------------------------------------------------------------------
+
+    /// Installs the callback that persists [`crate::SaveRequest`]s off the UI thread.
+    pub fn set_save_sink(&mut self, sink: SaveSink) {
+        self.save_sink = Some(sink);
+    }
+
+    /// Returns the persistence state of the document shown in the active tab.
+    #[must_use]
+    pub fn active_document_state(&self) -> Option<&DocumentState> {
+        let key = self.active_document_key()?;
+        self.doc_states.get(&key)
+    }
+
+    /// Returns `true` when the document in the active tab has unsaved changes.
+    #[must_use]
+    pub fn is_active_document_dirty(&self) -> bool {
+        self.active_document_key()
+            .is_some_and(|key| self.is_document_dirty(&key))
+    }
+
+    fn active_document_key(&self) -> Option<PathBuf> {
+        self.panes
+            .get(&self.active_pane)?
+            .tabs
+            .active_tab()?
+            .path
+            .clone()
+    }
+
+    fn is_document_dirty(&self, key: &Path) -> bool {
+        match (self.doc_states.get(key), self.documents.get(key)) {
+            (Some(doc), Some(buffer)) => doc.is_dirty(buffer.version().as_u64()),
+            _ => false,
+        }
+    }
+
+    /// Recomputes the tab dirty marker of `key` in every pane from its saved revision.
+    fn sync_dirty_flag(&mut self, key: &Path) {
+        let dirty = match (self.doc_states.get(key), self.documents.get(key)) {
+            (Some(doc), Some(buffer)) => doc.is_dirty(buffer.version().as_u64()),
+            _ => true,
+        };
+        for state in self.panes.values_mut() {
+            if let Some(id) = state.tabs.find_by_path(key).map(|t| t.id) {
+                state.tabs.set_dirty(id, dirty);
+            }
+        }
+    }
+
+    /// Shows a document passed on the command line: loaded from disk (`buffer = Some`) or a
+    /// new, not yet existing file (`buffer = None`) at `path`, then jumps to the optional
+    /// 1-based `line` / `column` with the line centered in the viewport.
+    pub fn open_document(
+        &mut self,
+        path: PathBuf,
+        buffer: Option<Buffer>,
+        line: Option<usize>,
+        column: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let key = self
+            .project_root
+            .as_deref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .map_or_else(|| path.clone(), Path::to_path_buf);
+        let shared = if let Some(existing) = self.documents.get(&key) {
+            existing.clone()
+        } else {
+            let is_new_file = buffer.is_none();
+            let shared = SharedBuffer::new(buffer.unwrap_or_default());
+            self.doc_states.insert(
+                key.clone(),
+                DocumentState::opened(Some(path), shared.version().as_u64(), is_new_file),
+            );
+            self.documents.insert(key.clone(), shared.clone());
+            shared
+        };
+        self.show_document(&key, shared, None, window, cx);
+        if let Some(line) = line
+            && let Some(editor) = self.active_editor().cloned()
+        {
+            editor.update(cx, |editor, cx| editor.go_to_line_column(line, column, cx));
+        }
+        cx.notify();
+    }
+
+    /// Reports a document that could not be opened (directory, non-UTF-8, I/O error); no tab
+    /// is created, so the unreadable file can never be overwritten by an accidental save.
+    pub fn report_open_error(&mut self, message: String, cx: &mut Context<'_, Self>) {
+        self.bottom_panel.run_logs.push(message.clone());
+        self.doc_notice = Some((StatusKind::Error, message));
+        cx.notify();
+    }
+
+    /// Shows a configuration notice in the status bar (e.g. an invalid `settings.toml`).
+    pub fn set_notice(&mut self, kind: StatusKind, message: String, cx: &mut Context<'_, Self>) {
+        self.config_notice = Some((kind, message));
+        cx.notify();
+    }
+
+    /// Clears the configuration notice set by [`Self::set_notice`].
+    pub fn clear_notice(&mut self, cx: &mut Context<'_, Self>) {
+        if self.config_notice.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Applies the result of a background save started by `Cmd+S` / `Ctrl+S`.
+    ///
+    /// The ticket identifies the document that issued the save, whichever tab is active now;
+    /// results for documents closed in the meantime are ignored.
+    pub fn finish_save(
+        &mut self,
+        ticket: SaveTicket,
+        result: Result<(), String>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(key) = self
+            .doc_states
+            .iter()
+            .find(|(_, doc)| doc.generation() == ticket.generation)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        let resave = self
+            .doc_states
+            .get_mut(&key)
+            .is_some_and(|doc| doc.finish_save(ticket, result));
+        if resave {
+            // Edits happened while the previous save ran and another save was requested.
+            self.dispatch_save(&key, cx);
+        }
+        self.sync_dirty_flag(&key);
+        cx.notify();
+    }
+
+    fn save_action(&mut self, _: &Save, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(key) = self.active_document_key() else {
+            return;
+        };
+        let has_path = self
+            .doc_states
+            .get(&key)
+            .is_some_and(|doc| doc.path.is_some());
+        if has_path {
+            self.dispatch_save(&key, cx);
+        } else {
+            Self::prompt_save_path(key, window, cx);
+        }
+    }
+
+    /// Hands the current snapshot of `key` to the save sink without touching the disk.
+    fn dispatch_save(&mut self, key: &Path, cx: &mut Context<'_, Self>) {
+        let Some(snapshot) = self.documents.get(key).map(SharedBuffer::snapshot) else {
+            return;
+        };
+        let Some(doc) = self.doc_states.get_mut(key) else {
+            return;
+        };
+        match doc.begin_save(snapshot) {
+            SaveAction::Dispatch(request) => {
+                if let Some(sink) = &self.save_sink {
+                    sink(request);
+                } else {
+                    doc.finish_save(request.ticket, Err("Saving is not available".to_owned()));
+                }
+                self.doc_notice = None;
+            }
+            SaveAction::Queued => {}
+            SaveAction::NeedsPath => {
+                self.doc_notice =
+                    Some((StatusKind::Warning, SAVE_PATH_REQUIRED_MESSAGE.to_owned()));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Asks for a target path for a document without a file (welcome / demo buffer) via the
+    /// native *Save As* dialog, falling back to a status-bar hint when the platform cannot
+    /// show one.
+    fn prompt_save_path(key: PathBuf, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let directory = std::env::current_dir().unwrap_or_default();
+        let suggested = key.file_name().map_or_else(
+            || "Untitled.java".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let receiver = cx.prompt_for_new_path(&directory, Some(&suggested));
+        cx.spawn_in(window, async move |this, cx| {
+            let chosen = receiver.await;
+            drop(this.update(cx, |shell, cx| match chosen {
+                Ok(Ok(Some(path))) => {
+                    if let Some(doc) = shell.doc_states.get_mut(&key) {
+                        doc.set_path(path);
+                    }
+                    shell.dispatch_save(&key, cx);
+                }
+                Ok(Ok(None)) => {}
+                _ => {
+                    shell.doc_notice =
+                        Some((StatusKind::Warning, SAVE_PATH_REQUIRED_MESSAGE.to_owned()));
+                    cx.notify();
+                }
+            }));
+        })
+        .detach();
+    }
+
+    /// Window title for the active tab: `Main.java • — Kova` when dirty.
+    fn active_window_title(&self) -> String {
+        let Some(tab) = self
+            .panes
+            .get(&self.active_pane)
+            .and_then(|pane| pane.tabs.active_tab())
+        else {
+            return "Kova".to_owned();
+        };
+        let dirty = tab
+            .path
+            .as_deref()
+            .is_some_and(|key| self.is_document_dirty(key));
+        if dirty {
+            format!("{} • — Kova", tab.title)
+        } else {
+            format!("{} — Kova", tab.title)
+        }
+    }
+
+    /// Status-bar text for the active document: a pending notice, else its save status.
+    fn document_status(&self) -> (StatusKind, String) {
+        self.doc_notice.clone().unwrap_or_else(|| {
+            self.active_document_state()
+                .map_or((StatusKind::Info, "Ready".to_owned()), |doc| {
+                    doc.status_label()
+                })
+        })
     }
 
     /// Splits the active pane along `axis`; the new pane shows the same document through the
@@ -2090,6 +2363,17 @@ impl WorkspaceShell {
         } else {
             p.run_icon
         };
+        let (doc_status_kind, doc_status_text) = self.document_status();
+        let kind_color = |kind: StatusKind| match kind {
+            StatusKind::Info => p.text_secondary,
+            StatusKind::Warning => p.warning,
+            StatusKind::Error => p.error,
+        };
+        let doc_status_color = kind_color(doc_status_kind);
+        let config_notice = self
+            .config_notice
+            .clone()
+            .map(|(kind, text)| div().text_color(kind_color(kind)).child(text));
         let start_color = match self.metrics.cold_start_within_budget {
             Some(true) => p.run_icon,
             Some(false) => p.warning,
@@ -2131,7 +2415,9 @@ impl WorkspaceShell {
                         div()
                             .text_color(p.text_muted)
                             .child(status.focused_region.label()),
-                    ),
+                    )
+                    .child(div().text_color(doc_status_color).child(doc_status_text))
+                    .children(config_notice),
             )
             .child(
                 div()
@@ -2239,6 +2525,12 @@ impl Render for WorkspaceShell {
             cx.defer_in(window, Self::complete_first_frame);
         }
 
+        let title = self.active_window_title();
+        if title != self.window_title {
+            window.set_window_title(&title);
+            self.window_title = title;
+        }
+
         let p = Palette::from_theme(cx.global::<KovaTheme>());
 
         div()
@@ -2247,6 +2539,8 @@ impl Render for WorkspaceShell {
             .flex_col()
             .bg(hsla_from_rgba(cx.global::<KovaTheme>().surfaces().canvas))
             .text_color(p.text_primary)
+            .key_context(WORKSPACE_KEY_CONTEXT)
+            .on_action(cx.listener(Self::save_action))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
