@@ -13,7 +13,9 @@ cafebabe.workspace    = true
 crc32fast.workspace   = true
 ignore.workspace      = true
 kova_config.workspace = true
+kova_core.workspace   = true
 kova_syntax.workspace = true
+nucleo-matcher.workspace = true
 postcard.workspace    = true
 rayon.workspace       = true
 serde.workspace       = true
@@ -23,7 +25,12 @@ tree-sitter.workspace = true
 zip.workspace         = true
 
 [dev-dependencies]
-tempfile.workspace = true
+criterion.workspace = true
+tempfile.workspace  = true
+
+[[bench]]
+name    = "jvm_index"
+harness = false
 
 [lints]
 workspace = true

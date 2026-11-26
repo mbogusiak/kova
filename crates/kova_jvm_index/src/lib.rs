@@ -10,7 +10,10 @@ pub mod discovery;
 pub mod error;
 pub mod indexer;
 pub mod model;
+pub mod search;
+pub mod service;
 pub mod signature;
+pub mod snapshot;
 pub mod source;
 
 pub use bytecode::{
@@ -32,6 +35,13 @@ pub use model::{
     is_compiler_generated_class_name, is_ignored_internal_name, split_package_and_simple,
     split_package_and_simple_name,
 };
+pub use search::{
+    ClassSearchHit, DEFAULT_SEARCH_LIMIT, JvmQueryEngine, ParsedClassQuery, QueryScratch,
+    SearchQueryOptions, SymbolSearchHit, parse_class_query,
+};
+pub use service::{
+    IndexJobHandle, IndexPhase, IndexReadyMetrics, IndexUpdateCallback, JvmIndexService,
+};
 pub use signature::{
     DecodedClassSignature, MAX_SIGNATURE_DEPTH, TypeDisplayMode, decode_class_signature,
     decode_constructor_descriptor, decode_constructor_signature, decode_field_descriptor,
@@ -39,6 +49,7 @@ pub use signature::{
     decode_method_descriptor, decode_method_descriptor_with_mode, decode_method_signature,
     decode_method_signature_with_mode, parse_class_signature,
 };
+pub use snapshot::JvmIndexSnapshot;
 pub use source::{
     DEFAULT_MAX_SOURCE_BYTES, SourceScanOptions, parse_java_source, parse_kotlin_source,
     parse_source_file,
