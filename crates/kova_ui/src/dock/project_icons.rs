@@ -124,7 +124,7 @@ fn hex(rgb: u32) -> Hsla {
     .into()
 }
 
-fn vector_icon(
+pub(crate) fn vector_icon(
     width: f32,
     height: f32,
     paint: impl Fn(f32, f32, &mut gpui::Window) + 'static,
@@ -143,11 +143,11 @@ fn vector_icon(
     .into_any_element()
 }
 
-fn pt(ox: f32, oy: f32, x: f32, y: f32) -> Point<Pixels> {
+pub(crate) fn pt(ox: f32, oy: f32, x: f32, y: f32) -> Point<Pixels> {
     point(px(ox + x), px(oy + y))
 }
 
-fn stroke_segments(
+pub(crate) fn stroke_segments(
     window: &mut gpui::Window,
     width: f32,
     color: Hsla,
@@ -169,7 +169,13 @@ fn stroke_segments(
     }
 }
 
-fn fill_polygon(window: &mut gpui::Window, color: Hsla, pts: &[(f32, f32)], ox: f32, oy: f32) {
+pub(crate) fn fill_polygon(
+    window: &mut gpui::Window,
+    color: Hsla,
+    pts: &[(f32, f32)],
+    ox: f32,
+    oy: f32,
+) {
     let Some((first, rest)) = pts.split_first() else {
         return;
     };
@@ -184,7 +190,7 @@ fn fill_polygon(window: &mut gpui::Window, color: Hsla, pts: &[(f32, f32)], ox: 
     }
 }
 
-fn paint_rounded_rect(
+pub(crate) fn paint_rounded_rect(
     window: &mut gpui::Window,
     origin: (f32, f32),
     rect: (f32, f32, f32, f32),
@@ -198,7 +204,7 @@ fn paint_rounded_rect(
     window.paint_quad(quad);
 }
 
-fn paint_outlined_rounded_rect(
+pub(crate) fn paint_outlined_rounded_rect(
     window: &mut gpui::Window,
     origin: (f32, f32),
     rect: (f32, f32, f32, f32),
@@ -216,6 +222,30 @@ fn paint_outlined_rounded_rect(
     quad.corner_radii = px(radius).into();
     quad.border_widths = gpui::Edges::all(px(stroke_w));
     window.paint_quad(quad);
+}
+
+pub(crate) fn paint_folder_outline(
+    ox: f32,
+    oy: f32,
+    window: &mut gpui::Window,
+    stroke_width: f32,
+    color: Hsla,
+) {
+    let mut builder = PathBuilder::stroke(px(stroke_width));
+    builder.move_to(pt(ox, oy, 2.0, 4.2));
+    builder.line_to(pt(ox, oy, 2.8, 3.4));
+    builder.line_to(pt(ox, oy, 6.1, 3.4));
+    builder.line_to(pt(ox, oy, 7.7, 5.0));
+    builder.line_to(pt(ox, oy, 13.2, 5.0));
+    builder.line_to(pt(ox, oy, 14.0, 5.8));
+    builder.line_to(pt(ox, oy, 14.0, 12.1));
+    builder.line_to(pt(ox, oy, 13.2, 12.9));
+    builder.line_to(pt(ox, oy, 2.8, 12.9));
+    builder.line_to(pt(ox, oy, 2.0, 12.1));
+    builder.close();
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
 }
 
 /// Renders a crisp `14×16 px` tree disclosure chevron (`>` when collapsed, `⌄` when expanded).
@@ -269,21 +299,7 @@ pub fn render_folder_icon(
     island_bg: Hsla,
 ) -> AnyElement {
     vector_icon(16.0, 16.0, move |ox, oy, window| {
-        let mut builder = PathBuilder::stroke(px(1.3));
-        builder.move_to(pt(ox, oy, 2.0, 4.2));
-        builder.line_to(pt(ox, oy, 2.8, 3.4));
-        builder.line_to(pt(ox, oy, 6.1, 3.4));
-        builder.line_to(pt(ox, oy, 7.7, 5.0));
-        builder.line_to(pt(ox, oy, 13.2, 5.0));
-        builder.line_to(pt(ox, oy, 14.0, 5.8));
-        builder.line_to(pt(ox, oy, 14.0, 12.1));
-        builder.line_to(pt(ox, oy, 13.2, 12.9));
-        builder.line_to(pt(ox, oy, 2.8, 12.9));
-        builder.line_to(pt(ox, oy, 2.0, 12.1));
-        builder.close();
-        if let Ok(path) = builder.build() {
-            window.paint_path(path, color);
-        }
+        paint_folder_outline(ox, oy, window, 1.3, color);
 
         if is_root {
             paint_rounded_rect(window, (ox, oy), (8.6, 8.6, 7.2, 7.2), 2.2, island_bg);
