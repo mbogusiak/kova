@@ -1,0 +1,308 @@
+package kova:plugin@0.1.0;
+
+/// Shared domain types exchanged between Kova IDE and sandboxed WASM plugins.
+interface types {
+    /// Metadata describing an installed plugin package.
+    record plugin-info {
+        id: string,
+        name: string,
+        version: string,
+        api-version: string,
+    }
+
+    /// Semantic style token mapped by the host to `kova_theme` (never raw HEX or pixels).
+    enum style-variant {
+        primary,
+        muted,
+        warning,
+        error,
+        accent,
+    }
+
+    /// Semantic icon identifier resolved by Kova's icon registry.
+    enum semantic-icon {
+        plugin,
+        database,
+        terminal,
+        search,
+        sparkle,
+        tree,
+        code,
+        bug,
+        settings,
+    }
+
+    /// Orientation for a `Split` layout container.
+    enum split-direction {
+        horizontal,
+        vertical,
+    }
+
+    /// Definition of a command registered in Omarchy Command / Search Everywhere.
+    record command-descriptor {
+        id: string,
+        title: string,
+        category: string,
+    }
+
+    /// Definition of a dockable Tool Window panel.
+    record tool-window-descriptor {
+        id: string,
+        title: string,
+        icon: semantic-icon,
+    }
+
+    /// Lightweight AST/JVM symbol summary for the active buffer.
+    record ast-symbol {
+        name: string,
+        kind: string,
+        line: u32,
+        column: u32,
+    }
+
+    /// Controlled, read-only snapshot of the active editor state.
+    record editor-snapshot {
+        workspace-root: option<string>,
+        active-file: option<string>,
+        language: option<string>,
+        buffer-version: u64,
+        content: option<string>,
+        line-count: u32,
+        cursor-line: u32,
+        cursor-column: u32,
+        symbols: list<ast-symbol>,
+        jvm-classpath-count: u32,
+    }
+
+    /// Editor / IDE lifecycle events dispatched to plugins.
+    variant plugin-event {
+        workspace-opened(string),
+        buffer-changed(string),
+        buffer-saved(string),
+        cursor-moved(tuple<u32, u32>),
+        theme-changed(string),
+    }
+
+    /// Tab header metadata for `Tabs` widget.
+    record tab-item {
+        id: string,
+        title: string,
+    }
+
+    /// Flattened tree item for `Tree` widget (non-recursive for WIT compatibility).
+    record tree-item {
+        id: string,
+        label: string,
+        depth: u32,
+        expanded: bool,
+        selected: bool,
+        has-children: bool,
+        style: style-variant,
+    }
+
+    /// Column header for `Table` widget.
+    record table-column {
+        id: string,
+        title: string,
+        width-weight: u16,
+    }
+
+    /// Item inside a `List` widget.
+    record list-item {
+        id: string,
+        label: string,
+        detail: option<string>,
+        style: style-variant,
+    }
+
+    /// Properties for a `Split` container widget.
+    record split-props {
+        direction: split-direction,
+        ratio-percent: u8,
+    }
+
+    /// Properties for a `Tabs` container widget.
+    record tabs-props {
+        items: list<tab-item>,
+        active-index: u32,
+    }
+
+    /// Properties for a `Tree` widget.
+    record tree-props {
+        items: list<tree-item>,
+    }
+
+    /// Properties for a virtualized `Table` widget.
+    record table-props {
+        columns: list<table-column>,
+        rows: list<list<string>>,
+        selected-row: option<u32>,
+    }
+
+    /// Properties for a virtualized `List` widget.
+    record list-props {
+        items: list<list-item>,
+        selected-index: option<u32>,
+    }
+
+    /// Properties for a `Form` container widget.
+    record form-props {
+        title: option<string>,
+    }
+
+    /// Properties for a `TextInput` form control.
+    record text-input-props {
+        label: string,
+        value: string,
+        placeholder: string,
+    }
+
+    /// Properties for a `Select` form control.
+    record select-props {
+        label: string,
+        options: list<string>,
+        selected-index: option<u32>,
+    }
+
+    /// Properties for a `Toggle` form control.
+    record toggle-props {
+        label: string,
+        checked: bool,
+    }
+
+    /// Properties for a `Button` form control.
+    record button-props {
+        label: string,
+        disabled: bool,
+    }
+
+    /// Properties for a `CodeBlock` widget (rendered with `kova_syntax`).
+    record code-block-props {
+        language: string,
+        code: string,
+    }
+
+    /// Properties for a `Markdown` widget.
+    record markdown-props {
+        content: string,
+    }
+
+    /// Properties for a `Badge` status widget.
+    record badge-props {
+        label: string,
+    }
+
+    /// Payload data for each of the declarative widget kinds.
+    variant widget-kind {
+        split(split-props),
+        tabs(tabs-props),
+        tree(tree-props),
+        table(table-props),
+        list-view(list-props),
+        form(form-props),
+        text-input(text-input-props),
+        select(select-props),
+        toggle(toggle-props),
+        button(button-props),
+        code-block(code-block-props),
+        markdown(markdown-props),
+        badge(badge-props),
+    }
+
+    /// A node inside a declarative UI tree.
+    record widget-node {
+        id: string,
+        kind: widget-kind,
+        style: style-variant,
+        children: list<u32>,
+    }
+
+    /// Arena-encoded declarative UI tree returned by `render-ui`.
+    record widget-tree {
+        root: u32,
+        nodes: list<widget-node>,
+    }
+
+    /// Event emitted by the GPUI renderer when the user interacts with a widget.
+    record ui-event {
+        widget-id: string,
+        kind: ui-event-kind,
+    }
+
+    /// Discriminated payload for UI interactions.
+    variant ui-event-kind {
+        clicked,
+        text-changed(string),
+        toggled(bool),
+        selected-index(u32),
+        tab-changed(u32),
+        tree-toggled(string),
+        tree-selected(string),
+        row-selected(u32),
+        submitted,
+    }
+
+    /// Log severity for plugin diagnostics.
+    enum log-level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+}
+
+/// Capabilities exposed by Kova IDE to sandboxed plugins.
+interface host {
+    use types.{
+        command-descriptor,
+        editor-snapshot,
+        log-level,
+        tool-window-descriptor,
+    };
+
+    /// Emit a structured log message routed through Kova's tracing pipeline.
+    log: func(level: log-level, message: string);
+
+    /// Read a controlled snapshot of the active editor/workspace state.
+    /// Requires `editor_read` permission in `plugin.toml`.
+    get-editor-snapshot: func() -> result<editor-snapshot, string>;
+
+    /// Replace a byte range in the active buffer (controlled write).
+    /// Requires `editor_write` permission in `plugin.toml`.
+    apply-editor-edit: func(start-byte: u64, end-byte: u64, replacement: string) -> result<u64, string>;
+
+    /// Register a command in Kova's action palette.
+    register-command: func(cmd: command-descriptor) -> result<_, string>;
+
+    /// Register a dockable Tool Window panel.
+    register-tool-window: func(panel: tool-window-descriptor) -> result<_, string>;
+}
+
+/// Lifecycle, command, event and declarative UI callbacks exported by a plugin.
+interface plugin {
+    use types.{plugin-event, ui-event, widget-tree};
+
+    /// Called once after instantiation.
+    init: func() -> result<_, string>;
+
+    /// Called before unloading or disabling the plugin.
+    shutdown: func() -> result<_, string>;
+
+    /// Called when an IDE lifecycle event occurs.
+    on-event: func(event: plugin-event) -> result<_, string>;
+
+    /// Called when a user triggers a command registered by this plugin.
+    on-command: func(command-id: string) -> result<_, string>;
+
+    /// Render the declarative UI tree for a registered Tool Window.
+    render-ui: func(panel-id: string) -> result<widget-tree, string>;
+
+    /// Handle an interactive UI event from the GPUI declarative widget renderer.
+    on-ui-event: func(panel-id: string, event: ui-event) -> result<option<widget-tree>, string>;
+}
+
+/// Canonical world implemented by every Kova WASM plugin component.
+world kova-plugin {
+    import host;
+    export plugin;
+}
