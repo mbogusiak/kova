@@ -64,6 +64,10 @@ use crate::settings::{
     DebugSink, ReloadOutcome, SettingsKeyOutcome, SettingsSource, SettingsView,
     SettingsWriteRequest, SettingsWriteSink,
 };
+use crate::terminal::terminal_dock::TerminalDockEvent;
+use crate::terminal::{
+    TerminalDock, TerminalLaunch, TerminalShortcut, TerminalView, terminal_shortcut,
+};
 use crate::theme::{KovaTheme, hsla_from_rgba};
 use kova_config::{KovaSettings, SettingsDocument};
 
@@ -385,6 +389,8 @@ pub struct WorkspaceShell {
     show_status_bar: bool,
     /// Last `settings.toml` reload error, kept for a Settings view opened later.
     settings_error: Option<String>,
+    /// Integrated PTY terminal, created on the first `Alt+F12` (`KOVA-039`).
+    terminal: Option<(Entity<TerminalDock>, Subscription)>,
 }
 
 impl fmt::Debug for WorkspaceShell {
@@ -498,6 +504,7 @@ impl WorkspaceShell {
             applied_settings: KovaSettings::default(),
             show_status_bar: true,
             settings_error: None,
+            terminal: None,
         }
     }
 
@@ -817,7 +824,89 @@ impl WorkspaceShell {
         cx: &mut Context<'_, Self>,
     ) {
         self.dock_layout.focus(region);
-        window.focus(&self.focus_handle);
+        if region == FocusedRegion::BottomPanel
+            && self.dock_layout.bottom_open == Some(DockToolId::Terminal)
+        {
+            let dock = self.ensure_terminal(window, cx);
+            dock.read(cx).focus_active(window, cx);
+        } else {
+            window.focus(&self.focus_handle);
+        }
+        cx.notify();
+    }
+
+    /// Returns the terminal dock, starting its first session on first use (`KOVA-039`).
+    ///
+    /// The PTY is never started at construction, so cold start and headless tests stay
+    /// free of child processes.
+    fn ensure_terminal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Entity<TerminalDock> {
+        if let Some((dock, _)) = &self.terminal {
+            return dock.clone();
+        }
+        let launch =
+            TerminalLaunch::from_settings(self.project_root.clone(), &self.applied_settings);
+        let dock = cx.new(|cx| TerminalDock::new(launch, cx));
+        let subscription =
+            cx.subscribe_in(
+                &dock,
+                window,
+                |this, _dock, event, window, cx| match event {
+                    TerminalDockEvent::AllClosed => this.close_terminal(window, cx),
+                },
+            );
+        self.terminal = Some((dock.clone(), subscription));
+        dock
+    }
+
+    /// Hides the terminal after its last tab closed and drops the dock.
+    fn close_terminal(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.terminal = None;
+        if self.dock_layout.bottom_open == Some(DockToolId::Terminal) {
+            self.dock_layout
+                .toggle_tool(DockToolId::Terminal, self.active_pane);
+        }
+        self.focus_active_editor(window, cx);
+        cx.notify();
+    }
+
+    /// Whether keyboard focus is inside the terminal dock.
+    fn terminal_focused(
+        &self,
+        window: &Window,
+        cx: &Context<'_, Self>,
+    ) -> Option<Entity<TerminalDock>> {
+        self.terminal
+            .as_ref()
+            .map(|(dock, _)| dock)
+            .filter(|dock| dock.read(cx).contains_focus(window, cx))
+            .cloned()
+    }
+
+    fn run_terminal_shortcut(
+        &mut self,
+        shortcut: TerminalShortcut,
+        dock: &Entity<TerminalDock>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match shortcut {
+            TerminalShortcut::Hide => self.toggle_tool(DockToolId::Terminal, window, cx),
+            TerminalShortcut::NewTab => dock.update(cx, |dock, cx| dock.new_tab(window, cx)),
+            TerminalShortcut::CloseTab => dock.update(cx, |dock, cx| dock.close_active(window, cx)),
+            TerminalShortcut::Clear => {
+                dock.update(cx, |dock, cx| dock.update_active(cx, TerminalView::clear));
+            }
+            TerminalShortcut::Copy => {
+                dock.update(cx, |dock, cx| dock.update_active(cx, TerminalView::copy));
+            }
+            TerminalShortcut::Paste => {
+                dock.update(cx, |dock, cx| dock.update_active(cx, TerminalView::paste));
+            }
+        }
         cx.notify();
     }
 
@@ -1380,6 +1469,18 @@ impl WorkspaceShell {
             cx.stop_propagation();
             return;
         }
+        // Terminal focused: its own shortcuts first, `Cmd` chords to the IDE keymap, every
+        // other key bubbles to the session (`Ctrl+C`, `Ctrl+W`, `Esc`, `j`/`k` …).
+        if let Some(dock) = self.terminal_focused(window, cx) {
+            if let Some(shortcut) = terminal_shortcut(keystroke, cfg!(target_os = "macos")) {
+                self.run_terminal_shortcut(shortcut, &dock, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if !keystroke.modifiers.platform {
+                return;
+            }
+        }
         let editor = self
             .active_editor()
             .filter(|editor| editor.read(cx).focus_handle().is_focused(window))
@@ -1814,6 +1915,14 @@ impl WorkspaceShell {
                     editor.update(cx, |editor, cx| editor.set_font(&family, size, cx));
                 }
             }
+        }
+        let next = &self.applied_settings;
+        if (next.terminal != previous.terminal
+            || next.editor.font_family != previous.editor.font_family)
+            && let Some((dock, _)) = &self.terminal
+        {
+            let launch = TerminalLaunch::from_settings(self.project_root.clone(), next);
+            dock.update(cx, |dock, cx| dock.set_launch(launch, cx));
         }
         cx.notify();
     }
@@ -2908,11 +3017,14 @@ impl WorkspaceShell {
                 .text_color(p.text_secondary)
                 .children(self.bottom_panel.run_logs.iter().map(|line| div().child(line.clone())))
                 .into_any_element(),
-            BottomTab::Terminal => placeholder(
-                "Terminal docked. The PTY session (kova_tools) is wired in Phase 3.",
-                p,
-            )
-            .into_any_element(),
+            BottomTab::Terminal => match &self.terminal {
+                Some((dock, _)) => div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(dock.clone())
+                    .into_any_element(),
+                None => placeholder("Starting terminal…", p).into_any_element(),
+            },
         }
     }
 
@@ -3504,6 +3616,10 @@ impl Render for WorkspaceShell {
         if title != self.window_title {
             window.set_window_title(&title);
             self.window_title = title;
+        }
+
+        if self.terminal.is_none() && self.dock_layout.bottom_open == Some(DockToolId::Terminal) {
+            self.ensure_terminal(window, cx);
         }
 
         let viewport = window.viewport_size();

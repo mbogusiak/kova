@@ -10,6 +10,7 @@ pub mod editor;
 pub mod keymap;
 pub mod settings;
 pub mod shell;
+pub mod terminal;
 pub mod theme;
 
 pub use dock::{
@@ -22,6 +23,7 @@ pub use document::{DocumentState, SaveRequest, SaveSink, SaveStatus, SaveTicket,
 pub use editor::shared::SharedBuffer;
 pub use editor::{EditorEvent, EditorView};
 pub use shell::{StartupMetrics, WorkspaceShell};
+pub use terminal::{TerminalDock, TerminalLaunch, TerminalView};
 pub use theme::{KovaTheme, ThemeState, apply_live_theme, hsla_from_rgba, rgba_to_gpui};
 
 /// Name of this crate as declared in its `Cargo.toml`.
