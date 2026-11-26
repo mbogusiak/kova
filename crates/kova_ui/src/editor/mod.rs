@@ -337,6 +337,7 @@ impl EditorView {
         epoch: u64,
         cx: &mut Context<'_, Self>,
     ) {
+        self.git_diff_task = None;
         let load = cx.background_executor().spawn(async move {
             let base = repo
                 .head_contents(&rel_path)

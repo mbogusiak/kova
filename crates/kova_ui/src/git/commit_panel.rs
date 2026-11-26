@@ -1000,11 +1000,16 @@ impl CommitPanel {
         let msg = self.model.message();
         let border = if focused { p.focus } else { p.border };
 
+        let placeholder = if cfg!(target_os = "macos") {
+            "Commit message (⌘↵ to commit)"
+        } else {
+            "Commit message (Ctrl+↵ to commit)"
+        };
         let content = if msg.text().is_empty() && !focused {
             div()
                 .text_size(px(12.0))
                 .text_color(p.text_muted)
-                .child("Commit message (Cmd+Enter to commit)")
+                .child(placeholder)
         } else {
             let (before, after) = msg.split_at_cursor();
             let before_lines: Vec<&str> = before.split('\n').collect();

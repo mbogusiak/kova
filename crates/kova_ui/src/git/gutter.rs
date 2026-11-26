@@ -58,6 +58,7 @@ impl EditorGitState {
     /// Invalidates in-flight work after `HEAD` moved (e.g. a commit). Returns the new epoch.
     pub fn bump_epoch(&mut self) -> u64 {
         self.base_epoch = self.base_epoch.wrapping_add(1);
+        self.diff_in_flight = None;
         self.base_epoch
     }
 
@@ -104,8 +105,8 @@ impl EditorGitState {
     /// Results for an older buffer version are still shown (so markers never flicker) and
     /// the next render schedules a fresh diff; results for a stale base are dropped.
     pub fn finish_diff(&mut self, version: u64, epoch: u64, hunks: Vec<GutterHunk>) {
-        self.diff_in_flight = None;
         if epoch == self.base_epoch {
+            self.diff_in_flight = None;
             self.hunks = Arc::from(hunks);
             self.diffed_version = Some(version);
         }
@@ -211,6 +212,27 @@ mod tests {
         state.finish_diff(9, old_epoch, Vec::new());
         assert_eq!(state.hunks().len(), 1, "stale diff ignored");
         state.set_base(old_epoch, None);
+        assert_eq!(state.marker_at(0), Some(LineChangeKind::Modified));
+    }
+
+    #[test]
+    fn bump_epoch_unblocks_in_flight_diff_and_ignores_stale_finish() {
+        let mut state = EditorGitState::default();
+        let e1 = state.epoch();
+        state.set_base(e1, Some("a\n".to_owned()));
+        assert!(state.begin_diff(1).is_some());
+
+        // Base changes (e.g. commit) while diff for e1 is still running.
+        let e2 = state.bump_epoch();
+        state.set_base(e2, Some("b\n".to_owned()));
+        let (_, started_epoch) = state.begin_diff(1).expect("new epoch must not be blocked");
+        assert_eq!(started_epoch, e2);
+
+        // Late completion from e1 must not clear e2's in-flight guard.
+        state.finish_diff(1, e1, Vec::new());
+        assert!(state.begin_diff(2).is_none(), "e2 diff still in flight");
+
+        state.finish_diff(1, e2, gutter_hunks("b\n", "c\n"));
         assert_eq!(state.marker_at(0), Some(LineChangeKind::Modified));
     }
 
