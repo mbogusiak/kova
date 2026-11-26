@@ -26,11 +26,13 @@ pub use keymap::{
     Platform, build_effective_keymap, jetbrains_keymap_layer, jetbrains_keymap_layer_ref, presets,
 };
 pub use project::{
-    BuildSystemKind, DEFAULT_MAX_ENTRIES, MAX_RECENT_FILES, MAX_RECENT_WORKSPACES, OpenTabState,
-    Project, ProjectError, ProjectFileEntry, ProjectMetadata, ProjectNode, ProjectNodeId,
-    ProjectNodeKind, ProjectScanOptions, ProjectTree, RecentWorkspaceEntry, RecentWorkspaces,
-    SESSION_SCHEMA_VERSION, SessionLayoutState, WorkspaceSession, load_recent_workspaces,
-    load_workspace_session, load_workspace_session_or_default, record_recent_workspace,
+    ActiveProject, BuildSystemKind, DEFAULT_MAX_ENTRIES, MAX_RECENT_FILES,
+    MAX_RECENT_PROJECTS_IN_MENU, MAX_RECENT_WORKSPACES, OpenTabState, Project, ProjectError,
+    ProjectFileEntry, ProjectGeneration, ProjectMetadata, ProjectNode, ProjectNodeId,
+    ProjectNodeKind, ProjectPhase, ProjectScanOptions, ProjectTree, RecentProject,
+    RecentProjectsStore, RecentWorkspaceEntry, RecentWorkspaces, SESSION_SCHEMA_VERSION,
+    SessionLayoutState, WorkspaceSession, load_recent_workspaces, load_workspace_session,
+    load_workspace_session_or_default, project_display_name, record_recent_workspace,
     save_recent_workspaces, save_workspace_session, scan_project,
 };
 
