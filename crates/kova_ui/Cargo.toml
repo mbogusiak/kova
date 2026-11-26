@@ -17,6 +17,7 @@ kova_plugin_host.workspace = true
 kova_syntax.workspace      = true
 kova_theme.workspace       = true
 kova_tools.workspace       = true
+nucleo-matcher.workspace   = true
 sha2.workspace             = true
 smallvec.workspace         = true
 
