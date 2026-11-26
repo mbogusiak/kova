@@ -45,6 +45,18 @@ pub enum DockToolId {
 }
 
 impl DockToolId {
+    /// All dockable tool window identifiers in canonical order.
+    pub const ALL: [Self; 8] = [
+        Self::Project,
+        Self::Commit,
+        Self::Run,
+        Self::Debug,
+        Self::Problems,
+        Self::Tests,
+        Self::Terminal,
+        Self::Structure,
+    ];
+
     /// Returns the human-readable title of this tool window.
     #[must_use]
     pub const fn title(self) -> &'static str {
@@ -90,6 +102,44 @@ impl DockToolId {
         }
     }
 
+    /// Returns the platform-native keyboard shortcut label matching the active preset keymap.
+    #[must_use]
+    pub const fn display_shortcut(self) -> &'static str {
+        #[cfg(target_os = "macos")]
+        {
+            match self {
+                Self::Project => "⌘1",
+                Self::Commit => "⌘9",
+                Self::Run => "⌘4",
+                Self::Debug => "⌘5",
+                Self::Problems => "⌘6",
+                Self::Tests => "⌥8",
+                Self::Terminal => "⌥F12",
+                Self::Structure => "⌘7",
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            match self {
+                Self::Project => "Alt+1",
+                Self::Commit => "Alt+9",
+                Self::Run => "Alt+4",
+                Self::Debug => "Alt+5",
+                Self::Problems => "Alt+6",
+                Self::Tests => "Alt+8",
+                Self::Terminal => "Alt+F12",
+                Self::Structure => "Alt+7",
+            }
+        }
+    }
+
+    /// Returns the tooltip text combining the tool window title and platform shortcut
+    /// (for example, `"Project (⌘1)"` on `macOS` or `"Project (Alt+1)"` on `Linux`).
+    #[must_use]
+    pub fn tooltip_label(self) -> String {
+        format!("{} ({})", self.title(), self.display_shortcut())
+    }
+
     /// Returns the dock slot this tool window is anchored to in the Islands layout.
     #[must_use]
     pub const fn side(self) -> DockSide {
@@ -102,6 +152,27 @@ impl DockToolId {
         }
     }
 }
+
+/// Top tool-window group rendered on the left stripe rail.
+pub const LEFT_STRIPE_TOP_TOOLS: [DockToolId; 4] = [
+    DockToolId::Project,
+    DockToolId::Commit,
+    DockToolId::Run,
+    DockToolId::Debug,
+];
+
+/// Bottom tool-window group rendered on the left stripe rail.
+pub const LEFT_STRIPE_BOTTOM_TOOLS: [DockToolId; 3] = [
+    DockToolId::Problems,
+    DockToolId::Tests,
+    DockToolId::Terminal,
+];
+
+/// Top tool-window group rendered on the right stripe rail.
+pub const RIGHT_STRIPE_TOP_TOOLS: [DockToolId; 1] = [DockToolId::Structure];
+
+/// Bottom tool-window group rendered on the right stripe rail.
+pub const RIGHT_STRIPE_BOTTOM_TOOLS: [DockToolId; 0] = [];
 
 /// Dock slot a tool window is anchored to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -343,5 +414,83 @@ mod tests {
 
         state.set_right_width(500.0);
         assert!((state.right_width - RIGHT_DOCK_MAX_WIDTH_PX).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn display_shortcut_and_tooltip_label_cover_all_tools_on_current_platform() {
+        let expected: [(DockToolId, &str, &str); 8] = if cfg!(target_os = "macos") {
+            [
+                (DockToolId::Project, "⌘1", "Project (⌘1)"),
+                (DockToolId::Commit, "⌘9", "Commit (⌘9)"),
+                (DockToolId::Run, "⌘4", "Run (⌘4)"),
+                (DockToolId::Debug, "⌘5", "Debug (⌘5)"),
+                (DockToolId::Problems, "⌘6", "Problems (⌘6)"),
+                (DockToolId::Tests, "⌥8", "Tests (⌥8)"),
+                (DockToolId::Terminal, "⌥F12", "Terminal (⌥F12)"),
+                (DockToolId::Structure, "⌘7", "Structure (⌘7)"),
+            ]
+        } else {
+            [
+                (DockToolId::Project, "Alt+1", "Project (Alt+1)"),
+                (DockToolId::Commit, "Alt+9", "Commit (Alt+9)"),
+                (DockToolId::Run, "Alt+4", "Run (Alt+4)"),
+                (DockToolId::Debug, "Alt+5", "Debug (Alt+5)"),
+                (DockToolId::Problems, "Alt+6", "Problems (Alt+6)"),
+                (DockToolId::Tests, "Alt+8", "Tests (Alt+8)"),
+                (DockToolId::Terminal, "Alt+F12", "Terminal (Alt+F12)"),
+                (DockToolId::Structure, "Alt+7", "Structure (Alt+7)"),
+            ]
+        };
+
+        assert_eq!(expected.len(), DockToolId::ALL.len());
+        for (tool, shortcut, tooltip) in expected {
+            assert_eq!(tool.display_shortcut(), shortcut);
+            assert_eq!(tool.tooltip_label(), tooltip);
+        }
+    }
+
+    #[test]
+    fn stripe_tool_lists_include_debug_and_cover_every_tool_once() {
+        let mut seen = Vec::new();
+        for group in [
+            LEFT_STRIPE_TOP_TOOLS.as_slice(),
+            LEFT_STRIPE_BOTTOM_TOOLS.as_slice(),
+            RIGHT_STRIPE_TOP_TOOLS.as_slice(),
+            RIGHT_STRIPE_BOTTOM_TOOLS.as_slice(),
+        ] {
+            for &tool in group {
+                assert!(
+                    !seen.contains(&tool),
+                    "duplicate tool {tool:?} in stripe lists"
+                );
+                seen.push(tool);
+            }
+        }
+
+        assert_eq!(seen.len(), DockToolId::ALL.len());
+        for tool in DockToolId::ALL {
+            assert!(
+                seen.contains(&tool),
+                "missing tool {tool:?} in stripe lists"
+            );
+        }
+        assert!(LEFT_STRIPE_TOP_TOOLS.contains(&DockToolId::Debug));
+        assert_eq!(RIGHT_STRIPE_TOP_TOOLS, [DockToolId::Structure]);
+        assert_eq!(RIGHT_STRIPE_BOTTOM_TOOLS.as_slice(), []);
+    }
+
+    #[test]
+    fn toggling_debug_tool_activates_bottom_panel_and_stripe_state() {
+        let mut state = DockLayoutState::default();
+        assert!(!state.is_tool_active(DockToolId::Debug));
+
+        state.toggle_tool(DockToolId::Debug, PaneId(1));
+        assert_eq!(state.bottom_open, Some(DockToolId::Debug));
+        assert_eq!(state.focused, FocusedRegion::BottomPanel);
+        assert!(state.is_tool_active(DockToolId::Debug));
+
+        state.toggle_tool(DockToolId::Debug, PaneId(1));
+        assert_eq!(state.bottom_open, None);
+        assert!(!state.is_tool_active(DockToolId::Debug));
     }
 }

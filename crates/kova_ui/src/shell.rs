@@ -75,10 +75,12 @@ use crate::dock::structure::{STRUCTURE_ROW_HEIGHT_PX, kind_icon};
 use crate::dock::{
     BadgeVariant, BottomPanelModel, BottomTab, BuildLogKind, BuildRunStatus, Direction,
     DockLayoutState, DockToolId, FileIconKind, FocusModeVariant, FocusTilingController,
-    FocusToggle, FocusedRegion, LayoutDensity, PaneId, ProblemEntry, ProblemRow, ProblemSeverity,
-    ProjectNode, ProjectNodeKind, ProjectTreeModel, SplitAxis, SplitTree, StatusBarState,
-    StructureModel, TabGroupModel, TabId, TabItem, TreeActivation, VimModeBadge,
-    render_build_hammer_icon, render_run_play_icon, render_run_tests_icon, render_stop_icon,
+    FocusToggle, FocusedRegion, LEFT_STRIPE_BOTTOM_TOOLS, LEFT_STRIPE_TOP_TOOLS, LayoutDensity,
+    PaneId, ProblemEntry, ProblemRow, ProblemSeverity, ProjectNode, ProjectNodeKind,
+    ProjectTreeModel, RIGHT_STRIPE_BOTTOM_TOOLS, RIGHT_STRIPE_TOP_TOOLS, SplitAxis, SplitTree,
+    StatusBarState, StructureModel, TabGroupModel, TabId, TabItem, ToolStripeTooltip,
+    TreeActivation, VimModeBadge, render_build_hammer_icon, render_run_play_icon,
+    render_run_tests_icon, render_stop_icon, render_tool_icon, stripe_icon_color,
 };
 use crate::document::{
     CompletionSink, DefinitionOutcome, DefinitionRequest, DefinitionSink, DefinitionTargetKind,
@@ -637,6 +639,8 @@ pub struct WorkspaceShell {
     completion_origin: Option<(PaneId, TabId)>,
     /// Whether the cursor is currently hovering the left `Project` island (`KOVA-055`).
     project_dock_hovered: bool,
+    /// Tool-window stripe rail button currently under the pointer (`KOVA-059`).
+    hovered_stripe_tool: Option<DockToolId>,
     /// Inline `+` (*New File / New Folder*) modal state and bounds (`KOVA-055`).
     new_item_modal: NewProjectItemModal,
     /// Whether the `Project` header `Options (⋮)` popover is open (`KOVA-055`).
@@ -773,6 +777,7 @@ impl WorkspaceShell {
             pending_completion_request_id: None,
             completion_origin: None,
             project_dock_hovered: false,
+            hovered_stripe_tool: None,
             new_item_modal: NewProjectItemModal::default(),
             project_options_open: false,
             project_options_bounds: Rc::new(Cell::new(None)),
@@ -5116,11 +5121,20 @@ impl WorkspaceShell {
         width_px: f32,
         top: &[DockToolId],
         bottom: &[DockToolId],
+        indicator_on_right: bool,
         p: Palette,
         cx: &Context<'_, Self>,
     ) -> Div {
         let render_item = |tool: DockToolId| {
             let is_active = self.dock_layout.is_tool_active(tool);
+            let is_hovered = self.hovered_stripe_tool == Some(tool);
+            let icon_color = stripe_icon_color(
+                is_active,
+                is_hovered,
+                p.text_primary,
+                p.text_secondary,
+                p.text_muted,
+            );
             let mut item = div()
                 .id(SharedString::from(format!("stripe-{}", tool.title())))
                 .relative()
@@ -5130,27 +5144,44 @@ impl WorkspaceShell {
                 .items_center()
                 .justify_center()
                 .rounded(px(6.0))
-                .text_size(px(9.0))
-                .font_weight(FontWeight::SEMIBOLD)
+                .cursor_pointer()
                 .hover(|s| s.bg(p.hover))
+                .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                    let next = if *hovered {
+                        Some(tool)
+                    } else if this.hovered_stripe_tool == Some(tool) {
+                        None
+                    } else {
+                        this.hovered_stripe_tool
+                    };
+                    if this.hovered_stripe_tool != next {
+                        this.hovered_stripe_tool = next;
+                        cx.notify();
+                    }
+                }))
+                .tooltip(move |_window, cx| {
+                    let tooltip = ToolStripeTooltip::new(tool, cx.global::<KovaTheme>());
+                    cx.new(|_| tooltip).into()
+                })
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.toggle_tool(tool, window, cx);
                 }));
             if is_active {
-                item = item.bg(p.active).text_color(p.text_primary).child(
-                    div()
-                        .absolute()
-                        .left(px(0.0))
-                        .top(px(5.0))
-                        .w(px(STRIPE_INDICATOR_WIDTH_PX))
-                        .h(px(16.0))
-                        .rounded(px(1.0))
-                        .bg(p.tab_indicator),
-                );
-            } else {
-                item = item.text_color(p.text_muted);
+                let mut indicator = div()
+                    .absolute()
+                    .top(px(5.0))
+                    .w(px(STRIPE_INDICATOR_WIDTH_PX))
+                    .h(px(16.0))
+                    .rounded(px(1.0))
+                    .bg(p.tab_indicator);
+                indicator = if indicator_on_right {
+                    indicator.right(px(0.0))
+                } else {
+                    indicator.left(px(0.0))
+                };
+                item = item.bg(p.active).child(indicator);
             }
-            item.child(tool.stripe_label())
+            item.child(render_tool_icon(tool, icon_color))
         };
 
         div()
@@ -6540,12 +6571,9 @@ impl WorkspaceShell {
             row = row
                 .child(self.render_stripe(
                     LEFT_STRIPE_WIDTH_PX,
-                    &[DockToolId::Project, DockToolId::Commit, DockToolId::Run],
-                    &[
-                        DockToolId::Problems,
-                        DockToolId::Tests,
-                        DockToolId::Terminal,
-                    ],
+                    &LEFT_STRIPE_TOP_TOOLS,
+                    &LEFT_STRIPE_BOTTOM_TOOLS,
+                    false,
                     p,
                     cx,
                 ))
@@ -6577,8 +6605,9 @@ impl WorkspaceShell {
                 .child(div().w(px(gap)).flex_none())
                 .child(self.render_stripe(
                     RIGHT_STRIPE_WIDTH_PX,
-                    &[DockToolId::Structure],
-                    &[],
+                    &RIGHT_STRIPE_TOP_TOOLS,
+                    &RIGHT_STRIPE_BOTTOM_TOOLS,
+                    true,
                     p,
                     cx,
                 ));

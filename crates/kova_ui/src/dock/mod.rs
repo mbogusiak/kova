@@ -12,6 +12,7 @@ pub mod split;
 pub mod status_bar;
 pub mod structure;
 pub mod tabs;
+pub mod tool_icons;
 
 pub use bottom_panel::{
     BottomPanelModel, BottomTab, BuildLogKind, BuildLogLine, BuildRunStatus, ProblemEntry,
@@ -21,7 +22,10 @@ pub use focus::{
     Direction, DockRestoreSnapshot, FocusModeVariant, FocusTilingController, FocusToggle,
     LayoutDensity, LayoutRect, compute_region_rects, find_neighbor_pane, region_visible,
 };
-pub use layout::{DockLayoutState, DockSide, DockToolId, FocusedRegion};
+pub use layout::{
+    DockLayoutState, DockSide, DockToolId, FocusedRegion, LEFT_STRIPE_BOTTOM_TOOLS,
+    LEFT_STRIPE_TOP_TOOLS, RIGHT_STRIPE_BOTTOM_TOOLS, RIGHT_STRIPE_TOP_TOOLS,
+};
 pub use project_icons::{
     ProjectIconPalette, render_build_hammer_icon, render_chevron, render_collapse_all_icon,
     render_expand_all_icon, render_file_icon, render_folder_icon, render_header_chevron,
@@ -36,3 +40,4 @@ pub use split::{PaneId, PaneRect, SplitAxis, SplitTree};
 pub use status_bar::{BadgeVariant, StatusBarState, VimModeBadge};
 pub use structure::{StructureModel, StructureSymbolItem};
 pub use tabs::{TabGroupModel, TabId, TabItem};
+pub use tool_icons::{ToolStripeTooltip, render_tool_icon, stripe_icon_color};
