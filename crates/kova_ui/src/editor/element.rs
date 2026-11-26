@@ -5,14 +5,19 @@ use std::ops::Range;
 use std::panic::Location;
 
 use gpui::{
-    App, Bounds, ContentMask, DispatchPhase, Element, ElementId, ElementInputHandler, Entity,
-    GlobalElementId, InspectorElementId, LayoutId, MouseButton, MouseMoveEvent, MouseUpEvent,
-    Pixels, ShapedLine, SharedString, Style, TextRun, Window, fill, point, px, relative, size,
+    App, Bounds, ContentMask, CursorStyle, DispatchPhase, Element, ElementId, ElementInputHandler,
+    Entity, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, LayoutId,
+    MouseButton, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, ShapedLine, SharedString,
+    Style, TextRun, Window, fill, point, px, relative, size,
 };
 use kova_buffer::BufferSnapshot;
+use kova_syntax::{GutterIconRole, HighlightSpan};
+use kova_theme::{RgbaColor, SyntaxTokens};
 use smallvec::SmallVec;
 
+use crate::editor::highlight::{build_line_text_runs, segment_line_styles};
 use crate::editor::line_cache::LineCacheKey;
+use crate::editor::syntax::EditorSyntax;
 use crate::editor::viewport::{
     GUTTER_DIGITS_GAP_PX, GUTTER_FOLD_SLOT_PX, GUTTER_GIT_BAR_SLOT_PX, GUTTER_RIGHT_PAD_PX,
     GUTTER_RUN_SLOT_PX, SCROLLBAR_RIGHT_MARGIN_PX, SCROLLBAR_THUMB_RADIUS_PX,
@@ -21,6 +26,180 @@ use crate::editor::viewport::{
 use crate::editor::vim::CursorRenderKind;
 use crate::editor::{EditorView, VisibleShapedLine};
 use crate::theme::{KovaTheme, hsla_from_rgba};
+
+/// Side length of the gutter `▶` run triangle (`10×10 px`).
+const RUN_ICON_SIZE_PX: f32 = 10.0;
+/// Corner radius of the run-slot hover background and the fold pill (`rx = 4 px`).
+const GUTTER_HOVER_RADIUS_PX: f32 = 4.0;
+/// Horizontal padding inside the `... (N lines)` fold pill.
+const FOLD_PILL_PAD_X_PX: f32 = 6.0;
+/// Half extent of the fold chevron glyph.
+const CHEVRON_HALF_PX: f32 = 3.5;
+
+/// Gutter decorations of one visible row.
+#[derive(Debug)]
+struct GutterMarker {
+    visual_row: usize,
+    /// `Some(true)` collapsed (`›`), `Some(false)` expandable (`⌄`), `None` not foldable.
+    fold: Option<bool>,
+    /// `▶` icon role when the row holds a runnable entry point.
+    run: Option<GutterIconRole>,
+    /// Whether the row holds a caret.
+    active: bool,
+    run_hitbox: Option<Hitbox>,
+    fold_hitbox: Option<Hitbox>,
+}
+
+impl GutterMarker {
+    /// Returns the marker of buffer `row`, or `None` when it has no chevron and no `▶`.
+    fn for_row(
+        editor: &EditorView,
+        syntax: Option<&EditorSyntax>,
+        row: usize,
+        visual_row: usize,
+        active: bool,
+    ) -> Option<Self> {
+        let fold = if editor.fold_map().collapsed_at(row).is_some() {
+            Some(true)
+        } else {
+            syntax.is_some_and(|s| s.has_fold_at(row)).then_some(false)
+        };
+        let run = syntax
+            .and_then(|s| s.entry_point_at(row))
+            .map(|e| e.icon_role);
+        (fold.is_some() || run.is_some()).then_some(Self {
+            visual_row,
+            fold,
+            run,
+            active,
+            run_hitbox: None,
+            fold_hitbox: None,
+        })
+    }
+}
+
+/// Inserts the whole-gutter hitbox (chevron hover reveal) and one hitbox per icon slot.
+fn insert_gutter_hitboxes(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    gutter_width_px: f32,
+    geom: OverlayGeometry,
+    markers: &mut [GutterMarker],
+) -> Hitbox {
+    let gutter_hitbox = window.insert_hitbox(
+        Bounds::new(bounds.origin, size(px(gutter_width_px), bounds.size.height)),
+        HitboxBehavior::Normal,
+    );
+    let (run_slot, fold_slot) = ViewportMetrics::gutter_slot_ranges(gutter_width_px);
+    for marker in markers {
+        let y = geom.row_y(marker.visual_row);
+        let slot = |range: &Range<f32>| {
+            Bounds::new(
+                point(bounds.origin.x + px(range.start), px(y)),
+                size(px(range.end - range.start), px(geom.line_height_px)),
+            )
+        };
+        if marker.run.is_some() {
+            marker.run_hitbox = Some(window.insert_hitbox(slot(&run_slot), HitboxBehavior::Normal));
+        }
+        if marker.fold.is_some() {
+            marker.fold_hitbox =
+                Some(window.insert_hitbox(slot(&fold_slot), HitboxBehavior::Normal));
+        }
+    }
+    gutter_hitbox
+}
+
+/// Shapes and places the `... (N lines)` pills after every visible collapsed fold header.
+fn build_fold_pills(
+    editor: &EditorView,
+    visible: &[VisibleShapedLine],
+    label_run: &TextRun,
+    font_size: Pixels,
+    geom: OverlayGeometry,
+    window: &mut Window,
+) -> Vec<FoldPill> {
+    let mut pills = Vec::new();
+    for line in visible {
+        let Some(region) = editor.fold_map().collapsed_at(line.row) else {
+            continue;
+        };
+        let text: SharedString =
+            format!("... ({} lines)", region.end_line - region.start_line).into();
+        let run = TextRun {
+            len: text.len(),
+            ..label_run.clone()
+        };
+        let label = window
+            .text_system()
+            .shape_line(text, font_size, &[run], None);
+        let x = geom.content_origin_x + line.x_offset - geom.scroll_x
+            + f32::from(line.shaped.width)
+            + geom.char_advance;
+        let bounds = Bounds::new(
+            point(px(x), px(geom.row_y(line.visual_row) + 2.0)),
+            size(
+                label.width + px(FOLD_PILL_PAD_X_PX * 2.0),
+                px((geom.line_height_px - 4.0).max(1.0)),
+            ),
+        );
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        pills.push(FoldPill {
+            row: line.row,
+            bounds,
+            label,
+            hitbox,
+        });
+    }
+    pills
+}
+
+/// `... (N lines)` pill painted after a collapsed fold header.
+#[derive(Debug)]
+struct FoldPill {
+    row: usize,
+    bounds: Bounds<Pixels>,
+    label: ShapedLine,
+    hitbox: Hitbox,
+}
+
+/// Per-frame syntax highlighting inputs for [`shape_visible_line`].
+struct HighlightCtx<'a> {
+    syntax: Option<&'a EditorSyntax>,
+    rows: &'a [(usize, usize)],
+    spans: Option<Vec<HighlightSpan>>,
+    tokens: &'a SyntaxTokens,
+    default_fg: RgbaColor,
+}
+
+impl HighlightCtx<'_> {
+    /// Lazily queries highlight spans for every visible buffer row (one query per contiguous
+    /// run of rows, so collapsed regions are never scanned). Runs only on a shaped-line cache
+    /// miss, so steady-state frames do no Tree-sitter work at all.
+    fn spans(&mut self) -> &[HighlightSpan] {
+        let syntax = self.syntax;
+        let rows = self.rows;
+        self.spans.get_or_insert_with(|| {
+            let mut out = Vec::new();
+            let Some(syntax) = syntax else {
+                return out;
+            };
+            let mut iter = rows.iter().map(|&(_, row)| row).peekable();
+            while let Some(start) = iter.next() {
+                let mut end = start;
+                while let Some(&next) = iter.peek() {
+                    if next != end + 1 {
+                        break;
+                    }
+                    end = next;
+                    iter.next();
+                }
+                syntax.highlight_lines_into(start..end + 1, &mut out);
+            }
+            out
+        })
+    }
+}
 
 /// Prepaint payload passed from [`EditorCanvasElement::prepaint`] to [`EditorCanvasElement::paint`].
 #[derive(Debug)]
@@ -31,9 +210,12 @@ pub struct EditorPrepaintState {
     scroll_x: f32,
     scroll_y: f32,
     visible_range: Range<usize>,
-    active_lines: SmallVec<[usize; 4]>,
+    active_visual_rows: SmallVec<[usize; 4]>,
     shaped_lines: Vec<(usize, ShapedLine, f32)>,
     shaped_gutter_numbers: Vec<(usize, ShapedLine)>,
+    gutter_markers: Vec<GutterMarker>,
+    fold_pills: Vec<FoldPill>,
+    gutter_hitbox: Hitbox,
     overlays: Overlays,
     scrollbar_thumb: Option<(f32, f32)>,
     scrollbar_active: bool,
@@ -90,7 +272,8 @@ impl Element for EditorCanvasElement {
         clippy::cast_precision_loss,
         clippy::too_many_lines,
         reason = "viewport line counts and widths fit cleanly within f32; one linear \
-                  per-frame pipeline (metrics, shaping, overlays) kept in order"
+                  per-frame pipeline (metrics, shaping, gutter markers, pills, overlays) kept \
+                  in order"
     )]
     fn prepaint(
         &mut self,
@@ -105,10 +288,14 @@ impl Element for EditorCanvasElement {
         let editor_fg = hsla_from_rgba(theme.editor().foreground);
         let gutter_fg = hsla_from_rgba(theme.gutter().line_number);
         let gutter_active_fg = hsla_from_rgba(theme.gutter().line_number_active);
+        let pill_fg = hsla_from_rgba(theme.text().muted);
+        let syntax_tokens = theme.tokens().syntax.clone();
+        let default_fg = theme.editor().foreground;
 
         self.view.update(cx, |editor, _cx| {
             let snapshot = editor.snapshot();
             let total_lines = snapshot.len_lines().max(1);
+            let total_visual = editor.fold_map().visible_line_count(total_lines).max(1);
             let font_size_px = editor.font_size_px();
             let gutter_font_size_px = (font_size_px - 1.0).max(9.0);
             let line_height_px = ViewportMetrics::quantized_line_height(font_size_px);
@@ -138,25 +325,50 @@ impl Element for EditorCanvasElement {
             );
             editor.update_layout_metrics(metrics, gutter_width_px);
 
-            let scroll_y = metrics.clamp_scroll_y(editor.scroll_offset().y, total_lines);
-            let visible_range = metrics.visible_line_range(scroll_y, total_lines);
+            let scroll_y = metrics.clamp_scroll_y(editor.scroll_offset().y, total_visual);
+            let visible_range = metrics.visible_line_range(scroll_y, total_visual);
             let active_lines = editor.active_lines(&snapshot);
+            let rows: Vec<(usize, usize)> = {
+                let fold_map = editor.fold_map();
+                visible_range
+                    .clone()
+                    .map(|visual| (visual, fold_map.visual_to_buffer_line(visual)))
+                    .filter(|&(_, row)| row < total_lines)
+                    .collect()
+            };
+            let active_visual_rows: SmallVec<[usize; 4]> = active_lines
+                .iter()
+                .filter(|&&row| !editor.fold_map().is_hidden(row))
+                .map(|&row| editor.fold_map().visual_row_of(row))
+                .collect();
 
+            let syntax_revision = editor.syntax_revision();
             editor.line_cache_mut().sync_context(
                 snapshot.version().as_u64(),
                 theme.revision,
+                syntax_revision,
                 font_size_px,
             );
 
-            let mut shaped_lines = Vec::with_capacity(visible_range.len());
-            let mut visible_shaped_cache = Vec::with_capacity(visible_range.len());
-            let mut shaped_gutter_numbers = Vec::with_capacity(visible_range.len());
+            let syntax = editor.syntax().cloned();
+            let mut highlight = HighlightCtx {
+                syntax: syntax.as_deref(),
+                rows: &rows,
+                spans: None,
+                tokens: &syntax_tokens,
+                default_fg,
+            };
+
+            let mut shaped_lines = Vec::with_capacity(rows.len());
+            let mut visible_shaped_cache = Vec::with_capacity(rows.len());
+            let mut shaped_gutter_numbers = Vec::with_capacity(rows.len());
+            let mut gutter_markers = Vec::new();
             let mut max_visible_width_px: f32 = 0.0;
 
             let mut num_scratch = String::with_capacity(16);
             let scroll_x_raw = editor.scroll_offset().x.max(0.0);
 
-            for row in visible_range.clone() {
+            for &(visual_row, row) in &rows {
                 if let Some((shaped, byte_start, x_offset)) = shape_visible_line(
                     editor,
                     &snapshot,
@@ -167,12 +379,19 @@ impl Element for EditorCanvasElement {
                     &editor_font,
                     editor_font_size,
                     editor_fg,
+                    &mut highlight,
                     window,
                 ) {
                     max_visible_width_px =
                         max_visible_width_px.max(x_offset + f32::from(shaped.width));
-                    visible_shaped_cache.push((row, shaped.clone(), byte_start, x_offset));
-                    shaped_lines.push((row, shaped, x_offset));
+                    visible_shaped_cache.push(VisibleShapedLine {
+                        row,
+                        visual_row,
+                        shaped: shaped.clone(),
+                        byte_start,
+                        x_offset,
+                    });
+                    shaped_lines.push((visual_row, shaped, x_offset));
                 }
 
                 let is_active = active_lines.contains(&row);
@@ -187,19 +406,49 @@ impl Element for EditorCanvasElement {
                     gutter_active_fg,
                     window,
                 );
-                shaped_gutter_numbers.push((row, shaped_num));
+                shaped_gutter_numbers.push((visual_row, shaped_num));
+
+                gutter_markers.extend(GutterMarker::for_row(
+                    editor,
+                    syntax.as_deref(),
+                    row,
+                    visual_row,
+                    is_active,
+                ));
             }
 
             let max_scroll_x =
                 (max_visible_width_px + char_advance * 4.0 - viewport_width_px).max(0.0);
             editor.set_scroll_bounds_and_clamp(max_scroll_x, scroll_y);
             let scroll_x = editor.scroll_offset().x;
-            editor.set_render_cache(bounds, visible_shaped_cache);
 
             let geom =
                 OverlayGeometry::new(bounds, gutter_width_px, &metrics, editor.scroll_offset());
+
+            let gutter_hitbox =
+                insert_gutter_hitboxes(window, bounds, gutter_width_px, geom, &mut gutter_markers);
+            let pill_font = TextRun {
+                len: 0,
+                font: editor_font.clone(),
+                color: pill_fg,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let fold_pills = build_fold_pills(
+                editor,
+                &visible_shaped_cache,
+                &pill_font,
+                gutter_font_size,
+                geom,
+                window,
+            );
+            editor.set_fold_pills(fold_pills.iter().map(|p| (p.bounds, p.row)).collect());
+
+            editor.set_render_cache(bounds, visible_shaped_cache);
+
             let focused = editor.focus_handle().is_focused(window);
-            let mut overlays = compute_overlays(editor, &snapshot, &visible_range, geom, focused);
+            let mut overlays = compute_overlays(editor, &snapshot, geom, focused);
             if focused {
                 let inverse = hsla_from_rgba(theme.text().inverse);
                 shape_caret_glyphs(
@@ -218,11 +467,14 @@ impl Element for EditorCanvasElement {
                 scroll_x,
                 scroll_y,
                 visible_range,
-                active_lines,
+                active_visual_rows,
                 shaped_lines,
                 shaped_gutter_numbers,
+                gutter_markers,
+                fold_pills,
+                gutter_hitbox,
                 overlays,
-                scrollbar_thumb: metrics.vertical_scrollbar_thumb(scroll_y, total_lines),
+                scrollbar_thumb: metrics.vertical_scrollbar_thumb(scroll_y, total_visual),
                 scrollbar_active: editor.is_scrollbar_active(),
             }
         })
@@ -273,7 +525,7 @@ impl Element for EditorCanvasElement {
         // Clip all editor painting strictly to the element bounds.
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             // Layer 1: Active line highlight spanning both gutter and content area.
-            for &active_row in &prepaint.active_lines {
+            for &active_row in &prepaint.active_visual_rows {
                 if prepaint.visible_range.contains(&active_row) {
                     let y = bounds.origin.y
                         + px(active_row as f32 * prepaint.line_height_px - prepaint.scroll_y);
@@ -312,7 +564,17 @@ impl Element for EditorCanvasElement {
                         let x = digits_right_x - shaped_num.width;
                         drop(shaped_num.paint(point(x, y), line_height, window, cx));
                     }
+                    // Layer 7c: fold chevrons and `▶` run icons in their reserved slots.
+                    paint_gutter_markers(prepaint, &theme, window);
                 },
+            );
+
+            // Layer 7d: `... (N lines)` pills after collapsed fold headers.
+            window.with_content_mask(
+                Some(ContentMask {
+                    bounds: content_bounds,
+                }),
+                |window| paint_fold_pills(prepaint, &theme, window, cx),
             );
 
             // Conditional 1px gutter separator when horizontally scrolled.
@@ -339,7 +601,156 @@ impl Element for EditorCanvasElement {
         });
 
         self.register_input_handlers(bounds, window, cx);
+        register_hover_refresh(prepaint, window);
     }
+}
+
+/// Paints fold chevrons (`›` collapsed, `⌄` expandable on gutter hover or caret line) and
+/// `▶` run icons (with hover background and pointing-hand cursor).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "visible row index fits cleanly within f32"
+)]
+fn paint_gutter_markers(prepaint: &EditorPrepaintState, theme: &KovaTheme, window: &mut Window) {
+    let fold_color = hsla_from_rgba(theme.gutter().fold_marker);
+    let run_color = hsla_from_rgba(theme.gutter().run_icon);
+    let hover_bg = hsla_from_rgba(theme.surfaces().hover);
+    let gutter_hovered = prepaint.gutter_hitbox.is_hovered(window);
+    let (run_slot, fold_slot) = ViewportMetrics::gutter_slot_ranges(prepaint.gutter_width_px);
+    let origin = prepaint.bounds.origin;
+    let lh = prepaint.line_height_px;
+
+    for marker in &prepaint.gutter_markers {
+        let top = f32::from(origin.y) + marker.visual_row as f32 * lh - prepaint.scroll_y;
+        let center_y = top + lh / 2.0;
+
+        if let Some(role) = marker.run {
+            let slot_x = f32::from(origin.x) + run_slot.start;
+            let hovered = marker
+                .run_hitbox
+                .as_ref()
+                .is_some_and(|hitbox| hitbox.is_hovered(window));
+            if let Some(hitbox) = marker.run_hitbox.as_ref() {
+                window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+            }
+            if hovered {
+                let side = GUTTER_RUN_SLOT_PX.min(lh);
+                let mut quad = fill(
+                    Bounds::new(
+                        point(px(slot_x), px(center_y - side / 2.0)),
+                        size(px(GUTTER_RUN_SLOT_PX), px(side)),
+                    ),
+                    hover_bg,
+                );
+                quad.corner_radii = px(GUTTER_HOVER_RADIUS_PX).into();
+                window.paint_quad(quad);
+            }
+            let icon_x = slot_x + (GUTTER_RUN_SLOT_PX - RUN_ICON_SIZE_PX) / 2.0 + 0.5;
+            paint_run_triangle(window, icon_x, center_y, RUN_ICON_SIZE_PX, run_color);
+            if role == GutterIconRole::RunAll {
+                // Test class (runs every test): a second, smaller chevron marks the group.
+                paint_run_triangle(
+                    window,
+                    icon_x + 4.0,
+                    center_y,
+                    RUN_ICON_SIZE_PX * 0.6,
+                    run_color,
+                );
+            }
+        }
+
+        if let Some(collapsed) = marker.fold {
+            if let Some(hitbox) = marker.fold_hitbox.as_ref() {
+                window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+            }
+            if collapsed || gutter_hovered || marker.active {
+                let cx = f32::from(origin.x) + f32::midpoint(fold_slot.start, fold_slot.end);
+                paint_chevron(window, cx, center_y, collapsed, fold_color);
+            }
+        }
+    }
+}
+
+/// Paints a filled right-pointing triangle of height `side` starting at `x`.
+fn paint_run_triangle(window: &mut Window, x: f32, center_y: f32, side: f32, color: Hsla) {
+    let mut builder = PathBuilder::fill();
+    builder.move_to(point(px(x), px(center_y - side / 2.0)));
+    builder.line_to(point(px(x + side * 0.866), px(center_y)));
+    builder.line_to(point(px(x), px(center_y + side / 2.0)));
+    builder.close();
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// Paints a stroked fold chevron: `›` when `collapsed`, `⌄` otherwise.
+fn paint_chevron(window: &mut Window, cx: f32, cy: f32, collapsed: bool, color: Hsla) {
+    let h = CHEVRON_HALF_PX;
+    let mut builder = PathBuilder::stroke(px(1.4));
+    if collapsed {
+        builder.move_to(point(px(cx - h / 2.0), px(cy - h)));
+        builder.line_to(point(px(cx + h / 2.0), px(cy)));
+        builder.line_to(point(px(cx - h / 2.0), px(cy + h)));
+    } else {
+        builder.move_to(point(px(cx - h), px(cy - h / 2.0)));
+        builder.line_to(point(px(cx), px(cy + h / 2.0)));
+        builder.line_to(point(px(cx + h), px(cy - h / 2.0)));
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// Paints the `... (N lines)` pills (`editor.inlay_hint_bg`, `text.muted`, `rx = 4 px`).
+fn paint_fold_pills(
+    prepaint: &EditorPrepaintState,
+    theme: &KovaTheme,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let bg = hsla_from_rgba(theme.editor().inlay_hint_bg);
+    for pill in &prepaint.fold_pills {
+        window.set_cursor_style(CursorStyle::PointingHand, &pill.hitbox);
+        let mut quad = fill(pill.bounds, bg);
+        quad.corner_radii = px(GUTTER_HOVER_RADIUS_PX).into();
+        window.paint_quad(quad);
+        let text_origin = point(
+            pill.bounds.origin.x + px(FOLD_PILL_PAD_X_PX),
+            pill.bounds.origin.y,
+        );
+        drop(
+            pill.label
+                .paint(text_origin, pill.bounds.size.height, window, cx),
+        );
+    }
+}
+
+/// Repaints when the pointer enters/leaves the gutter or a `▶` slot, so the `⌄` reveal and
+/// the run-icon hover background follow the mouse without per-move editor state.
+fn register_hover_refresh(prepaint: &EditorPrepaintState, window: &mut Window) {
+    let gutter = prepaint.gutter_hitbox.clone();
+    let gutter_was = gutter.is_hovered(window);
+    let runs: Vec<(Hitbox, bool)> = prepaint
+        .gutter_markers
+        .iter()
+        .filter_map(|m| m.run_hitbox.clone())
+        .map(|hitbox| {
+            let was = hitbox.is_hovered(window);
+            (hitbox, was)
+        })
+        .collect();
+    window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, _cx| {
+        if phase != DispatchPhase::Bubble {
+            return;
+        }
+        let changed = gutter.is_hovered(window) != gutter_was
+            || runs
+                .iter()
+                .any(|(hitbox, was)| hitbox.is_hovered(window) != *was);
+        if changed {
+            window.refresh();
+        }
+    });
 }
 
 /// Pixel geometry shared by the selection, caret and IME overlay computation.
@@ -368,6 +779,15 @@ impl OverlayGeometry {
             line_height_px: metrics.line_height,
             char_advance: metrics.char_advance,
         }
+    }
+
+    /// Window-space y of the top edge of `visual_row`.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "visible row indices fit cleanly within f32"
+    )]
+    fn row_y(&self, visual_row: usize) -> f32 {
+        self.origin_y + (visual_row as f32 * self.line_height_px - self.scroll_y)
     }
 }
 
@@ -443,13 +863,13 @@ fn span_x_range(
     include_newline: bool,
     geom: OverlayGeometry,
 ) -> Option<(f32, f32)> {
-    let (row, shaped, byte_start, x_offset) = line;
-    let line_start = snapshot.rope().line_to_byte(*row);
-    let line_len = snapshot.line_len_bytes(*row).unwrap_or(0);
+    let row = line.row;
+    let line_start = snapshot.rope().line_to_byte(row);
+    let line_len = snapshot.line_len_bytes(row).unwrap_or(0);
     let line_end = line_start + line_len;
     let limit = if include_newline {
         snapshot
-            .line_slice_with_ending(*row)
+            .line_slice_with_ending(row)
             .map_or(line_end, |s| line_start + s.len_bytes())
     } else {
         line_end
@@ -461,9 +881,9 @@ fn span_x_range(
     let local_end = range.end.saturating_sub(line_start).min(line_len);
     let x = |local| {
         x_for_line_byte(
-            shaped,
-            *byte_start,
-            *x_offset,
+            &line.shaped,
+            line.byte_start,
+            line.x_offset,
             local,
             geom.content_origin_x,
             geom.scroll_x,
@@ -477,14 +897,9 @@ fn span_x_range(
     (x2 > x1).then_some((x1, x2))
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "visible row indices fit cleanly within f32"
-)]
 fn compute_overlays(
     editor: &EditorView,
     snapshot: &BufferSnapshot,
-    visible_range: &Range<usize>,
     geom: OverlayGeometry,
     focused: bool,
 ) -> Overlays {
@@ -499,7 +914,7 @@ fn compute_overlays(
         caret_visible: editor.is_cursor_visible(),
     };
     let lh = geom.line_height_px;
-    let row_y = |row: usize| geom.origin_y + (row as f32 * lh - geom.scroll_y);
+    let row_y = |visual_row: usize| geom.row_y(visual_row);
     let visible = editor.visible_shaped_lines();
 
     for sel in editor.selections().as_slice() {
@@ -508,7 +923,7 @@ fn compute_overlays(
             for line in visible {
                 if let Some((x1, x2)) = span_x_range(snapshot, line, &range, true, geom) {
                     out.selections.push(Bounds::new(
-                        point(px(x1), px(row_y(line.0))),
+                        point(px(x1), px(row_y(line.visual_row))),
                         size(px(x2 - x1), px(lh)),
                     ));
                 }
@@ -519,23 +934,25 @@ fn compute_overlays(
         let Ok(pt) = snapshot.byte_to_point(head) else {
             continue;
         };
-        if !visible_range.contains(&pt.row) {
-            continue;
-        }
-        let Some((_, shaped, byte_start, x_offset)) = visible.iter().find(|l| l.0 == pt.row) else {
+        // Hidden (folded) or off-screen rows have no visible shaped line.
+        let Some(line) = visible.iter().find(|l| l.row == pt.row) else {
             continue;
         };
         let x = x_for_line_byte(
-            shaped,
-            *byte_start,
-            *x_offset,
+            &line.shaped,
+            line.byte_start,
+            line.x_offset,
             pt.column,
             geom.content_origin_x,
             geom.scroll_x,
         );
-        let y = row_y(pt.row);
+        let y = row_y(line.visual_row);
         // Width of the glyph under the caret; one `char_advance` at the end of the line.
-        let rel = pt.column.saturating_sub(*byte_start).min(shaped.text.len());
+        let shaped = &line.shaped;
+        let rel = pt
+            .column
+            .saturating_sub(line.byte_start)
+            .min(shaped.text.len());
         let glyph = shaped.text[rel..].chars().next().filter(|c| *c != '\n');
         let cell = glyph.map_or(geom.char_advance, |c| {
             let next = rel + c.len_utf8();
@@ -562,7 +979,7 @@ fn compute_overlays(
         for line in visible {
             if let Some((x1, x2)) = span_x_range(snapshot, line, &marked, false, geom) {
                 out.ime_underlines.push(Bounds::new(
-                    point(px(x1), px(row_y(line.0) + lh - 1.0)),
+                    point(px(x1), px(row_y(line.visual_row) + lh - 1.0)),
                     size(px(x2 - x1), px(1.0)),
                 ));
             }
@@ -602,7 +1019,7 @@ fn shape_caret_glyphs(
     overlays: &mut Overlays,
     editor_font: &gpui::Font,
     font_size: Pixels,
-    color: gpui::Hsla,
+    color: Hsla,
     window: &mut Window,
 ) {
     let mut font = editor_font.clone();
@@ -631,7 +1048,7 @@ fn measure_char_advance(
     window: &mut Window,
     font: gpui::Font,
     font_size: Pixels,
-    color: gpui::Hsla,
+    color: Hsla,
 ) -> f32 {
     let sample_run = TextRun {
         len: 1,
@@ -675,7 +1092,8 @@ fn shape_visible_line(
     viewport_width_px: f32,
     editor_font: &gpui::Font,
     editor_font_size: Pixels,
-    editor_fg: gpui::Hsla,
+    editor_fg: Hsla,
+    highlight: &mut HighlightCtx<'_>,
     window: &mut Window,
 ) -> Option<(ShapedLine, usize, f32)> {
     let line_slice = snapshot.line_slice(row).ok()?;
@@ -695,19 +1113,39 @@ fn shape_visible_line(
     let key = LineCacheKey::new(row, byte_range.start, byte_range.end);
 
     if editor.line_cache_mut().get(key).is_none() {
-        let slice_str = &editor.line_scratch_mut()[byte_range];
-        let text: SharedString = slice_str.to_owned().into();
-        let run = TextRun {
-            len: text.len(),
-            font: editor_font.clone(),
-            color: editor_fg,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
+        let line_str = editor.line_scratch_mut().as_str();
+        let text: SharedString = line_str[byte_range.clone()].to_owned().into();
+        // Stale-safe: spans and line start come from the snapshot the tree was parsed from.
+        let line_start = highlight.syntax.and_then(|s| s.line_start_byte(row));
+        let mut runs = match line_start {
+            Some(line_start) => {
+                let tokens = highlight.tokens;
+                let default_fg = highlight.default_fg;
+                let segments = segment_line_styles(
+                    line_str,
+                    line_start,
+                    byte_range,
+                    highlight.spans(),
+                    tokens,
+                    default_fg,
+                );
+                build_line_text_runs(&segments, editor_font)
+            }
+            None => Vec::new(),
         };
+        if runs.iter().map(|r| r.len).sum::<usize>() != text.len() {
+            runs = vec![TextRun {
+                len: text.len(),
+                font: editor_font.clone(),
+                color: editor_fg,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }];
+        }
         let shaped = window
             .text_system()
-            .shape_line(text, editor_font_size, &[run], None);
+            .shape_line(text, editor_font_size, &runs, None);
         editor.line_cache_mut().insert(key, shaped);
     }
 
@@ -728,8 +1166,8 @@ fn shape_gutter_number(
     gutter_font: &gpui::Font,
     gutter_font_active: &gpui::Font,
     gutter_font_size: Pixels,
-    gutter_fg: gpui::Hsla,
-    gutter_active_fg: gpui::Hsla,
+    gutter_fg: Hsla,
+    gutter_active_fg: Hsla,
     window: &mut Window,
 ) -> ShapedLine {
     num_scratch.clear();

@@ -56,6 +56,17 @@ pub const SCROLLBAR_RIGHT_MARGIN_PX: f32 = 4.0;
 /// Minimum vertical scrollbar thumb height (`24 px`) so 1M-line files remain draggable.
 pub const SCROLLBAR_MIN_THUMB_LEN_PX: f32 = 24.0;
 
+/// Interactive gutter slot under the mouse pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GutterSlot {
+    /// `Run/Debug/Breakpoint` slot (`18 px`) holding the `▶` icon.
+    Run,
+    /// Fold chevron slot (`14 px`).
+    Fold,
+    /// Line numbers, padding or the git bar.
+    Other,
+}
+
 /// Quantized viewport metrics used to compute $O(1)$ visible line slices.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewportMetrics {
@@ -204,6 +215,37 @@ impl ViewportMetrics {
             + GUTTER_RIGHT_PAD_PX
     }
 
+    /// Returns the gutter-local x ranges `(run_slot, fold_slot)` for a gutter of
+    /// `gutter_width_px`. Shared by painting and mouse hit-testing so both always agree.
+    #[must_use]
+    pub fn gutter_slot_ranges(gutter_width_px: f32) -> (Range<f32>, Range<f32>) {
+        let digits_right = gutter_width_px
+            - (GUTTER_DIGITS_GAP_PX
+                + GUTTER_RUN_SLOT_PX
+                + GUTTER_FOLD_SLOT_PX
+                + GUTTER_GIT_BAR_SLOT_PX
+                + GUTTER_RIGHT_PAD_PX);
+        let run_start = digits_right + GUTTER_DIGITS_GAP_PX;
+        let fold_start = run_start + GUTTER_RUN_SLOT_PX;
+        (
+            run_start..fold_start,
+            fold_start..fold_start + GUTTER_FOLD_SLOT_PX,
+        )
+    }
+
+    /// Classifies a gutter-local x coordinate into the interactive slot under it.
+    #[must_use]
+    pub fn gutter_slot_at(local_x: f32, gutter_width_px: f32) -> GutterSlot {
+        let (run, fold) = Self::gutter_slot_ranges(gutter_width_px);
+        if run.contains(&local_x) {
+            GutterSlot::Run
+        } else if fold.contains(&local_x) {
+            GutterSlot::Fold
+        } else {
+            GutterSlot::Other
+        }
+    }
+
     /// Returns `(byte_range, x_offset_px)` for shaping a single line safely within frame budget.
     ///
     /// Lines up to [`MAX_SHAPED_BYTES_PER_LINE`] are returned in full (`0..line.len()`, `0.0`).
@@ -306,6 +348,31 @@ fn ceil_char_boundary(s: &str, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gutter_slots_follow_the_reserved_anatomy() {
+        let width = ViewportMetrics::gutter_width_px(100, 7.2);
+        let (run, fold) = ViewportMetrics::gutter_slot_ranges(width);
+        assert!((run.end - run.start - GUTTER_RUN_SLOT_PX).abs() < f32::EPSILON);
+        assert!((fold.end - fold.start - GUTTER_FOLD_SLOT_PX).abs() < f32::EPSILON);
+        assert!((run.start - (GUTTER_LEFT_PAD_PX + 28.0 + GUTTER_DIGITS_GAP_PX)).abs() < 0.01);
+        assert_eq!(
+            ViewportMetrics::gutter_slot_at(run.start + 1.0, width),
+            GutterSlot::Run
+        );
+        assert_eq!(
+            ViewportMetrics::gutter_slot_at(fold.start + 1.0, width),
+            GutterSlot::Fold
+        );
+        assert_eq!(
+            ViewportMetrics::gutter_slot_at(2.0, width),
+            GutterSlot::Other
+        );
+        assert_eq!(
+            ViewportMetrics::gutter_slot_at(width - 1.0, width),
+            GutterSlot::Other
+        );
+    }
 
     #[test]
     fn quantized_line_height_matches_guidelines() {

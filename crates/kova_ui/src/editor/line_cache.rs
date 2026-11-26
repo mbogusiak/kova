@@ -1,6 +1,7 @@
 //! Bounded $O(\text{viewport})$ cache for shaped editor lines.
 //!
-//! Invalidates in $O(1)$ whenever buffer revision, theme revision, or font size changes,
+//! Invalidates in $O(1)$ whenever buffer revision, theme revision, syntax revision or font
+//! size changes,
 //! and bounds memory strictly by `capacity` entries regardless of file size.
 
 use std::collections::{HashMap, VecDeque};
@@ -40,6 +41,7 @@ pub struct ShapedLineCache<V> {
     capacity: usize,
     buffer_version: u64,
     theme_revision: u64,
+    syntax_revision: u64,
     font_size_bits: u32,
     entries: HashMap<LineCacheKey, V>,
     order: VecDeque<LineCacheKey>,
@@ -59,6 +61,7 @@ impl<V> ShapedLineCache<V> {
             capacity,
             buffer_version: u64::MAX,
             theme_revision: u64::MAX,
+            syntax_revision: u64::MAX,
             font_size_bits: 0,
             entries: HashMap::with_capacity(capacity.min(1024)),
             order: VecDeque::with_capacity(capacity.min(1024)),
@@ -83,19 +86,30 @@ impl<V> ShapedLineCache<V> {
         self.entries.is_empty()
     }
 
-    /// Synchronizes the cache with the active `(buffer_version, theme_revision, font_size_px)`.
+    /// Synchronizes the cache with the active
+    /// `(buffer_version, theme_revision, syntax_revision, font_size_px)`.
     ///
-    /// Clears all entries in $O(1)$ amortized time if any version or font size changed.
-    pub fn sync_context(&mut self, buffer_version: u64, theme_revision: u64, font_size_px: f32) {
+    /// Clears all entries in $O(1)$ amortized time if any revision or the font size changed.
+    /// Folding never calls this with new values: keys are buffer lines, so collapsing or
+    /// expanding a region reuses every already shaped line.
+    pub fn sync_context(
+        &mut self,
+        buffer_version: u64,
+        theme_revision: u64,
+        syntax_revision: u64,
+        font_size_px: f32,
+    ) {
         let font_bits = font_size_px.to_bits();
         if self.buffer_version != buffer_version
             || self.theme_revision != theme_revision
+            || self.syntax_revision != syntax_revision
             || self.font_size_bits != font_bits
         {
             self.entries.clear();
             self.order.clear();
             self.buffer_version = buffer_version;
             self.theme_revision = theme_revision;
+            self.syntax_revision = syntax_revision;
             self.font_size_bits = font_bits;
         }
     }
@@ -140,7 +154,7 @@ mod tests {
     #[test]
     fn enforces_capacity_bound_during_long_scrolls() {
         let mut cache = ShapedLineCache::new(64);
-        cache.sync_context(1, 0, 13.0);
+        cache.sync_context(1, 0, 0, 13.0);
 
         for line in 0..1_000 {
             cache.insert(LineCacheKey::new(line, 0, 42), line);
@@ -153,28 +167,33 @@ mod tests {
     }
 
     #[test]
-    fn invalidates_on_buffer_theme_or_font_size_change() {
+    fn invalidates_on_buffer_theme_syntax_or_font_size_change() {
         let mut cache = ShapedLineCache::new(16);
-        cache.sync_context(1, 0, 13.0);
+        cache.sync_context(1, 0, 0, 13.0);
         cache.insert(LineCacheKey::new(0, 0, 10), "hello");
         assert_eq!(cache.len(), 1);
 
         // Same context retains entry.
-        cache.sync_context(1, 0, 13.0);
+        cache.sync_context(1, 0, 0, 13.0);
         assert_eq!(cache.get(LineCacheKey::new(0, 0, 10)), Some(&"hello"));
 
         // Buffer version bump clears cache.
-        cache.sync_context(2, 0, 13.0);
+        cache.sync_context(2, 0, 0, 13.0);
         assert!(cache.is_empty());
 
         cache.insert(LineCacheKey::new(0, 0, 10), "world");
         // Theme revision bump clears cache.
-        cache.sync_context(2, 1, 13.0);
+        cache.sync_context(2, 1, 0, 13.0);
+        assert!(cache.is_empty());
+
+        cache.insert(LineCacheKey::new(0, 0, 10), "fresh");
+        // New syntax snapshot (fresh colours) clears cache.
+        cache.sync_context(2, 1, 1, 13.0);
         assert!(cache.is_empty());
 
         cache.insert(LineCacheKey::new(0, 0, 10), "again");
         // Font size change clears cache.
-        cache.sync_context(2, 1, 14.0);
+        cache.sync_context(2, 1, 1, 14.0);
         assert!(cache.is_empty());
     }
 }

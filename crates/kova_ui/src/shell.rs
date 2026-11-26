@@ -29,7 +29,9 @@ use kova_core::perf::{
     BudgetKind, budgets, check_duration_budget, check_rss_budget, current_process_rss_bytes,
 };
 use kova_core::project::{ProjectScanOptions, scan_project};
-use kova_syntax::{LanguageRegistry, SyntaxEngine, SyntaxEngineConfig, detect_language};
+use kova_syntax::{
+    Highlighter, LanguageRegistry, SyntaxEngine, SyntaxEngineConfig, detect_language,
+};
 use kova_theme::SyntaxLanguage;
 
 use crate::dock::bottom_panel::BOTTOM_TAB_BAR_HEIGHT_PX;
@@ -49,6 +51,7 @@ use crate::document::{
     DocumentState, SAVE_PATH_REQUIRED_MESSAGE, SaveAction, SaveSink, SaveTicket, StatusKind,
 };
 use crate::editor::actions::{Save, WORKSPACE_KEY_CONTEXT};
+use crate::editor::syntax::{EditorSyntax, RunEntryPointRequested};
 use crate::editor::vim::VimKeyResult;
 use crate::editor::{EditorEvent, EditorView, SharedBuffer};
 use crate::keymap::{
@@ -69,8 +72,9 @@ const STRIPE_INDICATOR_WIDTH_PX: f32 = 2.5;
 const RESIZE_SPLIT_STEP: f32 = 0.05;
 const DOCK_HEADER_HEIGHT_PX: f32 = 30.0;
 const FILTER_BAR_HEIGHT_PX: f32 = 26.0;
-/// Debounce applied before re-running `kova_syntax` analysis after an edit.
-const ANALYSIS_DEBOUNCE: Duration = Duration::from_millis(120);
+/// Debounce applied before re-running `kova_syntax` analysis after an edit. Editors keep
+/// painting the previous syntax snapshot (stale fallback) until the new one arrives.
+const ANALYSIS_DEBOUNCE: Duration = Duration::from_millis(60);
 /// Upper bound on syntax problems collected per document.
 const MAX_SYNTAX_PROBLEMS: usize = 200;
 
@@ -304,6 +308,8 @@ struct AnalysisResult {
     engine: Option<Arc<SyntaxEngine>>,
     structure: StructureModel,
     problems: Vec<ProblemEntry>,
+    /// Highlight / fold / entry-point snapshot pushed to every editor showing the document.
+    syntax: Option<Arc<EditorSyntax>>,
 }
 
 /// Root GPUI view rendering the *Kova Islands* `IntelliJ` New UI workspace.
@@ -620,10 +626,14 @@ impl WorkspaceShell {
             self.analysis_task = None;
             return;
         };
+        let document = self.documents.get(&path).cloned();
         let Some(language) = detect_language(&path) else {
             self.structure = StructureModel::default();
             self.bottom_panel.set_problems(Vec::new());
             self.analysis_task = None;
+            if let Some(document) = document.as_ref() {
+                self.push_editor_syntax(document, None, cx);
+            }
             return;
         };
         let engine = self.syntax_engine.clone();
@@ -642,10 +652,30 @@ impl WorkspaceShell {
                 }
                 this.structure = result.structure;
                 this.bottom_panel.set_problems(result.problems);
+                if let (Some(document), Some(syntax)) = (document.as_ref(), result.syntax) {
+                    this.push_editor_syntax(document, Some(&syntax), cx);
+                }
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    /// Delivers a syntax snapshot to every editor (in any split) showing `document`.
+    fn push_editor_syntax(
+        &self,
+        document: &SharedBuffer,
+        syntax: Option<&Arc<EditorSyntax>>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        for state in self.panes.values() {
+            for editor in state.editors.values() {
+                if editor.read(cx).shared_buffer().same_document(document) {
+                    let syntax = syntax.cloned();
+                    editor.update(cx, |editor, cx| editor.set_syntax(syntax, cx));
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -659,7 +689,7 @@ impl WorkspaceShell {
         cx: &mut Context<'_, Self>,
     ) -> Subscription {
         cx.subscribe(editor, move |this, editor, event: &EditorEvent, cx| {
-            this.on_editor_event(pane, tab, &editor, *event, cx);
+            this.on_editor_event(pane, tab, &editor, event, cx);
         })
     }
 
@@ -668,7 +698,7 @@ impl WorkspaceShell {
         pane: PaneId,
         tab: TabId,
         editor: &Entity<EditorView>,
-        event: EditorEvent,
+        event: &EditorEvent,
         cx: &mut Context<'_, Self>,
     ) {
         match event {
@@ -707,7 +737,24 @@ impl WorkspaceShell {
                 self.refresh_analysis(ANALYSIS_DEBOUNCE, cx);
                 cx.notify();
             }
+            EditorEvent::RunEntryPoint(entry) => {
+                let path = self
+                    .panes
+                    .get(&pane)
+                    .and_then(|state| state.tabs.tabs().iter().find(|t| t.id == tab))
+                    .and_then(|t| t.path.clone());
+                let request = RunEntryPointRequested::from_entry_point(entry, path);
+                self.handle_run_request(&request);
+                cx.notify();
+            }
         }
+    }
+
+    /// Phase 1 handling of a gutter `▶` click: opens the *Run* tab and logs the target.
+    /// Process execution attaches in Phase 2/3 (`kova_toolchain` / `kova_tools`).
+    fn handle_run_request(&mut self, request: &RunEntryPointRequested) {
+        self.bottom_panel.run_logs.push(request.log_line());
+        self.dock_layout.bottom_open = Some(DockToolId::Run);
     }
 
     fn set_active_pane(&mut self, pane: PaneId, cx: &mut Context<'_, Self>) {
@@ -3321,6 +3368,7 @@ fn analyze_document(
             engine: None,
             structure: StructureModel::default(),
             problems: Vec::new(),
+            syntax: None,
         };
     };
     let Ok(tree) = active_engine.parse_sync(language, snapshot, None) else {
@@ -3328,47 +3376,33 @@ fn analyze_document(
             engine,
             structure: StructureModel::default(),
             problems: Vec::new(),
+            syntax: None,
         };
     };
     let outline = kova_syntax::extract_structure(&tree, snapshot);
     let structure = StructureModel::from_outline(&outline);
 
-    let mut problems = Vec::new();
-    if tree.has_error() {
-        let mut stack = vec![tree.root_node()];
-        while let Some(node) = stack.pop() {
-            if problems.len() >= MAX_SYNTAX_PROBLEMS {
-                break;
-            }
-            if node.is_error() || node.is_missing() {
-                let pos = node.start_position();
-                let message = if node.is_missing() {
-                    format!("Syntax error: missing `{}`", node.kind())
-                } else {
-                    "Syntax error: unexpected input".to_owned()
-                };
-                problems.push(ProblemEntry {
-                    file: file_label.to_owned(),
-                    line: pos.row + 1,
-                    col: pos.column + 1,
-                    severity: ProblemSeverity::Error,
-                    message,
-                });
-                continue;
-            }
-            if node.has_error() {
-                for idx in (0..node.child_count()).rev() {
-                    if let Some(child) = u32::try_from(idx).ok().and_then(|i| node.child(i)) {
-                        stack.push(child);
-                    }
-                }
-            }
-        }
-    }
+    let problems = kova_syntax::collect_syntax_diagnostics(&tree, MAX_SYNTAX_PROBLEMS)
+        .into_iter()
+        .map(|diagnostic| ProblemEntry {
+            file: file_label.to_owned(),
+            line: diagnostic.line + 1,
+            col: diagnostic.col + 1,
+            severity: ProblemSeverity::Error,
+            message: diagnostic.message,
+        })
+        .collect();
+    let highlighter = Highlighter::new(active_engine.registry().clone());
+    let syntax = Some(Arc::new(EditorSyntax::build(
+        tree,
+        snapshot.clone(),
+        highlighter,
+    )));
     AnalysisResult {
         engine,
         structure,
         problems,
+        syntax,
     }
 }
 

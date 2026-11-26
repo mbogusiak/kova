@@ -3,6 +3,7 @@
 //! This crate belongs to the **Headless Core**: it must compile and pass its
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
 
+pub mod diagnostics;
 pub mod engine;
 pub mod entry_points;
 pub mod error;
@@ -13,6 +14,9 @@ pub mod registry;
 pub mod structure;
 pub mod tree;
 
+pub use diagnostics::{
+    DEFAULT_MAX_SYNTAX_DIAGNOSTICS, SyntaxDiagnostic, collect_syntax_diagnostics,
+};
 pub use engine::{
     DEFAULT_PARSE_TIMEOUT, ParseJobHandle, ParseRequest, SyntaxEngine, SyntaxEngineConfig,
     SyntaxTreeStore,

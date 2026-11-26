@@ -3,11 +3,14 @@
 
 pub mod actions;
 pub mod element;
+pub mod folding;
+pub mod highlight;
 pub mod ime;
 pub mod input;
 pub mod line_cache;
 pub mod shared;
 pub mod state;
+pub mod syntax;
 pub mod viewport;
 pub mod vim;
 
@@ -22,15 +25,18 @@ use gpui::{
     Render, ScrollWheelEvent, ShapedLine, SharedString, Styled as _, Window, div, px,
 };
 use kova_buffer::{Buffer, BufferSnapshot, BufferVersion, Motion, SelectionSet};
+use kova_syntax::EntryPoint;
 use smallvec::SmallVec;
 
 use crate::editor::element::EditorCanvasElement;
+use crate::editor::folding::{FoldMap, VisualLineMapping};
 use crate::editor::input::{EditorKeyCommand, InputLatencyStats, KeyMods, map_editor_key};
 use crate::editor::line_cache::ShapedLineCache;
 pub use crate::editor::shared::SharedBuffer;
 use crate::editor::state::EditorState;
+use crate::editor::syntax::EditorSyntax;
 use crate::editor::viewport::{
-    DEFAULT_EDITOR_FONT_SIZE_PX, SCROLLBAR_RIGHT_MARGIN_PX, ViewportMetrics,
+    DEFAULT_EDITOR_FONT_SIZE_PX, GutterSlot, SCROLLBAR_RIGHT_MARGIN_PX, ViewportMetrics,
 };
 use crate::editor::vim::{CursorRenderKind, VimBridge, VimKeyResult};
 
@@ -85,8 +91,20 @@ enum DragMode {
     Lines { anchor_row: usize },
 }
 
-/// A visible line cached from the last prepaint: `(row, shaped, window_byte_start, x_offset)`.
-pub(crate) type VisibleShapedLine = (usize, ShapedLine, usize, f32);
+/// A visible line cached from the last prepaint.
+#[derive(Debug, Clone)]
+pub(crate) struct VisibleShapedLine {
+    /// 0-based buffer line.
+    pub(crate) row: usize,
+    /// 0-based visual row (after folding).
+    pub(crate) visual_row: usize,
+    /// Shaped text of the visible byte window.
+    pub(crate) shaped: ShapedLine,
+    /// Line-local start byte of the shaped window.
+    pub(crate) byte_start: usize,
+    /// Horizontal pixel offset of the shaped window inside the line.
+    pub(crate) x_offset: f32,
+}
 
 /// Whether an [`EditorView`] belongs to the active split pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,12 +114,14 @@ enum PaneRole {
 }
 
 /// Events emitted by [`EditorView`] to its owner (the workspace shell).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorEvent {
     /// The shared document was edited through this view.
     Edited,
     /// The view was clicked and took keyboard focus.
     Focused,
+    /// A gutter `▶` icon (or `Ctrl+Shift+R` on its line) asked to run an entry point.
+    RunEntryPoint(Box<EntryPoint>),
 }
 
 /// Virtualized GPUI code editor view operating strictly on $O(1)$ [`BufferSnapshot`]s.
@@ -131,6 +151,10 @@ pub struct EditorView {
     blink_epoch: u64,
     input_latency: InputLatencyStats,
     focus_handle: FocusHandle,
+    syntax: Option<Arc<EditorSyntax>>,
+    syntax_revision: u64,
+    fold_map: FoldMap,
+    fold_pills: Vec<(Bounds<Pixels>, usize)>,
 }
 
 impl EditorView {
@@ -169,6 +193,10 @@ impl EditorView {
             blink_epoch: 0,
             input_latency: InputLatencyStats::default(),
             focus_handle: cx.focus_handle(),
+            syntax: None,
+            syntax_revision: 0,
+            fold_map: FoldMap::new(),
+            fold_pills: Vec::new(),
         }
     }
 
@@ -226,6 +254,7 @@ impl EditorView {
     /// Used by *Structure* and *Problems* navigation; out-of-range positions are clamped.
     pub fn set_cursor_position(&mut self, line: usize, col: usize, cx: &mut Context<'_, Self>) {
         self.state.set_line_col(line, col);
+        self.reveal_cursors();
         self.ensure_primary_cursor_visible();
         cx.notify();
     }
@@ -234,6 +263,178 @@ impl EditorView {
     #[must_use]
     pub fn line_count(&self) -> usize {
         self.state.snapshot().len_lines().max(1)
+    }
+
+    /// Returns the number of visual rows after folding (`>= 1`).
+    #[must_use]
+    pub fn visual_line_count(&self) -> usize {
+        self.fold_map.visible_line_count(self.line_count()).max(1)
+    }
+
+    /// Returns the code-folding model of this view.
+    #[must_use]
+    pub const fn fold_map(&self) -> &FoldMap {
+        &self.fold_map
+    }
+
+    /// Returns the latest syntax snapshot delivered by the background analysis, if any.
+    #[must_use]
+    pub const fn syntax(&self) -> Option<&Arc<EditorSyntax>> {
+        self.syntax.as_ref()
+    }
+
+    /// Returns the monotonic syntax revision (bumped on every [`Self::set_syntax`]).
+    #[must_use]
+    pub const fn syntax_revision(&self) -> u64 {
+        self.syntax_revision
+    }
+
+    /// Installs a fresh syntax snapshot (or clears it for plain-text files).
+    ///
+    /// Older snapshots keep painting until this is called (*stale syntax fallback*); collapsed
+    /// folds are re-anchored on the new candidates once they match the current buffer.
+    pub fn set_syntax(&mut self, syntax: Option<Arc<EditorSyntax>>, cx: &mut Context<'_, Self>) {
+        if let Some(fresh) = syntax.as_ref()
+            && fresh.snapshot().version() == self.state.snapshot().version()
+        {
+            self.fold_map.reconcile(fresh.folds());
+        }
+        if syntax.is_none() {
+            self.fold_map.unfold_all();
+        }
+        self.syntax = syntax;
+        self.syntax_revision = self.syntax_revision.wrapping_add(1);
+        cx.notify();
+    }
+
+    pub(crate) fn set_fold_pills(&mut self, pills: Vec<(Bounds<Pixels>, usize)>) {
+        self.fold_pills = pills;
+    }
+
+    /// Expands every collapsed region hiding a caret, so the caret is never invisible.
+    fn reveal_cursors(&mut self) {
+        if self.fold_map.is_empty() {
+            return;
+        }
+        let snapshot = self.state.snapshot();
+        for row in self.active_lines(&snapshot) {
+            self.fold_map.reveal_line(row);
+        }
+    }
+
+    /// After collapsing, moves a caret hidden inside a fold to the end of the fold header.
+    fn park_cursors_after_fold(&mut self) {
+        let snapshot = self.state.snapshot();
+        let hidden_header = self.active_lines(&snapshot).into_iter().find_map(|row| {
+            match self.fold_map.buffer_to_visual_line(row) {
+                VisualLineMapping::HiddenInsideFold {
+                    header_buffer_line, ..
+                } => Some(header_buffer_line),
+                VisualLineMapping::Visible(_) => None,
+            }
+        });
+        if let Some(header) = hidden_header {
+            self.state.set_line_col(header + 1, usize::MAX);
+        }
+    }
+
+    fn fold_candidates(&self) -> &[folding::FoldCandidate] {
+        self.syntax.as_ref().map_or(&[], |s| s.folds())
+    }
+
+    /// Toggles the fold whose header is `row` (gutter chevron click).
+    fn toggle_fold_row(&mut self, row: usize) -> bool {
+        if self.fold_map.is_collapsed_at(row) {
+            return self.fold_map.expand_at(row);
+        }
+        if !self.syntax.as_ref().is_some_and(|s| s.has_fold_at(row)) {
+            return false;
+        }
+        let candidates = self.fold_candidates().to_vec();
+        let changed = self.fold_map.toggle_fold_at(row, &candidates);
+        self.park_cursors_after_fold();
+        changed
+    }
+
+    /// Runs a fold command at the primary caret and repaints.
+    fn fold_command(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+        command: impl FnOnce(&mut FoldMap, usize, &[folding::FoldCandidate]) -> bool,
+    ) {
+        let started = Instant::now();
+        self.reset_cursor_blink(window, cx);
+        let row = self.state.primary_point().0;
+        let candidates = self.fold_candidates().to_vec();
+        if command(&mut self.fold_map, row, &candidates) {
+            self.park_cursors_after_fold();
+        }
+        self.finish_input(started, true, cx);
+    }
+
+    fn fold_at_cursor_action(
+        &mut self,
+        _: &actions::FoldAtCursor,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.fold_command(window, cx, |map, row, candidates| {
+            map.fold_at(row, candidates)
+        });
+    }
+
+    fn unfold_at_cursor_action(
+        &mut self,
+        _: &actions::UnfoldAtCursor,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.fold_command(window, cx, |map, row, _| map.unfold_at(row));
+    }
+
+    fn toggle_fold_action(
+        &mut self,
+        _: &actions::ToggleFold,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.fold_command(window, cx, FoldMap::toggle_fold_at);
+    }
+
+    fn fold_all_action(
+        &mut self,
+        _: &actions::FoldAll,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.fold_command(window, cx, |map, _, candidates| map.fold_all(candidates));
+    }
+
+    fn unfold_all_action(
+        &mut self,
+        _: &actions::UnfoldAll,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.fold_command(window, cx, |map, _, _| map.unfold_all());
+    }
+
+    fn run_entry_point_action(
+        &mut self,
+        _: &actions::RunEntryPointAtCursor,
+        _window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let row = self.state.primary_point().0;
+        if let Some(entry) = self
+            .syntax
+            .as_ref()
+            .and_then(|s| s.entry_point_at(row))
+            .cloned()
+        {
+            cx.emit(EditorEvent::RunEntryPoint(Box::new(entry)));
+        }
     }
 
     /// Returns the 1-based `(line, column)` of the primary cursor for status-bar display.
@@ -268,7 +469,7 @@ impl EditorView {
 
     /// Scrolls the viewport by `(delta_x, delta_y)` in logical pixels, clamping to buffer bounds.
     pub fn scroll_by(&mut self, delta_x: Pixels, delta_y: Pixels, cx: &mut Context<'_, Self>) {
-        let total_lines = self.line_count();
+        let total_lines = self.visual_line_count();
         let next_x = self
             .last_viewport
             .clamp_scroll_x(self.scroll_offset.x + f32::from(delta_x), self.max_scroll_x);
@@ -290,9 +491,12 @@ impl EditorView {
         reason = "line index fits cleanly within f32 mantissa"
     )]
     pub fn scroll_to_line(&mut self, line_idx: usize, cx: &mut Context<'_, Self>) {
-        let total_lines = self.line_count();
+        let line_idx = line_idx.min(self.line_count().saturating_sub(1));
+        self.fold_map.reveal_line(line_idx);
+        let total_lines = self.visual_line_count();
+        let visual = self.fold_map.visual_row_of(line_idx);
         let target_y =
-            (line_idx.min(total_lines.saturating_sub(1)) as f32) * self.last_viewport.line_height;
+            (visual.min(total_lines.saturating_sub(1)) as f32) * self.last_viewport.line_height;
         self.scroll_offset.y = self.last_viewport.clamp_scroll_y(target_y, total_lines);
         cx.notify();
     }
@@ -311,8 +515,12 @@ impl EditorView {
         cx: &mut Context<'_, Self>,
     ) {
         self.state.set_line_col(line, column.unwrap_or(1));
-        let total_lines = self.line_count();
-        let row = line.saturating_sub(1).min(total_lines.saturating_sub(1));
+        self.reveal_cursors();
+        let row = line
+            .saturating_sub(1)
+            .min(self.line_count().saturating_sub(1));
+        let row = self.fold_map.visual_row_of(row);
+        let total_lines = self.visual_line_count();
         let lh = self.last_viewport.line_height.max(1.0);
         let target = row as f32 * lh - (self.last_viewport.viewport_height - lh) / 2.0;
         self.scroll_offset.y = self.last_viewport.clamp_scroll_y(target, total_lines);
@@ -529,11 +737,11 @@ impl EditorView {
     )]
     fn x_for_row_col(&self, row: usize, col: usize) -> f32 {
         let base = self.last_gutter_width_px - self.scroll_offset.x;
-        if let Some((_, shaped, byte_start, x_offset)) =
-            self.visible_shaped_lines.iter().find(|(r, ..)| *r == row)
-        {
-            let rel = col.saturating_sub(*byte_start).min(shaped.text.len());
-            return base + x_offset + f32::from(shaped.x_for_index(rel));
+        if let Some(line) = self.visible_shaped_lines.iter().find(|l| l.row == row) {
+            let rel = col
+                .saturating_sub(line.byte_start)
+                .min(line.shaped.text.len());
+            return base + line.x_offset + f32::from(line.shaped.x_for_index(rel));
         }
         let snap = self.state.snapshot();
         let line_start = snap
@@ -603,13 +811,14 @@ impl EditorView {
         reason = "line indices fit cleanly within f32 mantissa"
     )]
     fn ensure_primary_cursor_visible(&mut self) {
-        let total_lines = self.line_count();
+        let total_lines = self.visual_line_count();
         let (row, col) = self.state.primary_point();
+        let visual_row = self.fold_map.visual_row_of(row);
 
         let lh = self.last_viewport.line_height.max(1.0);
         let vh = self.last_viewport.viewport_height.max(lh);
         let margin_y = (lh * 2.0).min(vh * 0.4);
-        let cursor_top = row as f32 * lh;
+        let cursor_top = visual_row as f32 * lh;
         let cursor_bottom = cursor_top + lh;
 
         if cursor_top < self.scroll_offset.y + margin_y {
@@ -649,7 +858,11 @@ impl EditorView {
         let local_x = f32::from(pos.x) - f32::from(self.last_canvas_bounds.origin.x);
         let local_y = f32::from(pos.y) - f32::from(self.last_canvas_bounds.origin.y);
         let lh = self.last_viewport.line_height.max(1.0);
-        let row = (((local_y + self.scroll_offset.y).max(0.0) / lh).floor() as usize)
+        let visual_row = (((local_y + self.scroll_offset.y).max(0.0) / lh).floor() as usize)
+            .min(self.visual_line_count().saturating_sub(1));
+        let row = self
+            .fold_map
+            .visual_to_buffer_line(visual_row)
             .min(total_lines.saturating_sub(1));
         let in_gutter = local_x < self.last_gutter_width_px;
 
@@ -658,11 +871,11 @@ impl EditorView {
         let content_x = local_x - self.last_gutter_width_px + self.scroll_offset.x;
         let byte = if in_gutter {
             line_start
-        } else if let Some((_, shaped, byte_start, x_offset)) =
-            self.visible_shaped_lines.iter().find(|(r, ..)| *r == row)
-        {
-            let rel_idx = shaped.closest_index_for_x(px((content_x - *x_offset).max(0.0)));
-            (line_start + byte_start + rel_idx).min(line_start + line_len)
+        } else if let Some(line) = self.visible_shaped_lines.iter().find(|l| l.row == row) {
+            let rel_idx = line
+                .shaped
+                .closest_index_for_x(px((content_x - line.x_offset).max(0.0)));
+            (line_start + line.byte_start + rel_idx).min(line_start + line_len)
         } else {
             let approx_chars =
                 (content_x.max(0.0) / self.last_viewport.char_advance.max(1.0)).round() as usize;
@@ -683,6 +896,7 @@ impl EditorView {
         scroll_to_cursor: bool,
         cx: &mut Context<'_, Self>,
     ) {
+        self.reveal_cursors();
         if scroll_to_cursor {
             self.ensure_primary_cursor_visible();
         }
@@ -710,7 +924,16 @@ impl EditorView {
         let started = Instant::now();
         self.reset_cursor_blink(window, cx);
         self.state.sync_external_edits();
+        let lines_before = self.state.snapshot().len_lines();
+        let row_before = self.state.primary_point().0;
         let changed = edit(&mut self.state, cx);
+        let lines_after = self.state.snapshot().len_lines();
+        if lines_after != lines_before {
+            let delta = isize::try_from(lines_after)
+                .unwrap_or(isize::MAX)
+                .saturating_sub(isize::try_from(lines_before).unwrap_or(isize::MAX));
+            self.fold_map.shift_after_edit(row_before, delta);
+        }
         self.finish_input(started, changed, cx);
     }
 
@@ -853,7 +1076,7 @@ impl EditorView {
     fn page(&mut self, down: bool, extend: bool, window: &Window, cx: &mut Context<'_, Self>) {
         let lines = self.page_lines();
         let delta = lines as f32 * self.last_viewport.line_height;
-        let total_lines = self.line_count();
+        let total_lines = self.visual_line_count();
         self.scroll_offset.y = self.last_viewport.clamp_scroll_y(
             self.scroll_offset.y + if down { delta } else { -delta },
             total_lines,
@@ -877,7 +1100,7 @@ impl EditorView {
         cx.emit(EditorEvent::Focused);
 
         let local_x = f32::from(event.position.x) - f32::from(self.last_canvas_bounds.origin.x);
-        let total_lines = self.line_count();
+        let total_lines = self.visual_line_count();
         if self
             .last_viewport
             .vertical_scrollbar_thumb(self.scroll_offset.y, total_lines)
@@ -894,6 +1117,11 @@ impl EditorView {
 
         let (row, byte, in_gutter) = self.hit_test_point(event.position);
         let mods = event.modifiers;
+        if self.handle_fold_or_run_click(event, row, local_x, in_gutter, cx) {
+            cx.stop_propagation();
+            self.finish_input(started, false, cx);
+            return;
+        }
         if in_gutter {
             let anchor_row = if mods.shift {
                 self.state.primary_point().0
@@ -919,6 +1147,47 @@ impl EditorView {
         self.finish_input(started, false, cx);
     }
 
+    /// Handles single clicks on the gutter `▶` / fold chevron slots and on `... (N lines)`
+    /// pills. Returns `true` when the click was consumed.
+    fn handle_fold_or_run_click(
+        &mut self,
+        event: &MouseDownEvent,
+        row: usize,
+        local_x: f32,
+        in_gutter: bool,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if event.click_count != 1 || event.modifiers.shift || event.modifiers.alt {
+            return false;
+        }
+        if !in_gutter {
+            let Some(line) = self
+                .fold_pills
+                .iter()
+                .find(|(bounds, _)| bounds.contains(&event.position))
+                .map(|(_, line)| *line)
+            else {
+                return false;
+            };
+            return self.fold_map.expand_at(line);
+        }
+        match ViewportMetrics::gutter_slot_at(local_x, self.last_gutter_width_px) {
+            GutterSlot::Run => {
+                let entry = self
+                    .syntax
+                    .as_ref()
+                    .and_then(|s| s.entry_point_at(row))
+                    .cloned();
+                entry.is_some_and(|entry| {
+                    cx.emit(EditorEvent::RunEntryPoint(Box::new(entry)));
+                    true
+                })
+            }
+            GutterSlot::Fold => self.toggle_fold_row(row),
+            GutterSlot::Other => false,
+        }
+    }
+
     /// Handles hover over the scrollbar zone (only while the pointer is over the editor).
     fn handle_hover_move(
         &mut self,
@@ -931,7 +1200,7 @@ impl EditorView {
         }
         let local_x = f32::from(event.position.x) - f32::from(self.last_canvas_bounds.origin.x);
         let hovered = self.is_in_scrollbar_hit_zone(local_x)
-            && self.last_viewport.max_scroll_y(self.line_count()) > 0.0;
+            && self.last_viewport.max_scroll_y(self.visual_line_count()) > 0.0;
         if hovered != self.scrollbar_hovered {
             self.scrollbar_hovered = hovered;
             cx.notify();
@@ -951,7 +1220,7 @@ impl EditorView {
         cx: &mut Context<'_, Self>,
     ) {
         if let Some(drag) = self.scrollbar_drag {
-            let total_lines = self.line_count();
+            let total_lines = self.visual_line_count();
             if let Some((_thumb_y, thumb_height)) = self
                 .last_viewport
                 .vertical_scrollbar_thumb(self.scroll_offset.y, total_lines)
@@ -1020,7 +1289,7 @@ impl EditorView {
                             editor.autoscroll_running = false;
                             return false;
                         }
-                        let total_lines = editor.line_count();
+                        let total_lines = editor.visual_line_count();
                         editor.scroll_offset.y = editor
                             .last_viewport
                             .clamp_scroll_y(editor.scroll_offset.y + delta, total_lines);
@@ -1074,6 +1343,12 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::undo_action))
             .on_action(cx.listener(Self::redo_action))
             .on_action(cx.listener(Self::escape_action))
+            .on_action(cx.listener(Self::fold_at_cursor_action))
+            .on_action(cx.listener(Self::unfold_at_cursor_action))
+            .on_action(cx.listener(Self::toggle_fold_action))
+            .on_action(cx.listener(Self::fold_all_action))
+            .on_action(cx.listener(Self::unfold_all_action))
+            .on_action(cx.listener(Self::run_entry_point_action))
             .on_action(cx.listener(|this, _: &actions::MoveLeft, window, cx| {
                 this.motion(Motion::Left, false, window, cx);
             }))
@@ -1121,7 +1396,7 @@ mod tests {
 
         let mut scratch = String::with_capacity(128);
         let mut cache = ShapedLineCache::new(512);
-        cache.sync_context(snapshot.version().as_u64(), 0, 13.0);
+        cache.sync_context(snapshot.version().as_u64(), 0, 0, 13.0);
 
         for row in visible.clone() {
             scratch.clear();
