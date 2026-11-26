@@ -53,6 +53,7 @@ notify       = "7"
 portable-pty = "0.9"
 postcard     = { version = "1", features = ["use-std"] }
 rayon        = "1"
+roxmltree    = "0.20"
 reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 ropey        = { version = "1", default-features = false, features = ["simd"] }
 serde                = { version = "1", features = ["derive"] }

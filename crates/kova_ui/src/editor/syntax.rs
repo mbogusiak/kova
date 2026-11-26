@@ -112,8 +112,8 @@ impl EditorSyntax {
 
 /// Request to run a gutter entry point (`main`, `@Test` method/class or `.http` request).
 ///
-/// Phase 1 only logs it in the *Run* tool window; process execution attaches in Phase 2/3
-/// (`kova_toolchain` / `kova_tools`).
+/// `@Test` methods and classes start a `JUnit` *Test Runner* run (`KOVA-040`); other entry
+/// points are logged in the *Run* tool window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunEntryPointRequested {
     /// Project-relative path of the document, when it has one.

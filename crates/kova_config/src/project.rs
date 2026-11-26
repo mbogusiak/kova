@@ -213,11 +213,18 @@ impl ProjectConfig {
                 reason: format!("expected 0..=1440 minutes, got {mins}"),
             });
         }
+        let mut seen = std::collections::BTreeSet::new();
         for run_cfg in &self.run_configurations {
             if run_cfg.name.trim().is_empty() {
                 return Err(ConfigError::Validation {
                     field: "run_configurations.name",
                     reason: "run configuration name must not be empty".to_owned(),
+                });
+            }
+            if !seen.insert(run_cfg.name.as_str()) {
+                return Err(ConfigError::Validation {
+                    field: "run_configurations.name",
+                    reason: format!("duplicate run configuration name `{}`", run_cfg.name),
                 });
             }
         }
@@ -228,8 +235,8 @@ impl ProjectConfig {
 /// Lossless `toml_edit::DocumentMut` wrapper for optional `<project_root>/kova.toml`.
 #[derive(Debug, Clone)]
 pub struct ProjectConfigDocument {
-    doc: DocumentMut,
-    config: ProjectConfig,
+    pub(crate) doc: DocumentMut,
+    pub(crate) config: ProjectConfig,
 }
 
 impl ProjectConfigDocument {
@@ -317,7 +324,7 @@ impl ProjectConfigDocument {
     }
 }
 
-fn deserialize_project(doc: &DocumentMut) -> Result<ProjectConfig, ConfigError> {
+pub(crate) fn deserialize_project(doc: &DocumentMut) -> Result<ProjectConfig, ConfigError> {
     let config: ProjectConfig =
         toml_edit::de::from_document(doc.clone()).map_err(|err| ConfigError::Deserialize {
             message: err.to_string(),

@@ -38,6 +38,8 @@ pub enum DockToolId {
     Structure,
     /// Integrated terminal tool window (`Alt+F12`).
     Terminal,
+    /// `JUnit` Test Runner tool window (`Alt+8`, `KOVA-040`).
+    Tests,
 }
 
 impl DockToolId {
@@ -51,6 +53,7 @@ impl DockToolId {
             Self::Problems => "Problems",
             Self::Structure => "Structure",
             Self::Terminal => "Terminal",
+            Self::Tests => "Tests",
         }
     }
 
@@ -64,6 +67,7 @@ impl DockToolId {
             Self::Problems => "PRB",
             Self::Structure => "STR",
             Self::Terminal => "TRM",
+            Self::Tests => "TST",
         }
     }
 
@@ -77,6 +81,7 @@ impl DockToolId {
             Self::Problems => "Alt+6",
             Self::Structure => "Alt+7",
             Self::Terminal => "Alt+F12",
+            Self::Tests => "Alt+8",
         }
     }
 
@@ -86,7 +91,7 @@ impl DockToolId {
         match self {
             Self::Project | Self::Commit => DockSide::Left,
             Self::Structure => DockSide::Right,
-            Self::Run | Self::Problems | Self::Terminal => DockSide::Bottom,
+            Self::Run | Self::Problems | Self::Terminal | Self::Tests => DockSide::Bottom,
         }
     }
 }
@@ -316,6 +321,7 @@ mod tests {
         assert_eq!(state.left_open, Some(DockToolId::Commit));
         assert!(!state.is_tool_active(DockToolId::Project));
         assert_eq!(DockToolId::Terminal.side(), DockSide::Bottom);
+        assert_eq!(DockToolId::Tests.side(), DockSide::Bottom);
         assert_eq!(DockToolId::Structure.shortcut(), "Alt+7");
     }
 

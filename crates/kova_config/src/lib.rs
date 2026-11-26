@@ -8,6 +8,7 @@ pub mod document;
 pub mod model;
 pub mod paths;
 pub mod project;
+pub mod run_config;
 pub mod watcher;
 
 pub use document::SettingsDocument;

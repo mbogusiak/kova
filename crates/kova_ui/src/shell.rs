@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,8 +69,16 @@ use crate::terminal::terminal_dock::TerminalDockEvent;
 use crate::terminal::{
     TerminalDock, TerminalLaunch, TerminalShortcut, TerminalView, terminal_shortcut,
 };
+use crate::test_runner::test_runner_panel::{self, TestRunnerHandler};
+use crate::test_runner::{
+    TestRunRequest, TestRunSink, TestRunnerAction, TestRunnerColors, TestRunnerModel,
+};
 use crate::theme::{KovaTheme, hsla_from_rgba};
-use kova_config::{KovaSettings, SettingsDocument};
+use kova_config::{
+    KovaSettings, ProjectConfigDocument, RunConfigKind, RunConfiguration, SettingsDocument,
+};
+use kova_syntax::EntryPointKind;
+use kova_tools::junit::TestEvent;
 
 /// Canonical Islands UI layout geometry (`KOVA-025` spec §FR-1, `new_ui_dock_mockup.svg`).
 /// Outer margin, island gap and focus ring width come from [`LayoutDensity`] (`KOVA-026`);
@@ -391,6 +400,15 @@ pub struct WorkspaceShell {
     settings_error: Option<String>,
     /// Integrated PTY terminal, created on the first `Alt+F12` (`KOVA-039`).
     terminal: Option<(Entity<TerminalDock>, Subscription)>,
+    /// `JUnit` *Test Runner* state (`KOVA-040`).
+    test_runner: TestRunnerModel,
+    tests_scroll: UniformListScrollHandle,
+    /// Host executor of test runs (BSP / Gradle / Maven).
+    test_sink: Option<TestRunSink>,
+    /// Shared `[[run_configurations]]` from the project `kova.toml`.
+    run_configs: Vec<RunConfiguration>,
+    /// Last `kova.toml` load / save error.
+    run_configs_error: Option<String>,
 }
 
 impl fmt::Debug for WorkspaceShell {
@@ -505,6 +523,11 @@ impl WorkspaceShell {
             show_status_bar: true,
             settings_error: None,
             terminal: None,
+            test_runner: TestRunnerModel::default(),
+            tests_scroll: UniformListScrollHandle::new(),
+            test_sink: None,
+            run_configs: Vec::new(),
+            run_configs_error: None,
         }
     }
 
@@ -624,19 +647,25 @@ impl WorkspaceShell {
             let branch = std::fs::read_to_string(root.join(".git").join("HEAD"))
                 .ok()
                 .and_then(|head| parse_git_head(&head));
-            (tree, branch)
+            let run_configs = load_run_configurations(&root);
+            (tree, branch, run_configs)
         });
         self.project_task = Some(cx.spawn(async move |this, cx| {
-            let (tree, branch) = scan.await;
+            let (tree, branch, run_configs) = scan.await;
             this.update(cx, |this, cx| {
                 this.project_loading = false;
                 match tree {
-                    Ok(tree) => this.project_tree = tree,
+                    Ok(tree) => {
+                        this.test_runner
+                            .set_project_files(tree.file_paths().map(Path::to_path_buf).collect());
+                        this.project_tree = tree;
+                    }
                     Err(err) => this
                         .bottom_panel
                         .run_logs
                         .push(format!("Project scan failed: {err}")),
                 }
+                this.apply_run_configurations(run_configs);
                 if let Some(branch) = branch {
                     this.status_bar.git_branch = branch;
                 }
@@ -784,11 +813,225 @@ impl WorkspaceShell {
         }
     }
 
-    /// Phase 1 handling of a gutter `▶` click: opens the *Run* tab and logs the target.
-    /// Process execution attaches in Phase 2/3 (`kova_toolchain` / `kova_tools`).
+    /// Handles a gutter `▶` click: `@Test` methods / classes start a `JUnit` *Test Runner* run
+    /// (`KOVA-040`); other entry points are logged in the *Run* tab.
     fn handle_run_request(&mut self, request: &RunEntryPointRequested) {
+        if matches!(
+            request.kind,
+            EntryPointKind::JvmTestMethod | EntryPointKind::JvmTestClass
+        ) {
+            let label = test_label(&request.symbol_name);
+            let file = match (&self.project_root, &request.file_path) {
+                (Some(root), Some(rel)) => Some(root.join(rel)),
+                _ => None,
+            };
+            let test_request = self.test_runner.new_request(
+                label,
+                vec![request.symbol_name.clone()],
+                self.project_root.clone(),
+                file,
+            );
+            self.start_test_run(test_request);
+            return;
+        }
         self.bottom_panel.run_logs.push(request.log_line());
         self.dock_layout.bottom_open = Some(DockToolId::Run);
+    }
+
+    /// Shows `request` in the Test Runner dock and hands it to the host sink.
+    fn start_test_run(&mut self, request: TestRunRequest) {
+        let run_id = request.run_id;
+        self.test_runner.start(request.clone());
+        self.tests_scroll = UniformListScrollHandle::new();
+        self.dock_layout.bottom_open = Some(DockToolId::Tests);
+        if let Some(sink) = &self.test_sink {
+            sink(request);
+        } else {
+            self.test_runner.apply(
+                run_id,
+                vec![TestEvent::RunFinished {
+                    success: false,
+                    message: Some(
+                        "No build server attached: open a Gradle/Maven project with `kova <dir>`."
+                            .to_owned(),
+                    ),
+                }],
+            );
+        }
+    }
+
+    /// Installs the host executor of test runs (`KOVA-040`).
+    pub fn set_test_run_sink(&mut self, sink: TestRunSink) {
+        self.test_sink = Some(sink);
+    }
+
+    /// Applies a batch of test events reported by the host for `run_id`.
+    pub fn apply_test_events(
+        &mut self,
+        run_id: u64,
+        events: Vec<TestEvent>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.test_runner.apply(run_id, events) {
+            cx.notify();
+        }
+    }
+
+    /// Replaces the compile diagnostics of `file` reported by the build server.
+    pub fn set_build_problems(
+        &mut self,
+        file: &str,
+        problems: Vec<ProblemEntry>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.bottom_panel.set_build_problems(file, problems);
+        cx.notify();
+    }
+
+    /// Test Runner state.
+    #[must_use]
+    pub const fn test_runner(&self) -> &TestRunnerModel {
+        &self.test_runner
+    }
+
+    /// Run configurations loaded from the project `kova.toml`.
+    #[must_use]
+    pub fn run_configurations(&self) -> &[RunConfiguration] {
+        &self.run_configs
+    }
+
+    fn apply_run_configurations(&mut self, loaded: Result<Vec<RunConfiguration>, String>) {
+        match loaded {
+            Ok(configs) => {
+                self.run_configs = configs;
+                self.run_configs_error = None;
+            }
+            Err(err) => self.run_configs_error = Some(err),
+        }
+    }
+
+    /// Re-reads `kova.toml` off the UI thread.
+    fn reload_run_configurations(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(root) = self.project_root.clone() else {
+            return;
+        };
+        let load = cx
+            .background_executor()
+            .spawn(async move { load_run_configurations(&root) });
+        cx.spawn(async move |this, cx| {
+            let loaded = load.await;
+            this.update(cx, |this, cx| {
+                this.apply_run_configurations(loaded);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Writes `config` into `kova.toml` (created on this explicit action only), off the UI
+    /// thread, then reloads the list.
+    fn save_run_configuration(&mut self, config: RunConfiguration, cx: &mut Context<'_, Self>) {
+        let Some(root) = self.project_root.clone() else {
+            self.run_configs_error =
+                Some("Open a project directory to save run configurations".to_owned());
+            cx.notify();
+            return;
+        };
+        let write = cx.background_executor().spawn(async move {
+            let mut doc = ProjectConfigDocument::load_optional(&root)
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(ProjectConfigDocument::empty);
+            doc.upsert_run_configuration(&config)
+                .map_err(|e| e.to_string())?;
+            doc.save_to_project(&root).map_err(|e| e.to_string())?;
+            Ok::<_, String>(doc.run_configurations().to_vec())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = write.await;
+            this.update(cx, |this, cx| {
+                this.apply_run_configurations(result);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Runs a `kova.toml` run configuration: `junit` entries go to the Test Runner.
+    fn run_configuration(&mut self, index: usize, cx: &mut Context<'_, Self>) {
+        let Some(config) = self.run_configs.get(index).cloned() else {
+            return;
+        };
+        if config.kind == RunConfigKind::Junit {
+            let targets: Vec<String> = config
+                .main_class
+                .iter()
+                .flat_map(|t| t.split(','))
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+                .collect();
+            let mut request = self.test_runner.new_request(
+                config.name.clone(),
+                targets,
+                self.project_root.clone(),
+                None,
+            );
+            request.vm_options.clone_from(&config.vm_options);
+            request.env.clone_from(&config.env);
+            self.start_test_run(request);
+        } else {
+            self.bottom_panel.run_logs.push(format!(
+                "[kova.toml] {} ({}) — only `junit` run configurations execute in this build",
+                config.name,
+                config.summary()
+            ));
+        }
+        cx.notify();
+    }
+
+    fn handle_test_action(
+        &mut self,
+        action: &TestRunnerAction,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.dock_layout.focus(FocusedRegion::BottomPanel);
+        if self.test_runner.handle_local(action) {
+            cx.notify();
+            return;
+        }
+        match action {
+            TestRunnerAction::RerunAll => {
+                if let Some(request) = self.test_runner.rerun_all_request() {
+                    self.start_test_run(request);
+                }
+            }
+            TestRunnerAction::RerunFailed => {
+                if let Some(request) = self.test_runner.rerun_failed_request() {
+                    self.start_test_run(request);
+                }
+            }
+            TestRunnerAction::OpenFrame(index) => {
+                if let Some(target) = self.test_runner.target_at(*index).cloned() {
+                    self.open_path(&target.path, Some((target.line, 1)), window, cx);
+                    return;
+                }
+            }
+            TestRunnerAction::SaveConfiguration => {
+                if let Some(request) = self.test_runner.request() {
+                    let config =
+                        RunConfiguration::junit(request.label.clone(), request.targets.join(","));
+                    self.save_run_configuration(config, cx);
+                }
+            }
+            TestRunnerAction::ToggleShowPassed
+            | TestRunnerAction::ToggleShowFailed
+            | TestRunnerAction::SelectRow(_)
+            | TestRunnerAction::ToggleRow(_) => {}
+        }
+        cx.notify();
     }
 
     fn set_active_pane(&mut self, pane: PaneId, cx: &mut Context<'_, Self>) {
@@ -1229,6 +1472,9 @@ impl WorkspaceShell {
             self.dispatch_save(&key, cx);
         }
         self.sync_dirty_flag(&key);
+        if saved && key.file_name().is_some_and(|n| n == "kova.toml") {
+            self.reload_run_configurations(cx);
+        }
         if self.close_after_save.as_deref() == Some(key.as_path()) && !resave {
             self.close_after_save = None;
             if saved {
@@ -2281,6 +2527,7 @@ impl WorkspaceShell {
                 "6" => Some(DockToolId::Problems),
                 "7" => Some(DockToolId::Structure),
                 "f12" => Some(DockToolId::Terminal),
+                "8" => Some(DockToolId::Tests),
                 _ => None,
             };
             if let Some(tool) = tool {
@@ -2405,6 +2652,21 @@ impl WorkspaceShell {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> bool {
+        if self.dock_layout.bottom_open == Some(DockToolId::Tests) {
+            match key {
+                "up" | "k" => self.test_runner.move_selection(false),
+                "down" | "j" => self.test_runner.move_selection(true),
+                "enter" => {
+                    if let Some(index) = self.test_runner.first_project_frame() {
+                        self.handle_test_action(&TestRunnerAction::OpenFrame(index), window, cx);
+                    }
+                }
+                "escape" => self.focus_active_editor(window, cx),
+                _ => return false,
+            }
+            cx.notify();
+            return true;
+        }
         match key {
             "up" | "k" => self.bottom_panel.move_selection(false),
             "down" | "j" => self.bottom_panel.move_selection(true),
@@ -2935,6 +3197,28 @@ impl WorkspaceShell {
                 el.text_color(p.text_muted)
             };
             el = el.child(tab.title());
+            if tab == BottomTab::Tests
+                && let Some(run) = self.test_runner.run()
+            {
+                let counts = run.counts();
+                let (color, text) = if counts.failed > 0 {
+                    (p.error, counts.failed.to_string())
+                } else if run.is_running() {
+                    (p.text_muted, "…".to_owned())
+                } else {
+                    (rgb_hex(0x0059_A869), "✓".to_owned())
+                };
+                el = el.child(
+                    div()
+                        .px(px(6.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(color)
+                        .text_size(px(10.0))
+                        .text_color(color)
+                        .child(text),
+                );
+            }
             if tab == BottomTab::Problems && errors + warnings > 0 {
                 let (variant_color, count) = if errors > 0 {
                     (p.error, errors)
@@ -3002,21 +3286,8 @@ impl WorkspaceShell {
             .flex_1()
             .w_full()
             .into_any_element(),
-            BottomTab::Run if self.bottom_panel.run_logs.is_empty() => placeholder(
-                "No runs yet. ▶ Run entry points from the gutter (KOVA-027); Gradle/JUnit arrive in Phase 3.",
-                p,
-            )
-            .into_any_element(),
-            BottomTab::Run => div()
-                .flex_1()
-                .p(px(10.0))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .text_size(px(12.0))
-                .text_color(p.text_secondary)
-                .children(self.bottom_panel.run_logs.iter().map(|line| div().child(line.clone())))
-                .into_any_element(),
+            BottomTab::Run => self.render_run_body(p, cx).into_any_element(),
+            BottomTab::Tests => self.render_tests_body(p, cx),
             BottomTab::Terminal => match &self.terminal {
                 Some((dock, _)) => div()
                     .flex_1()
@@ -3026,6 +3297,197 @@ impl WorkspaceShell {
                 None => placeholder("Starting terminal…", p).into_any_element(),
             },
         }
+    }
+
+    fn test_runner_colors(p: Palette) -> TestRunnerColors {
+        TestRunnerColors::islands_dark(
+            p.text_primary,
+            p.text_secondary,
+            p.text_muted,
+            p.hover,
+            p.active,
+            p.border_subtle,
+            p.warning,
+        )
+    }
+
+    fn test_runner_handler(cx: &Context<'_, Self>) -> TestRunnerHandler {
+        Rc::new(cx.listener(|this, action: &TestRunnerAction, window, cx| {
+            this.handle_test_action(action, window, cx);
+        }))
+    }
+
+    fn render_tests_body(&self, p: Palette, cx: &Context<'_, Self>) -> AnyElement {
+        let colors = Self::test_runner_colors(p);
+        let Some(run) = self.test_runner.run() else {
+            return test_runner_panel::render_empty(colors).into_any_element();
+        };
+        let handler = Self::test_runner_handler(cx);
+        let tree = uniform_list(
+            "test-tree",
+            run.rows().len(),
+            cx.processor(Self::render_test_rows),
+        )
+        .track_scroll(self.tests_scroll.clone())
+        .h_full()
+        .w_full();
+        div()
+            .flex_1()
+            .w_full()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .child(test_runner_panel::render_toolbar(
+                &self.test_runner,
+                colors,
+                self.project_root.is_some(),
+                &handler,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .flex_row()
+                    .child(div().w(relative(0.42)).h_full().child(tree))
+                    .child(test_runner_panel::render_output(
+                        &self.test_runner,
+                        colors,
+                        &handler,
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn render_test_rows(
+        &mut self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Vec<Stateful<Div>> {
+        let p = Palette::from_theme(cx.global::<KovaTheme>());
+        let handler = Self::test_runner_handler(cx);
+        test_runner_panel::render_rows(
+            &self.test_runner,
+            range,
+            Self::test_runner_colors(p),
+            &handler,
+        )
+    }
+
+    fn render_run_body(&self, p: Palette, cx: &Context<'_, Self>) -> Div {
+        let header = div()
+            .h(px(24.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .text_size(px(12.0))
+            .child(
+                div()
+                    .text_color(p.text_primary)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Run Configurations (kova.toml)"),
+            )
+            .child(
+                div()
+                    .id("run-config-edit")
+                    .px(px(6.0))
+                    .rounded(px(4.0))
+                    .text_color(p.border_focus)
+                    .hover(|s| s.bg(p.hover))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.edit_kova_toml(window, cx);
+                    }))
+                    .child("Edit kova.toml"),
+            );
+        let configs = self.run_configs.iter().enumerate().map(|(index, config)| {
+            div()
+                .id(("run-config", index))
+                .h(px(22.0))
+                .px(px(6.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(4.0))
+                .text_size(px(12.0))
+                .hover(|s| s.bg(p.hover))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    this.run_configuration(index, cx);
+                }))
+                .child(div().text_color(p.run_icon).child("▶"))
+                .child(div().text_color(p.text_primary).child(config.name.clone()))
+                .child(div().text_color(p.text_muted).child(config.summary()))
+        });
+        let mut body = div()
+            .flex_1()
+            .p(px(10.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(header);
+        if let Some(err) = &self.run_configs_error {
+            body = body.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(p.error)
+                    .child(err.clone()),
+            );
+        } else if self.run_configs.is_empty() {
+            body = body.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(p.text_muted)
+                    .child("No shared run configurations. Use “＋ kova.toml” in the Tests tab or edit kova.toml."),
+            );
+        }
+        body.children(configs).child(
+            div()
+                .mt(px(6.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .text_size(px(12.0))
+                .text_color(p.text_secondary)
+                .children(
+                    self.bottom_panel
+                        .run_logs
+                        .iter()
+                        .map(|line| div().child(line.clone())),
+                ),
+        )
+    }
+
+    /// Opens `kova.toml` in the editor, creating a minimal one first (explicit user action).
+    fn edit_kova_toml(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(root) = self.project_root.clone() else {
+            self.run_configs_error = Some("Open a project directory to edit kova.toml".to_owned());
+            cx.notify();
+            return;
+        };
+        let ensure = cx.background_executor().spawn(async move {
+            if ProjectConfigDocument::load_optional(&root)
+                .map_err(|e| e.to_string())?
+                .is_none()
+            {
+                ProjectConfigDocument::empty()
+                    .save_to_project(&root)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok::<_, String>(())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = ensure.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => this.open_path(Path::new("kova.toml"), None, window, cx),
+                Err(err) => {
+                    this.run_configs_error = Some(err);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn render_problem_rows(
@@ -3563,7 +4025,11 @@ impl WorkspaceShell {
                 .child(self.render_stripe(
                     LEFT_STRIPE_WIDTH_PX,
                     &[DockToolId::Project, DockToolId::Commit, DockToolId::Run],
-                    &[DockToolId::Problems, DockToolId::Terminal],
+                    &[
+                        DockToolId::Problems,
+                        DockToolId::Tests,
+                        DockToolId::Terminal,
+                    ],
                     p,
                     cx,
                 ))
@@ -3712,6 +4178,29 @@ fn line_comment_prefix(path: Option<&Path>) -> &'static str {
         "toml" | "yaml" | "yml" | "properties" | "sh" | "bash" | "zsh" | "http" | "rest" | "py"
         | "gitignore" => "#",
         _ => "//",
+    }
+}
+
+/// Loads the shared run configurations of `root/kova.toml` (empty when the file is absent).
+fn load_run_configurations(root: &Path) -> Result<Vec<RunConfiguration>, String> {
+    ProjectConfigDocument::load_optional(root)
+        .map(|doc| {
+            doc.map(|d| d.run_configurations().to_vec())
+                .unwrap_or_default()
+        })
+        .map_err(|err| format!("kova.toml: {err}"))
+}
+
+/// Tool window label for a runner target (`OrderTest.creates` / `OrderTest`).
+fn test_label(target: &str) -> String {
+    let (class, method) = match target.split_once('#') {
+        Some((class, method)) => (class, Some(method)),
+        None => (target, None),
+    };
+    let simple = class.rsplit_once('.').map_or(class, |(_, s)| s);
+    match method {
+        Some(method) => format!("{simple}.{method}"),
+        None => simple.to_owned(),
     }
 }
 

@@ -2,6 +2,11 @@
 //!
 //! This crate belongs to the **Headless Core**: it must compile and pass its
 //! tests without any windowing or GPU dependency (enforced by KOVA-003).
+//!
+//! The [`junit`] module (KOVA-040) holds the headless `JUnit` *Test Runner* model fed by BSP
+//! notifications or `TEST-*.xml` reports.
+
+pub mod junit;
 
 pub mod terminal;
 
