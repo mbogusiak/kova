@@ -171,6 +171,8 @@ pub enum VimKeyResult {
     PassThrough,
     /// `:` / `/` / `?` in `NORMAL` / `VISUAL`: open the status-bar command line.
     OpenCommandLine(char),
+    /// `gd` in `NORMAL` mode: jump to the definition of the symbol under the caret.
+    GoToDefinition,
 }
 
 /// Keeps a [`VimEngine`] in step with one editor's shared document and selections.
@@ -239,9 +241,15 @@ impl VimBridge {
                     return VimKeyResult::OpenCommandLine(prefix);
                 }
                 Some(VimKey::Char('u')) if mode == VimMode::Normal => {
+                    if state.is_read_only() {
+                        return VimKeyResult::Handled { edited: false };
+                    }
                     return self.after_history(state, EditorState::undo);
                 }
                 Some(VimKey::Ctrl('r')) if mode == VimMode::Normal => {
+                    if state.is_read_only() {
+                        return VimKeyResult::Handled { edited: false };
+                    }
                     return self.after_history(state, EditorState::redo);
                 }
                 _ => {}
@@ -249,8 +257,27 @@ impl VimBridge {
         }
 
         let before = self.engine.buffer().version();
-        if self.engine.handle_key(stroke) == VimOutcome::PassThrough {
-            return VimKeyResult::PassThrough;
+        match self.engine.handle_key(stroke) {
+            VimOutcome::PassThrough => return VimKeyResult::PassThrough,
+            VimOutcome::GoToDefinition => {
+                self.mirror_selection(state);
+                return VimKeyResult::GoToDefinition;
+            }
+            VimOutcome::Handled => {}
+        }
+        if state.is_read_only() {
+            if self.engine.buffer().version() != before {
+                let buffer = state
+                    .shared_buffer()
+                    .with_document(|buffer, _| buffer.clone());
+                self.engine.replace_buffer(buffer);
+                self.synced_doc = Some(state.shared_buffer().version());
+            }
+            if self.engine.mode() == VimMode::Insert {
+                let _ = self.engine.handle_vim_key(VimKey::Escape);
+            }
+            self.mirror_selection(state);
+            return VimKeyResult::Handled { edited: false };
         }
         let edited = self.write_back(state, before);
         self.mirror_selection(state);
@@ -265,6 +292,17 @@ impl VimBridge {
         self.sync_from(state);
         let before = self.engine.buffer().version();
         if self.engine.handle_text_input(text) == VimOutcome::PassThrough {
+            return VimKeyResult::Handled { edited: false };
+        }
+        if state.is_read_only() {
+            if self.engine.buffer().version() != before {
+                let buffer = state
+                    .shared_buffer()
+                    .with_document(|buffer, _| buffer.clone());
+                self.engine.replace_buffer(buffer);
+                self.synced_doc = Some(state.shared_buffer().version());
+            }
+            self.mirror_selection(state);
             return VimKeyResult::Handled { edited: false };
         }
         let edited = self.write_back(state, before);
@@ -671,5 +709,29 @@ mod tests {
             worst < INPUT_LATENCY_MAX,
             "worst Vim dispatch {worst:?} exceeded {INPUT_LATENCY_MAX:?}"
         );
+    }
+
+    #[test]
+    fn gd_returns_go_to_definition_and_read_only_blocks_vim_edits() {
+        let mut state = EditorState::from_text("OrderService service;\n");
+        state.set_read_only(true);
+        let mut bridge = VimBridge::new(&mut state);
+
+        // `gd` returns GoToDefinition without editing.
+        assert_eq!(
+            bridge.handle_key(&mut state, key('g')),
+            VimKeyResult::Handled { edited: false }
+        );
+        assert_eq!(
+            bridge.handle_key(&mut state, key('d')),
+            VimKeyResult::GoToDefinition
+        );
+        assert_eq!(state.snapshot().text(), "OrderService service;\n");
+
+        // Mutating commands and Insert mode are blocked on read-only state.
+        feed(&mut bridge, &mut state, "dd");
+        assert_eq!(state.snapshot().text(), "OrderService service;\n");
+        feed(&mut bridge, &mut state, "i");
+        assert_eq!(bridge.mode(), VimMode::Normal);
     }
 }

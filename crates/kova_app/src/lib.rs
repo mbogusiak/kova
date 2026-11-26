@@ -10,6 +10,7 @@
 
 pub mod cli;
 pub mod debug_sessions;
+pub mod definition;
 pub mod io;
 pub mod menus;
 pub mod test_runs;
@@ -171,6 +172,13 @@ pub enum AppEvent {
         session_id: u64,
         /// Update for the *Debugger* dock.
         update: kova_ui::DebugUpdate,
+    },
+    /// *Go to Definition* resolution completed (`KOVA-051`).
+    DefinitionResolved {
+        /// Request identifier for stale-reply filtering.
+        request_id: u64,
+        /// Resolution outcome.
+        outcome: kova_ui::DefinitionOutcome,
     },
 }
 
@@ -350,6 +358,10 @@ pub fn handle_app_event(
             format!("Recent Projects unavailable: {message}"),
             cx,
         ),
+        AppEvent::DefinitionResolved {
+            request_id,
+            outcome,
+        } => shell.apply_definition_result(request_id, outcome, window, cx),
     }
 }
 
@@ -425,11 +437,8 @@ pub fn run_cli(
         })
         .detach();
 
-        let sink = save_sink(runtime_handle.clone(), events_tx.clone());
-        let settings_sink = settings_write_sink(&runtime_handle, events_tx.clone());
-        let test_sink = test_runs::test_run_sink(runtime_handle.clone(), events_tx.clone());
-        let debug_sink =
-            debug_sessions::debug_command_sink(runtime_handle.clone(), events_tx.clone());
+        let runtime_for_shell = runtime_handle.clone();
+        let events_for_shell = events_tx.clone();
         let open_result = cx.open_window(default_window_options(cx), move |_, cx| {
             cx.activate(true);
             cx.new(move |cx| {
@@ -447,10 +456,7 @@ pub fn run_cli(
                     })),
                     cx,
                 );
-                shell.set_save_sink(sink);
-                shell.set_settings_sink(settings_sink);
-                shell.set_test_run_sink(test_sink);
-                shell.set_debug_sink(debug_sink);
+                install_shell_sinks(&mut shell, &runtime_for_shell, &events_for_shell);
                 match project_root {
                     Some(root) => shell.with_project_root(root),
                     None => shell,
@@ -501,6 +507,21 @@ pub fn run_cli(
         report_cell.get(),
         &probe_printed,
     )
+}
+
+fn install_shell_sinks(
+    shell: &mut WorkspaceShell,
+    runtime: &Handle,
+    events: &mpsc::UnboundedSender<AppEvent>,
+) {
+    shell.set_save_sink(save_sink(runtime.clone(), events.clone()));
+    shell.set_settings_sink(settings_write_sink(runtime, events.clone()));
+    shell.set_test_run_sink(test_runs::test_run_sink(runtime.clone(), events.clone()));
+    shell.set_debug_sink(debug_sessions::debug_command_sink(
+        runtime.clone(),
+        events.clone(),
+    ));
+    shell.set_definition_sink(definition::definition_sink(runtime.clone(), events.clone()));
 }
 
 fn default_window_options(cx: &App) -> WindowOptions {

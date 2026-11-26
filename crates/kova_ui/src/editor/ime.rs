@@ -63,6 +63,9 @@ impl EntityInputHandler for EditorView {
             self.vim_text_input(new_text, started, cx);
             return;
         }
+        if self.state.is_read_only() {
+            return;
+        }
         let _changed = self
             .state
             .replace_text_in_range(range_utf16.as_ref(), new_text);
@@ -77,8 +80,8 @@ impl EntityInputHandler for EditorView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.vim_owns_keys() {
-            // No composition preview in Vim NORMAL / VISUAL; the commit arrives above.
+        if self.vim_owns_keys() || self.state.is_read_only() {
+            // No composition preview in Vim NORMAL / VISUAL or read-only tabs.
             return;
         }
         let started = Instant::now();

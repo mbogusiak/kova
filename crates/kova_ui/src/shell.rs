@@ -28,6 +28,10 @@ use gpui::{
 use kova_buffer::{Buffer, BufferSnapshot};
 use kova_core::builtin_actions::builtin_action_registry_ref;
 use kova_core::jetbrains_keymap_layer_ref;
+use kova_core::navigation::{
+    NavLocation, NavigationHistory, SourceLanguageKind, extract_symbol_query,
+    resolve_local_definition,
+};
 use kova_core::perf::{
     BudgetKind, budgets, check_duration_budget, check_rss_budget, current_process_rss_bytes,
 };
@@ -59,12 +63,13 @@ use crate::dock::{
     TreeActivation, VimModeBadge,
 };
 use crate::document::{
-    DocumentState, SAVE_PATH_REQUIRED_MESSAGE, SaveAction, SaveSink, SaveTicket, StatusKind,
+    DefinitionOutcome, DefinitionRequest, DefinitionSink, DefinitionTargetKind, DocumentState,
+    SAVE_PATH_REQUIRED_MESSAGE, SaveAction, SaveSink, SaveTicket, StatusKind,
 };
 use crate::editor::actions::{Save, WORKSPACE_KEY_CONTEXT};
 use crate::editor::syntax::{EditorSyntax, RunEntryPointRequested};
 use crate::editor::vim::VimKeyResult;
-use crate::editor::{EditorEvent, EditorView, SharedBuffer};
+use crate::editor::{EditorEvent, EditorView, SharedBuffer, is_go_to_def_modifiers};
 use crate::git::CommitPanel;
 use crate::http_runner::HttpResponseView;
 use crate::keymap::{
@@ -448,6 +453,15 @@ pub struct WorkspaceShell {
     commit_panel_open: bool,
     /// *Search Everywhere* (`Shift+Shift`) modal overlay (`KOVA-050`).
     search_everywhere: SearchEverywhereModal,
+    /// Back/Forward cursor jump history (`KOVA-051`).
+    nav_history: NavigationHistory,
+    /// Host symbol definition resolver (Level 1 + LSP/Vineflower, `KOVA-051`).
+    definition_sink: Option<DefinitionSink>,
+    next_definition_request_id: u64,
+    pending_definition_request: Option<(u64, NavLocation)>,
+    queued_go_to_definition_byte: Option<usize>,
+    /// Document keys opened in read-only mode (decompiled / external library sources).
+    read_only_docs: HashSet<PathBuf>,
 }
 
 impl fmt::Debug for WorkspaceShell {
@@ -485,9 +499,13 @@ impl WorkspaceShell {
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let root_pane = PaneId(1);
-        let welcome = cx.new(EditorView::welcome_demo);
-        let welcome_buffer = welcome.read(cx).shared_buffer();
         let welcome_path = PathBuf::from(WELCOME_DOCUMENT_PATH);
+        let welcome = cx.new(|cx| {
+            let mut editor = EditorView::welcome_demo(cx);
+            editor.set_language_hint(SourceLanguageKind::from_path(&welcome_path));
+            editor
+        });
+        let welcome_buffer = welcome.read(cx).shared_buffer();
 
         let mut pane = PaneState::new(root_pane);
         let tab = pane.tabs.open_or_focus(
@@ -574,6 +592,12 @@ impl WorkspaceShell {
             commit_panel: None,
             commit_panel_open: false,
             search_everywhere: SearchEverywhereModal::new(cx.focus_handle()),
+            nav_history: NavigationHistory::new(),
+            definition_sink: None,
+            next_definition_request_id: 1,
+            pending_definition_request: None,
+            queued_go_to_definition_byte: None,
+            read_only_docs: HashSet::new(),
         }
     }
 
@@ -875,6 +899,12 @@ impl WorkspaceShell {
                     .and_then(|t| t.path.clone());
                 if let Some(key) = key {
                     self.toggle_breakpoint_at(&key, *row, cx);
+                }
+            }
+            EditorEvent::GoToDefinition { row: _, byte } => {
+                if !self.dispatch_definition_to_sink(Some(*byte), cx) {
+                    self.queued_go_to_definition_byte = Some(*byte);
+                    cx.notify();
                 }
             }
         }
@@ -1371,10 +1401,14 @@ impl WorkspaceShell {
         } else {
             let vim_enabled = self.vim_enabled;
             let (font_family, font_size) = editor_font(&self.applied_settings);
+            let is_read_only = self.read_only_docs.contains(rel_path);
+            let lang_hint = SourceLanguageKind::from_path(rel_path);
             let editor = cx.new(|cx| {
                 let mut editor = EditorView::with_shared_buffer(buffer, cx);
                 editor.set_vim_enabled(vim_enabled, cx);
                 editor.set_font(&font_family, font_size, cx);
+                editor.set_language_hint(lang_hint);
+                editor.set_read_only(is_read_only, cx);
                 editor
             });
             let Some(pane) = self.panes.get_mut(&pane_id) else {
@@ -1385,6 +1419,7 @@ impl WorkspaceShell {
                 file_title(rel_path),
                 language_label(rel_path),
             );
+            pane.tabs.set_read_only(tab, is_read_only);
             pane.editors.insert(tab, editor.clone());
             let subscription = Self::subscribe_editor(&editor, pane_id, tab, cx);
             if let Some(pane) = self.panes.get_mut(&pane_id) {
@@ -1399,10 +1434,20 @@ impl WorkspaceShell {
             .and_then(|pane| pane.editors.get(&tab))
             .cloned()
         {
-            self.attach_editor_git(rel_path, &editor, cx);
-            if let Some((line, col)) = position {
-                editor.update(cx, |editor, cx| editor.set_cursor_position(line, col, cx));
+            let is_read_only = self.read_only_docs.contains(rel_path);
+            let lang_hint = SourceLanguageKind::from_path(rel_path);
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                pane.tabs.set_read_only(tab, is_read_only);
             }
+            self.attach_editor_git(rel_path, &editor, cx);
+            editor.update(cx, |editor, cx| {
+                editor.set_language_hint(lang_hint);
+                editor.set_read_only(is_read_only, cx);
+                if let Some((line, col)) = position {
+                    editor.go_to_line_column(line, Some(col), cx);
+                    editor.force_vim_normal(cx);
+                }
+            });
             window.focus(editor.read(cx).focus_handle());
         }
         self.refresh_debug_gutters(cx);
@@ -1465,6 +1510,8 @@ impl WorkspaceShell {
         let documents = &self.documents;
         self.doc_states
             .retain(|path, _| documents.contains_key(path));
+        self.read_only_docs
+            .retain(|path| documents.contains_key(path));
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1647,6 +1694,11 @@ impl WorkspaceShell {
         let Some(key) = self.active_document_key() else {
             return;
         };
+        if self.read_only_docs.contains(&key) {
+            self.doc_notice = Some((StatusKind::Warning, "Document is read-only".to_owned()));
+            cx.notify();
+            return;
+        }
         let has_path = self
             .doc_states
             .get(&key)
@@ -1868,28 +1920,44 @@ impl WorkspaceShell {
                 FocusedRegion::EditorPane(_) => kova_core::FocusContext::Workspace,
             },
         };
+        let editor_read_only = editor.as_ref().is_some_and(|e| e.read(cx).is_read_only());
         (
             editor,
             DispatchContext {
                 leaf,
                 vim_enabled: self.vim_enabled,
+                editor_read_only,
             },
         )
     }
 
     /// Handles modifier-only events (macOS `NSFlagsChanged` / X11 modifier edges) to detect
-    /// clean `Shift+Shift` double-taps across every island and Vim mode (`KOVA-050`).
+    /// clean `Shift+Shift` double-taps across every island and Vim mode (`KOVA-050`) and to
+    /// update `Cmd+Hover` / `Ctrl+Hover` link underlines in visible editors (`KOVA-051`).
     fn handle_modifiers_changed(
         &mut self,
         event: &ModifiersChangedEvent,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.settings_open
+        let modal_open = self.settings_open
             || self.commit_panel_open
             || self.ex_line.is_some()
-            || self.debugger.evaluate_modal().is_some()
-        {
+            || self.debugger.evaluate_modal().is_some();
+        let held = if modal_open || self.search_everywhere.is_open() {
+            false
+        } else {
+            is_go_to_def_modifiers(event.modifiers, cfg!(target_os = "macos"))
+        };
+        for pane in self.panes.values() {
+            if let Some(editor) = pane.active_editor() {
+                editor.update(cx, |editor, cx| {
+                    editor.set_go_to_def_modifier_held(held, cx);
+                });
+            }
+        }
+
+        if modal_open {
             self.keymap
                 .sync_modifiers_and_cancel(event.modifiers, event.capslock.on);
             return;
@@ -1898,6 +1966,7 @@ impl WorkspaceShell {
             DispatchContext {
                 leaf: kova_core::FocusContext::SearchEverywhere,
                 vim_enabled: self.vim_enabled,
+                editor_read_only: false,
             }
         } else {
             self.active_editor_and_dispatch_context(window, cx).1
@@ -1988,6 +2057,12 @@ impl WorkspaceShell {
                         }
                         VimKeyResult::OpenCommandLine(prefix) => {
                             self.ex_line = Some(ExCommandLine::new(prefix));
+                            cx.stop_propagation();
+                            cx.notify();
+                            return;
+                        }
+                        VimKeyResult::GoToDefinition => {
+                            self.go_to_definition_at(None, window, cx);
                             cx.stop_propagation();
                             cx.notify();
                             return;
@@ -2121,8 +2196,344 @@ impl WorkspaceShell {
             ShellAction::OpenSearchEverywhere => self.open_search_everywhere(window, cx),
             ShellAction::OpenSettings => self.open_settings(window, cx),
             ShellAction::ToggleCommitPanel => self.toggle_commit_panel(window, cx),
+            ShellAction::GoToDefinition => self.go_to_definition_at(None, window, cx),
+            ShellAction::NavigateBack => self.navigate_back(window, cx),
+            ShellAction::NavigateForward => self.navigate_forward(window, cx),
             ShellAction::Debug(action) => self.run_debug_action(action, window, cx),
         }
+    }
+
+    /// Installs the host *Go to Definition* resolver (`KOVA-051`).
+    pub fn set_definition_sink(&mut self, sink: DefinitionSink) {
+        self.definition_sink = Some(sink);
+    }
+
+    /// Current cursor navigation history (`Back`/`Forward`).
+    #[must_use]
+    pub const fn nav_history(&self) -> &NavigationHistory {
+        &self.nav_history
+    }
+
+    fn current_nav_location(&self, cx: &Context<'_, Self>) -> Option<NavLocation> {
+        let path = self.active_document_key()?;
+        let (line, col) = self.active_editor()?.read(cx).primary_cursor_position();
+        Some(NavLocation::new(path, line, col))
+    }
+
+    fn dispatch_definition_to_sink(
+        &mut self,
+        byte_override: Option<usize>,
+        cx: &Context<'_, Self>,
+    ) -> bool {
+        let Some(sink) = self.definition_sink.clone() else {
+            return false;
+        };
+        let Some((request, _snapshot)) = self.prepare_definition_request(byte_override, cx) else {
+            return true;
+        };
+        sink(request);
+        true
+    }
+
+    fn prepare_definition_request(
+        &mut self,
+        byte_override: Option<usize>,
+        cx: &Context<'_, Self>,
+    ) -> Option<(DefinitionRequest, BufferSnapshot)> {
+        let source_path = self.active_document_key()?;
+        let editor = self.active_editor()?.clone();
+        let (snapshot, primary_head, (origin_line, origin_col)) = {
+            let editor = editor.read(cx);
+            (
+                editor.snapshot(),
+                editor.state().primary_head(),
+                editor.primary_cursor_position(),
+            )
+        };
+        let cursor_byte = byte_override.unwrap_or(primary_head);
+        let origin = NavLocation::new(source_path.clone(), origin_line, origin_col);
+
+        let request_id = self.next_definition_request_id;
+        self.next_definition_request_id = self.next_definition_request_id.wrapping_add(1);
+        self.pending_definition_request = Some((request_id, origin));
+
+        let open_buffers: Vec<(PathBuf, String)> = self
+            .documents
+            .iter()
+            .map(|(path, buf)| (path.clone(), buf.snapshot().text()))
+            .collect();
+        let workspace_files: Vec<PathBuf> = self
+            .project_tree
+            .file_paths()
+            .map(Path::to_path_buf)
+            .collect();
+        let source_text = snapshot.text();
+
+        Some((
+            DefinitionRequest {
+                request_id,
+                project_root: self.project.root_owned(),
+                source_path,
+                source_text,
+                cursor_byte,
+                line: origin_line,
+                column: origin_col,
+                open_buffers,
+                workspace_files,
+            },
+            snapshot,
+        ))
+    }
+
+    fn go_to_definition_at(
+        &mut self,
+        byte_override: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.dispatch_definition_to_sink(byte_override, cx) {
+            return;
+        }
+        let Some((request, snapshot)) = self.prepare_definition_request(byte_override, cx) else {
+            return;
+        };
+        let request_id = request.request_id;
+
+        // Fallback for standalone shell / demo mode without a host sink: run Level-1 locally.
+        let Some(query) =
+            extract_symbol_query(&snapshot, &request.source_path, request.cursor_byte)
+        else {
+            self.apply_definition_result(
+                request_id,
+                DefinitionOutcome::NoSymbolAtCursor,
+                window,
+                cx,
+            );
+            return;
+        };
+        let project_root = request.project_root;
+        let source_text = request.source_text;
+        let open_buffers = request.open_buffers;
+        let workspace_files = request.workspace_files;
+        if project_root.is_none() {
+            let outcome = match resolve_local_definition(
+                &query,
+                &source_text,
+                &open_buffers,
+                None,
+                &workspace_files,
+            ) {
+                Some(hit) => DefinitionOutcome::Found {
+                    target: DefinitionTargetKind::WorkspaceFile { rel_path: hit.path },
+                    line: hit.line,
+                    column: hit.column,
+                    symbol_name: hit.symbol_name,
+                },
+                None => DefinitionOutcome::NotFound {
+                    symbol_name: query.ident,
+                },
+            };
+            self.apply_definition_result(request_id, outcome, window, cx);
+            return;
+        }
+
+        let job = cx.background_executor().spawn(async move {
+            match resolve_local_definition(
+                &query,
+                &source_text,
+                &open_buffers,
+                project_root.as_deref(),
+                &workspace_files,
+            ) {
+                Some(hit) => DefinitionOutcome::Found {
+                    target: DefinitionTargetKind::WorkspaceFile { rel_path: hit.path },
+                    line: hit.line,
+                    column: hit.column,
+                    symbol_name: hit.symbol_name,
+                },
+                None => DefinitionOutcome::NotFound {
+                    symbol_name: query.ident,
+                },
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = job.await;
+            this.update_in(cx, |this, window, cx| {
+                this.apply_definition_result(request_id, outcome, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Applies the asynchronous *Go to Definition* outcome from the host (`KOVA-051`).
+    pub fn apply_definition_result(
+        &mut self,
+        request_id: u64,
+        outcome: DefinitionOutcome,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((pending_id, origin)) = self.pending_definition_request.clone() else {
+            return;
+        };
+        if pending_id != request_id {
+            return;
+        }
+        self.pending_definition_request = None;
+
+        match outcome {
+            DefinitionOutcome::Found {
+                target,
+                line,
+                column,
+                symbol_name: _,
+            } => {
+                let target_path = match &target {
+                    DefinitionTargetKind::WorkspaceFile { rel_path } => rel_path.clone(),
+                    DefinitionTargetKind::ExternalFile { path, .. } => path.clone(),
+                    DefinitionTargetKind::DecompiledClass { cache_file, .. } => cache_file.clone(),
+                };
+                if target_path != origin.path || line != origin.line || column != origin.column {
+                    self.nav_history.push(origin);
+                }
+                self.doc_notice = None;
+                match target {
+                    DefinitionTargetKind::WorkspaceFile { rel_path } => {
+                        self.open_path(&rel_path, Some((line, column)), window, cx);
+                    }
+                    DefinitionTargetKind::ExternalFile { path, read_only } => {
+                        if read_only {
+                            self.open_external_read_only_file(path, line, column, window, cx);
+                        } else {
+                            self.open_path(&path, Some((line, column)), window, cx);
+                        }
+                    }
+                    DefinitionTargetKind::DecompiledClass {
+                        fqcn,
+                        cache_file,
+                        source_text,
+                    } => {
+                        self.read_only_docs.insert(cache_file.clone());
+                        let shared = self
+                            .documents
+                            .entry(cache_file.clone())
+                            .or_insert_with(|| SharedBuffer::new(Buffer::from_text(&source_text)))
+                            .clone();
+                        let rev = shared.version().as_u64();
+                        self.doc_states
+                            .entry(cache_file.clone())
+                            .or_insert_with(|| DocumentState::opened(None, rev, false));
+                        self.show_document(&cache_file, shared, Some((line, column)), window, cx);
+                        self.doc_notice =
+                            Some((StatusKind::Info, format!("Decompiled {fqcn} (read-only)")));
+                    }
+                }
+            }
+            DefinitionOutcome::NotFound { symbol_name } => {
+                self.doc_notice = Some((
+                    StatusKind::Info,
+                    format!("No definition found for '{symbol_name}'"),
+                ));
+            }
+            DefinitionOutcome::NoSymbolAtCursor => {
+                self.doc_notice = Some((
+                    StatusKind::Info,
+                    "Place caret on a symbol to go to definition".to_owned(),
+                ));
+            }
+            DefinitionOutcome::Error(message) => {
+                self.doc_notice = Some((StatusKind::Warning, message));
+            }
+        }
+        cx.notify();
+    }
+
+    fn open_external_read_only_file(
+        &mut self,
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(shared) = self.documents.get(&path).cloned() {
+            self.read_only_docs.insert(path.clone());
+            self.show_document(&path, shared, Some((line, column)), window, cx);
+            return;
+        }
+        let read = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { std::fs::read_to_string(path) }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = read.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(text) => {
+                    this.read_only_docs.insert(path.clone());
+                    let shared = this
+                        .documents
+                        .entry(path.clone())
+                        .or_insert_with(|| SharedBuffer::new(Buffer::from_text(&text)))
+                        .clone();
+                    let rev = shared.version().as_u64();
+                    this.doc_states
+                        .entry(path.clone())
+                        .or_insert_with(|| DocumentState::opened(None, rev, false));
+                    this.show_document(&path, shared, Some((line, column)), window, cx);
+                }
+                Err(err) => {
+                    this.report_open_error(format!("Cannot open {}: {err}", path.display()), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn navigate_back(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(current) = self.current_nav_location(cx) else {
+            return;
+        };
+        let Some(target) = self.nav_history.go_back(current) else {
+            self.doc_notice = Some((StatusKind::Info, "No previous location".to_owned()));
+            cx.notify();
+            return;
+        };
+        self.navigate_to_location(&target, window, cx);
+    }
+
+    fn navigate_forward(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(current) = self.current_nav_location(cx) else {
+            return;
+        };
+        let Some(target) = self.nav_history.go_forward(current) else {
+            self.doc_notice = Some((StatusKind::Info, "No forward location".to_owned()));
+            cx.notify();
+            return;
+        };
+        self.navigate_to_location(&target, window, cx);
+    }
+
+    fn navigate_to_location(
+        &mut self,
+        target: &NavLocation,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.doc_notice = None;
+        if let Some(shared) = self.documents.get(&target.path).cloned() {
+            self.show_document(
+                &target.path,
+                shared,
+                Some((target.line, target.column)),
+                window,
+                cx,
+            );
+        } else {
+            self.open_path(&target.path, Some((target.line, target.column)), window, cx);
+        }
+        cx.notify();
     }
 
     /// Opens the *Search Everywhere* modal (or switches to the next scope tab if already open)
@@ -4189,6 +4600,15 @@ impl WorkspaceShell {
         } else {
             badge.text_color(p.text_muted).child("×")
         };
+        let ro_badge = tab.is_read_only.then(|| {
+            div()
+                .px(px(4.0))
+                .rounded(px(3.0))
+                .bg(p.hover)
+                .text_color(p.text_muted)
+                .text_size(px(10.0))
+                .child("RO")
+        });
         el.child(
             div().text_color(p.tab_indicator).text_size(px(10.0)).child(
                 tab.path
@@ -4197,6 +4617,7 @@ impl WorkspaceShell {
             ),
         )
         .child(tab.display_title(compact))
+        .children(ro_badge)
         .child(badge)
     }
 
@@ -4591,6 +5012,9 @@ impl Render for WorkspaceShell {
         if !self.first_frame_scheduled {
             self.first_frame_scheduled = true;
             cx.defer_in(window, Self::complete_first_frame);
+        }
+        if let Some(byte) = self.queued_go_to_definition_byte.take() {
+            self.go_to_definition_at(Some(byte), window, cx);
         }
 
         let title = self.active_window_title();

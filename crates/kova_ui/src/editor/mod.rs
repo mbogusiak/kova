@@ -25,6 +25,7 @@ use gpui::{
     Render, ScrollWheelEvent, ShapedLine, SharedString, Styled as _, Task, Window, div, px,
 };
 use kova_buffer::{Buffer, BufferSnapshot, BufferVersion, Motion, SelectionSet};
+use kova_core::navigation::{SourceLanguageKind, navigable_identifier_at_byte};
 use kova_syntax::EntryPoint;
 use kova_tools::git::{GitRepository, gutter_hunks};
 use smallvec::SmallVec;
@@ -127,6 +128,42 @@ pub enum EditorEvent {
     /// A click on the line numbers asked to toggle a breakpoint on buffer row `usize`
     /// (`KOVA-041`).
     ToggleBreakpoint(usize),
+    /// `Cmd+Click` (macOS) / `Ctrl+Click` (Linux) on a navigable identifier (`KOVA-051`).
+    GoToDefinition {
+        /// 0-based buffer row.
+        row: usize,
+        /// Byte offset of the clicked identifier.
+        byte: usize,
+    },
+}
+
+/// Identifier currently underlined under `Cmd+Hover` / `Ctrl+Hover` (`KOVA-051`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HoveredLink {
+    pub(crate) row: usize,
+    pub(crate) byte_range: Range<usize>,
+}
+
+/// Hover state for `Cmd+Hover` / `Ctrl+Hover` link underlining (`KOVA-051`).
+#[derive(Debug, Default)]
+struct HoverLinkState {
+    modifier_held: bool,
+    last_position: Option<Point<Pixels>>,
+    link: Option<HoveredLink>,
+}
+
+/// Returns `true` when the mouse/modifier state matches the platform's *Go to Definition*
+/// activator (`Cmd` on macOS, `Ctrl` on Linux/others) with no `Alt` (multi-cursor) or `Shift`.
+#[must_use]
+pub const fn is_go_to_def_modifiers(modifiers: gpui::Modifiers, macos: bool) -> bool {
+    if modifiers.alt || modifiers.shift {
+        return false;
+    }
+    if macos {
+        modifiers.platform && !modifiers.control
+    } else {
+        modifiers.control && !modifiers.platform
+    }
 }
 
 /// Debugger decorations of the gutter (`KOVA-041`).
@@ -173,6 +210,8 @@ pub struct EditorView {
     git: EditorGitState,
     git_base_task: Option<Task<()>>,
     git_diff_task: Option<Task<()>>,
+    language_hint: SourceLanguageKind,
+    hover_link: HoverLinkState,
 }
 
 impl EditorView {
@@ -219,6 +258,82 @@ impl EditorView {
             git: EditorGitState::default(),
             git_base_task: None,
             git_diff_task: None,
+            language_hint: SourceLanguageKind::Unknown,
+            hover_link: HoverLinkState::default(),
+        }
+    }
+
+    /// Sets the source language hint used for `Cmd+Hover` / `Cmd+Click` identifier checks.
+    pub const fn set_language_hint(&mut self, language: SourceLanguageKind) {
+        self.language_hint = language;
+    }
+
+    /// Returns the source language hint of this editor view.
+    #[must_use]
+    pub const fn language_hint(&self) -> SourceLanguageKind {
+        self.language_hint
+    }
+
+    /// Returns `true` when this buffer is read-only (e.g. a decompiled class).
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        self.state.is_read_only()
+    }
+
+    /// Enables or disables read-only mode on this view.
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<'_, Self>) {
+        if self.state.is_read_only() == read_only {
+            return;
+        }
+        self.state.set_read_only(read_only);
+        if read_only {
+            self.force_vim_normal(cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) const fn hovered_link(&self) -> Option<&HoveredLink> {
+        self.hover_link.link.as_ref()
+    }
+
+    /// Updates whether the `Cmd`/`Ctrl` Go-to-Definition modifier is held and refreshes the
+    /// underlined identifier immediately without requiring mouse movement.
+    pub fn set_go_to_def_modifier_held(&mut self, held: bool, cx: &mut Context<'_, Self>) {
+        self.hover_link.modifier_held = held;
+        if self.recompute_hovered_link() {
+            cx.notify();
+        }
+    }
+
+    fn recompute_hovered_link(&mut self) -> bool {
+        let next = if !self.hover_link.modifier_held
+            || self.scrollbar_drag.is_some()
+            || self.is_selecting()
+            || self.language_hint == SourceLanguageKind::Unknown
+        {
+            None
+        } else if let Some(pos) = self.hover_link.last_position {
+            let local_x = f32::from(pos.x) - f32::from(self.last_canvas_bounds.origin.x);
+            if !self.last_canvas_bounds.contains(&pos) || self.is_in_scrollbar_hit_zone(local_x) {
+                None
+            } else {
+                let (row, byte, in_gutter) = self.hit_test_point(pos);
+                if in_gutter {
+                    None
+                } else {
+                    let snap = self.state.snapshot();
+                    navigable_identifier_at_byte(&snap, byte, self.language_hint)
+                        .map(|byte_range| HoveredLink { row, byte_range })
+                }
+            }
+        } else {
+            None
+        };
+        if next == self.hover_link.link {
+            false
+        } else {
+            self.hover_link.link = next;
+            true
         }
     }
 
@@ -1274,6 +1389,18 @@ impl EditorView {
         let Some(command) = map_editor_key(event.keystroke.key.as_str(), mods, macos) else {
             return;
         };
+        if self.state.is_read_only()
+            && matches!(
+                command,
+                EditorKeyCommand::Newline
+                    | EditorKeyCommand::Tab
+                    | EditorKeyCommand::DeleteBackward
+                    | EditorKeyCommand::DeleteForward
+            )
+        {
+            cx.stop_propagation();
+            return;
+        }
         match command {
             EditorKeyCommand::Escape => self.run_edit(window, cx, |state, _| {
                 state.escape();
@@ -1349,6 +1476,9 @@ impl EditorView {
 
         let (row, byte, in_gutter) = self.hit_test_point(event.position);
         let mods = event.modifiers;
+        let macos = cfg!(target_os = "macos");
+        let go_to_def_click =
+            event.click_count == 1 && !in_gutter && is_go_to_def_modifiers(mods, macos);
         if self.handle_fold_or_run_click(event, row, local_x, in_gutter, cx) {
             cx.stop_propagation();
             self.finish_input(started, false, cx);
@@ -1366,6 +1496,15 @@ impl EditorView {
             self.state.select_lines(row, row);
         } else if event.click_count == 2 {
             self.state.select_word_at(byte);
+        } else if go_to_def_click {
+            self.drag_mode = DragMode::None;
+            self.hover_link.link = None;
+            self.state.set_caret(byte);
+            if navigable_identifier_at_byte(&self.state.snapshot(), byte, self.language_hint)
+                .is_some()
+            {
+                cx.emit(EditorEvent::GoToDefinition { row, byte });
+            }
         } else if mods.alt {
             self.state.add_cursor_at(byte);
         } else if mods.shift {
@@ -1389,7 +1528,13 @@ impl EditorView {
         in_gutter: bool,
         cx: &mut Context<'_, Self>,
     ) -> bool {
-        if event.click_count != 1 || event.modifiers.shift || event.modifiers.alt {
+        let macos = cfg!(target_os = "macos");
+        let primary_held = if macos {
+            event.modifiers.platform
+        } else {
+            event.modifiers.control
+        };
+        if event.click_count != 1 || event.modifiers.shift || event.modifiers.alt || primary_held {
             return false;
         }
         if !in_gutter {
@@ -1424,7 +1569,8 @@ impl EditorView {
         }
     }
 
-    /// Handles hover over the scrollbar zone (only while the pointer is over the editor).
+    /// Handles hover over the scrollbar zone and `Cmd+Hover` link highlighting (only while
+    /// the pointer is over the editor).
     fn handle_hover_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -1432,13 +1578,24 @@ impl EditorView {
         cx: &mut Context<'_, Self>,
     ) {
         if self.scrollbar_drag.is_some() || self.is_selecting() {
+            if self.hover_link.link.take().is_some() {
+                cx.notify();
+            }
             return;
         }
         let local_x = f32::from(event.position.x) - f32::from(self.last_canvas_bounds.origin.x);
         let hovered = self.is_in_scrollbar_hit_zone(local_x)
             && self.last_viewport.max_scroll_y(self.visual_line_count()) > 0.0;
-        if hovered != self.scrollbar_hovered {
+        let scrollbar_changed = hovered != self.scrollbar_hovered;
+        if scrollbar_changed {
             self.scrollbar_hovered = hovered;
+        }
+
+        self.hover_link.last_position = Some(event.position);
+        self.hover_link.modifier_held =
+            is_go_to_def_modifiers(event.modifiers, cfg!(target_os = "macos"));
+        let link_changed = self.recompute_hovered_link();
+        if scrollbar_changed || link_changed {
             cx.notify();
         }
     }
@@ -1473,6 +1630,12 @@ impl EditorView {
             return;
         }
         if !self.is_selecting() || !event.dragging() {
+            if !self.last_canvas_bounds.contains(&event.position) {
+                self.hover_link.last_position = None;
+                if self.hover_link.link.take().is_some() {
+                    cx.notify();
+                }
+            }
             return;
         }
         self.last_drag_position = Some(event.position);
@@ -1650,5 +1813,28 @@ mod tests {
 
         assert_eq!(cache.len(), visible.len());
         assert!(cache.len() <= 512);
+    }
+
+    #[test]
+    fn go_to_def_modifiers_never_collide_with_alt_multicursor_or_shift() {
+        use super::is_go_to_def_modifiers;
+        let cmd = gpui::Modifiers::command();
+        let ctrl = gpui::Modifiers::control();
+        let alt = gpui::Modifiers::alt();
+        let shift = gpui::Modifiers::shift();
+
+        // macOS: Cmd only.
+        assert!(is_go_to_def_modifiers(cmd, true));
+        assert!(!is_go_to_def_modifiers(ctrl, true));
+        assert!(!is_go_to_def_modifiers(cmd | alt, true));
+        assert!(!is_go_to_def_modifiers(cmd | shift, true));
+        assert!(!is_go_to_def_modifiers(alt, true));
+
+        // Linux: Ctrl only.
+        assert!(is_go_to_def_modifiers(ctrl, false));
+        assert!(!is_go_to_def_modifiers(cmd, false));
+        assert!(!is_go_to_def_modifiers(ctrl | alt, false));
+        assert!(!is_go_to_def_modifiers(ctrl | shift, false));
+        assert!(!is_go_to_def_modifiers(alt, false));
     }
 }

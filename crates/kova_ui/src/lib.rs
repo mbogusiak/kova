@@ -31,9 +31,12 @@ pub use dock::{
     ProjectNodeKind, ProjectTreeModel, SplitAxis, SplitTree, StatusBarState, StructureModel,
     StructureSymbolItem, TabGroupModel, TabId, TabItem, TreeActivation, VimModeBadge,
 };
-pub use document::{DocumentState, SaveRequest, SaveSink, SaveStatus, SaveTicket, StatusKind};
+pub use document::{
+    DefinitionOutcome, DefinitionRequest, DefinitionSink, DefinitionTargetKind, DocumentState,
+    SaveRequest, SaveSink, SaveStatus, SaveTicket, StatusKind,
+};
 pub use editor::shared::SharedBuffer;
-pub use editor::{EditorEvent, EditorView};
+pub use editor::{EditorEvent, EditorView, is_go_to_def_modifiers};
 pub use git::{
     CheckState, CommitPanel, CommitPanelEvent, CommitPanelModel, EditorGitState, StageOp,
 };

@@ -31,6 +31,7 @@ pub struct EditorState {
     clipboard: MultiCursorClipboard,
     marked_range: Option<Range<usize>>,
     motion_config: MotionConfig,
+    read_only: bool,
 }
 
 impl EditorState {
@@ -51,7 +52,19 @@ impl EditorState {
             clipboard: MultiCursorClipboard::default(),
             marked_range: None,
             motion_config: MotionConfig::default(),
+            read_only: false,
         }
+    }
+
+    /// Returns `true` when the buffer is read-only (mutations and history are blocked).
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Enables or disables read-only mode (for decompiled or external library files).
+    pub const fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
     }
 
     /// Creates a state from an in-memory UTF-8 string.
@@ -203,6 +216,9 @@ impl EditorState {
 
     /// Reverts the latest history transaction. Returns `true` if anything was undone.
     pub fn undo(&mut self) -> bool {
+        if self.read_only {
+            return false;
+        }
         self.marked_range = None;
         self.sync_external_edits();
         let selections = &mut self.selections;
@@ -215,6 +231,9 @@ impl EditorState {
 
     /// Re-applies the latest undone transaction. Returns `true` if anything was redone.
     pub fn redo(&mut self) -> bool {
+        if self.read_only {
+            return false;
+        }
         self.marked_range = None;
         self.sync_external_edits();
         let selections = &mut self.selections;
@@ -238,6 +257,9 @@ impl EditorState {
 
     /// Copies like [`Self::copy`] and deletes the selected text as one undo transaction.
     pub fn cut(&mut self) -> Option<String> {
+        if self.read_only {
+            return None;
+        }
         self.marked_range = None;
         self.sync_external_edits();
         let (clipboard, selections) = (&mut self.clipboard, &mut self.selections);
@@ -264,6 +286,9 @@ impl EditorState {
     /// Otherwise [`split_paste_for_cursors`] decides: with `K > 1` cursors and exactly
     /// `K` lines, line `i` goes to cursor `i`; else the whole text goes to every cursor.
     pub fn paste(&mut self, text: &str) -> bool {
+        if self.read_only {
+            return false;
+        }
         self.marked_range = None;
         let entry = match self.clipboard.latest() {
             Some(latest) if latest.text == text => latest.clone(),
@@ -589,6 +614,10 @@ impl EditorState {
         range_utf16: Option<&Range<usize>>,
         text: &str,
     ) -> bool {
+        if self.read_only {
+            self.marked_range = None;
+            return false;
+        }
         let target = match (range_utf16, self.marked_range.take()) {
             (Some(r), _) => self.utf16_range_to_bytes(r),
             (None, Some(marked)) => marked,
@@ -611,6 +640,10 @@ impl EditorState {
         text: &str,
         selected_utf16: Option<&Range<usize>>,
     ) -> bool {
+        if self.read_only {
+            self.marked_range = None;
+            return false;
+        }
         let target = match (range_utf16, self.marked_range.clone()) {
             (Some(r), _) => self.utf16_range_to_bytes(r),
             (None, Some(marked)) => marked,
@@ -636,6 +669,9 @@ impl EditorState {
     // ---------------------------------------------------------------- internal
 
     fn record(&mut self, edits: &[TextEdit], origin: EditOrigin) -> bool {
+        if self.read_only {
+            return false;
+        }
         self.sync_external_edits();
         let before = self.buffer.version();
         let selections = &mut self.selections;
@@ -1086,5 +1122,30 @@ mod tests {
         assert_eq!(st.cursor_count(), 1);
         assert!(st.add_next_occurrence());
         assert_eq!(st.cursor_count(), 2);
+    }
+
+    #[test]
+    fn read_only_blocks_all_mutations_while_allowing_copy_and_navigation() {
+        let mut st = EditorState::from_text("class Decompiled {}");
+        st.set_read_only(true);
+        assert!(st.is_read_only());
+
+        assert!(!st.insert_text("x"));
+        assert!(!st.delete_backward());
+        assert!(!st.delete_forward());
+        assert!(!st.paste("y"));
+        assert_eq!(st.cut(), None);
+        assert!(!st.apply_edits(&[TextEdit::new(0..0, "z")], EditOrigin::Typing));
+        assert!(!st.duplicate_lines_or_selections());
+        assert!(!st.toggle_line_comment("//"));
+        assert!(!st.replace_text_in_range(None, "abc"));
+        assert!(!st.replace_and_mark_text_in_range(None, "abc", None));
+        assert!(!st.undo());
+        assert!(!st.redo());
+        assert_eq!(text(&st), "class Decompiled {}");
+
+        st.select_word_at(6);
+        assert_eq!(st.copy().as_deref(), Some("Decompiled"));
+        assert_eq!(text(&st), "class Decompiled {}");
     }
 }

@@ -7,6 +7,7 @@ pub mod action;
 pub mod builtin_actions;
 pub mod context;
 pub mod keymap;
+pub mod navigation;
 pub mod perf;
 pub mod project;
 pub mod vim;
@@ -24,6 +25,10 @@ pub use keymap::{
     KeymapDiagnostic, KeymapDiagnosticKind, KeymapLayer, KeymapLayerKind, KeymapParseError,
     KeymapPresetMode, KeymapResolver, KeymapSession, ModifierTap, ModifierTapDetector, Modifiers,
     Platform, build_effective_keymap, jetbrains_keymap_layer, jetbrains_keymap_layer_ref, presets,
+};
+pub use navigation::{
+    NavLocation, NavigationHistory, ResolvedLocation, SourceLanguageKind, SymbolQuery,
+    extract_symbol_query, navigable_identifier_at_byte, resolve_local_definition,
 };
 pub use project::{
     ActiveProject, BuildSystemKind, DEFAULT_MAX_ENTRIES, MAX_RECENT_FILES,

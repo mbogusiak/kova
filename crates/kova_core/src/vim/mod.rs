@@ -80,6 +80,8 @@ pub enum VimOutcome {
     Handled,
     /// The key is not owned by Vim; dispatch it to the IDE keymap.
     PassThrough,
+    /// `gd` in Normal mode: trigger IDE *Go to Definition* at the current cursor.
+    GoToDefinition,
 }
 
 /// Normalized key as understood by the Vim state machine.
