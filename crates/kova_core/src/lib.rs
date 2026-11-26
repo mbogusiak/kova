@@ -8,6 +8,7 @@ pub mod builtin_actions;
 pub mod completion;
 pub mod context;
 pub mod keymap;
+pub mod markdown;
 pub mod navigation;
 pub mod perf;
 pub mod project;
@@ -33,6 +34,10 @@ pub use keymap::{
     KeymapDiagnostic, KeymapDiagnosticKind, KeymapLayer, KeymapLayerKind, KeymapParseError,
     KeymapPresetMode, KeymapResolver, KeymapSession, ModifierTap, ModifierTapDetector, Modifiers,
     Platform, build_effective_keymap, jetbrains_keymap_layer, jetbrains_keymap_layer_ref, presets,
+};
+pub use markdown::{
+    InlineSpan, ListItem, ListMarkerKind, MarkdownBlock, MarkdownDocument, MarkdownViewMode,
+    TableAlignment, TableBlock, is_markdown_path, parse_markdown,
 };
 pub use navigation::{
     NavLocation, NavigationHistory, ResolvedLocation, SourceLanguageKind, SymbolQuery,

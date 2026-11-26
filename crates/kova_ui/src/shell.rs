@@ -30,6 +30,7 @@ use kova_buffer::{Buffer, BufferSnapshot};
 use kova_core::builtin_actions::builtin_action_registry_ref;
 use kova_core::completion::{CompletionTriggerKind, should_auto_trigger_completion};
 use kova_core::jetbrains_keymap_layer_ref;
+use kova_core::markdown::{MarkdownViewMode, is_markdown_path};
 use kova_core::navigation::{
     NavLocation, NavigationHistory, SourceLanguageKind, extract_symbol_query,
     resolve_local_definition,
@@ -94,6 +95,7 @@ use crate::keymap::{
     KeyDispatchLayer, KeyRoute, RouteFlags, ShellAction, is_text_composition, key_route,
     parse_ex_command, shortcut_stroke, vim_stroke,
 };
+use crate::markdown_preview::{MarkdownPreviewEvent, MarkdownPreviewView};
 use crate::search::find_in_files::render_find_in_files_row;
 use crate::search::modal::render_search_row;
 use crate::search::{
@@ -336,11 +338,18 @@ fn rgb_hex(hex: u32) -> Hsla {
     .into()
 }
 
+struct MarkdownPreviewEntry {
+    preview: Entity<MarkdownPreviewView>,
+    _subscription: Subscription,
+}
+
 /// One editor split pane: its tab group plus one [`EditorView`] per open tab.
 struct PaneState {
     tabs: TabGroupModel,
     editors: HashMap<TabId, Entity<EditorView>>,
     subscriptions: HashMap<TabId, Subscription>,
+    markdown_modes: HashMap<TabId, MarkdownViewMode>,
+    markdown_previews: HashMap<TabId, MarkdownPreviewEntry>,
 }
 
 impl PaneState {
@@ -349,6 +358,8 @@ impl PaneState {
             tabs: TabGroupModel::new(id),
             editors: HashMap::new(),
             subscriptions: HashMap::new(),
+            markdown_modes: HashMap::new(),
+            markdown_previews: HashMap::new(),
         }
     }
 
@@ -356,6 +367,37 @@ impl PaneState {
         self.tabs
             .active_tab_id()
             .and_then(|tab| self.editors.get(&tab))
+    }
+
+    fn active_markdown_mode(&self) -> Option<MarkdownViewMode> {
+        self.tabs
+            .active_tab_id()
+            .and_then(|tab| self.markdown_modes.get(&tab))
+            .copied()
+    }
+
+    fn active_markdown_preview(&self) -> Option<&Entity<MarkdownPreviewView>> {
+        self.tabs
+            .active_tab_id()
+            .and_then(|tab| self.markdown_previews.get(&tab))
+            .map(|entry| &entry.preview)
+    }
+
+    fn set_markdown_mode(&mut self, tab: TabId, mode: MarkdownViewMode) -> bool {
+        if let Some(slot) = self.markdown_modes.get_mut(&tab) {
+            *slot = mode;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remove_tab_state(&mut self, tab: TabId) {
+        self.tabs.close_tab(tab);
+        self.editors.remove(&tab);
+        self.subscriptions.remove(&tab);
+        self.markdown_modes.remove(&tab);
+        self.markdown_previews.remove(&tab);
     }
 }
 
@@ -987,6 +1029,11 @@ impl WorkspaceShell {
                                 // Sibling split sharing the buffer: repaint with the new revision.
                                 other.update(cx, |_, cx| cx.notify());
                             }
+                            if let Some(entry) = state.markdown_previews.get(tab_id) {
+                                entry
+                                    .preview
+                                    .update(cx, MarkdownPreviewView::refresh_if_needed);
+                            }
                             dirty_path = dirty_path.or_else(|| {
                                 state
                                     .tabs
@@ -1436,10 +1483,113 @@ impl WorkspaceShell {
     fn focus_active_editor(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.dock_layout
             .focus(FocusedRegion::EditorPane(self.active_pane));
-        if let Some(editor) = self.active_editor() {
-            window.focus(editor.read(cx).focus_handle());
+        if let Some(pane) = self.panes.get(&self.active_pane) {
+            if pane.active_markdown_mode() == Some(MarkdownViewMode::Preview)
+                && let Some(preview) = pane.active_markdown_preview()
+            {
+                window.focus(preview.read(cx).focus_handle());
+            } else if let Some(editor) = pane.active_editor() {
+                window.focus(editor.read(cx).focus_handle());
+            } else {
+                window.focus(&self.focus_handle);
+            }
         }
         cx.notify();
+    }
+
+    fn subscribe_markdown_preview(
+        preview: &Entity<MarkdownPreviewView>,
+        pane: PaneId,
+        tab: TabId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Subscription {
+        cx.subscribe_in(
+            preview,
+            window,
+            move |this, _preview, event: &MarkdownPreviewEvent, window, cx| match event {
+                MarkdownPreviewEvent::Focused => {
+                    if let Some(state) = this.panes.get_mut(&pane) {
+                        state.tabs.select_tab(tab);
+                    }
+                    this.set_active_pane(pane, cx);
+                    this.dock_layout.focus(FocusedRegion::EditorPane(pane));
+                    let is_preview_only = this
+                        .panes
+                        .get(&pane)
+                        .and_then(|state| state.markdown_modes.get(&tab))
+                        .is_some_and(|mode| *mode == MarkdownViewMode::Preview);
+                    if is_preview_only {
+                        window.focus(&this.focus_handle);
+                    }
+                    cx.notify();
+                }
+                MarkdownPreviewEvent::OpenRelativePath(target) => {
+                    this.open_markdown_relative_link(pane, tab, target, window, cx);
+                }
+            },
+        )
+    }
+
+    fn set_markdown_view_mode(
+        &mut self,
+        pane_id: PaneId,
+        tab_id: TabId,
+        mode: MarkdownViewMode,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            return;
+        };
+        if !pane.set_markdown_mode(tab_id, mode) {
+            return;
+        }
+        if pane.tabs.active_tab_id() == Some(tab_id) {
+            if mode != MarkdownViewMode::Editor
+                && let Some(preview) = pane
+                    .markdown_previews
+                    .get(&tab_id)
+                    .map(|entry| entry.preview.clone())
+            {
+                preview.update(cx, MarkdownPreviewView::refresh_if_needed);
+            }
+            self.set_active_pane(pane_id, cx);
+            self.dock_layout.focus(FocusedRegion::EditorPane(pane_id));
+            if let Some(pane) = self.panes.get(&pane_id) {
+                if mode == MarkdownViewMode::Preview
+                    && let Some(preview) = pane
+                        .markdown_previews
+                        .get(&tab_id)
+                        .map(|entry| &entry.preview)
+                {
+                    window.focus(preview.read(cx).focus_handle());
+                } else if let Some(editor) = pane.editors.get(&tab_id) {
+                    window.focus(editor.read(cx).focus_handle());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn open_markdown_relative_link(
+        &mut self,
+        pane_id: PaneId,
+        tab_id: TabId,
+        target: &Path,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let doc_path = self
+            .panes
+            .get(&pane_id)
+            .and_then(|pane| pane.tabs.tabs().iter().find(|t| t.id == tab_id))
+            .and_then(|tab| tab.path.as_deref());
+        let Some(resolved) = resolve_markdown_relative_path(doc_path, target) else {
+            return;
+        };
+        self.set_active_pane(pane_id, cx);
+        self.open_path(&resolved, None, window, cx);
     }
 
     fn focus_dock(
@@ -1625,7 +1775,7 @@ impl WorkspaceShell {
             let is_read_only = self.read_only_docs.contains(rel_path);
             let lang_hint = SourceLanguageKind::from_path(rel_path);
             let editor = cx.new(|cx| {
-                let mut editor = EditorView::with_shared_buffer(buffer, cx);
+                let mut editor = EditorView::with_shared_buffer(buffer.clone(), cx);
                 editor.set_vim_enabled(vim_enabled, cx);
                 editor.set_font(&font_family, font_size, cx);
                 editor.set_language_hint(lang_hint);
@@ -1645,6 +1795,23 @@ impl WorkspaceShell {
             let subscription = Self::subscribe_editor(&editor, pane_id, tab, cx);
             if let Some(pane) = self.panes.get_mut(&pane_id) {
                 pane.subscriptions.insert(tab, subscription);
+            }
+            if is_markdown_path(rel_path) {
+                let preview_id = format!("md-preview-{}-{}", pane_id.0, tab.0);
+                let rel_owned = rel_path.to_path_buf();
+                let preview =
+                    cx.new(|cx| MarkdownPreviewView::new(Some(rel_owned), buffer, preview_id, cx));
+                let md_sub = Self::subscribe_markdown_preview(&preview, pane_id, tab, window, cx);
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    pane.markdown_modes.insert(tab, MarkdownViewMode::default());
+                    pane.markdown_previews.insert(
+                        tab,
+                        MarkdownPreviewEntry {
+                            preview,
+                            _subscription: md_sub,
+                        },
+                    );
+                }
             }
             tab
         };
@@ -1669,7 +1836,17 @@ impl WorkspaceShell {
                     editor.force_vim_normal(cx);
                 }
             });
-            window.focus(editor.read(cx).focus_handle());
+            let preview_focus = self
+                .panes
+                .get(&pane_id)
+                .filter(|pane| pane.markdown_modes.get(&tab) == Some(&MarkdownViewMode::Preview))
+                .and_then(|pane| pane.markdown_previews.get(&tab))
+                .map(|entry| entry.preview.clone());
+            if let Some(preview) = preview_focus {
+                window.focus(preview.read(cx).focus_handle());
+            } else {
+                window.focus(editor.read(cx).focus_handle());
+            }
         }
         self.refresh_debug_gutters(cx);
         self.record_recent_file(rel_path);
@@ -1727,9 +1904,7 @@ impl WorkspaceShell {
         let Some(state) = self.panes.get_mut(&pane) else {
             return;
         };
-        state.tabs.close_tab(tab);
-        state.editors.remove(&tab);
-        state.subscriptions.remove(&tab);
+        state.remove_tab_state(tab);
         let now_empty = state.tabs.tab_count() == 0;
 
         if now_empty && self.split_tree.close(pane) {
@@ -3931,12 +4106,23 @@ impl WorkspaceShell {
             self.panes.insert(new_id, PaneState::new(new_id));
             new_id
         };
+        let source_md_mode = self
+            .panes
+            .get(&source)
+            .and_then(|pane| pane.markdown_modes.get(&tab))
+            .copied();
         self.active_pane = target;
         self.show_document(&path, buffer, position, window, cx);
+        if let Some(mode) = source_md_mode
+            && let Some(target_pane) = self.panes.get_mut(&target)
+            && let Some(target_tab) = target_pane.tabs.active_tab_id()
+        {
+            target_pane.set_markdown_mode(target_tab, mode);
+        }
         self.detach_tab(source, tab);
         self.set_active_pane(target, cx);
         self.drop_unused_documents();
-        cx.notify();
+        self.focus_active_editor(window, cx);
     }
 
     /// Removes `tab` from `pane` without moving focus; closes the pane when it becomes empty.
@@ -3944,9 +4130,7 @@ impl WorkspaceShell {
         let Some(state) = self.panes.get_mut(&pane) else {
             return;
         };
-        state.tabs.close_tab(tab);
-        state.editors.remove(&tab);
-        state.subscriptions.remove(&tab);
+        state.remove_tab_state(tab);
         if state.tabs.tab_count() == 0 && self.split_tree.close(pane) {
             self.panes.remove(&pane);
         }
@@ -5124,14 +5308,54 @@ impl WorkspaceShell {
         };
         let tab_bar = Self::render_tab_bar(pane_id, pane, p, cx);
 
-        let content: AnyElement = match pane.active_editor() {
-            Some(editor) => div()
+        let content: AnyElement = match (
+            pane.active_editor(),
+            pane.active_markdown_mode(),
+            pane.active_markdown_preview(),
+        ) {
+            (Some(editor), Some(MarkdownViewMode::Split), Some(preview)) => div()
+                .flex_1()
+                .size_full()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .flex()
+                .flex_row()
+                .child(
+                    div()
+                        .w(relative(0.5))
+                        .h_full()
+                        .min_w(px(0.0))
+                        .min_h(px(0.0))
+                        .overflow_hidden()
+                        .child(editor.clone()),
+                )
+                .child(div().w(px(1.0)).h_full().flex_none().bg(p.border_subtle))
+                .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .min_w(px(0.0))
+                        .min_h(px(0.0))
+                        .overflow_hidden()
+                        .child(preview.clone()),
+                )
+                .into_any_element(),
+            (_, Some(MarkdownViewMode::Preview), Some(preview)) => div()
                 .flex_1()
                 .w_full()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(preview.clone())
+                .into_any_element(),
+            (Some(editor), _, _) => div()
+                .flex_1()
+                .w_full()
+                .min_w(px(0.0))
                 .min_h(px(0.0))
                 .child(editor.clone())
                 .into_any_element(),
-            None => placeholder("No open files — pick one in the Project dock (Alt+1).", p)
+            (None, _, _) => placeholder("No open files — pick one in the Project dock (Alt+1).", p)
                 .into_any_element(),
         };
 
@@ -5215,6 +5439,63 @@ impl WorkspaceShell {
         .child(badge)
     }
 
+    fn render_markdown_mode_switcher(
+        pane_id: PaneId,
+        active_mode: MarkdownViewMode,
+        active_tab_id: TabId,
+        p: Palette,
+        cx: &Context<'_, Self>,
+    ) -> Div {
+        let mut switcher = div()
+            .h(px(22.0))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(1.0))
+            .p(px(2.0))
+            .rounded(px(5.0))
+            .bg(p.input)
+            .border_1()
+            .border_color(p.border_subtle);
+        for mode in MarkdownViewMode::ALL {
+            let is_selected = mode == active_mode;
+            let mut btn = div()
+                .id(SharedString::from(format!(
+                    "md-mode-{}-{}",
+                    pane_id.0,
+                    mode.label()
+                )))
+                .h_full()
+                .px(px(7.0))
+                .rounded(px(3.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.0))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.set_markdown_view_mode(pane_id, active_tab_id, mode, window, cx);
+                }))
+                .child(mode.label());
+            btn = if is_selected {
+                btn.bg(p.tab_active)
+                    .text_color(p.text_primary)
+                    .font_weight(FontWeight::SEMIBOLD)
+            } else {
+                btn.text_color(p.text_muted)
+                    .hover(move |s| s.bg(p.hover).text_color(p.text_primary))
+            };
+            switcher = switcher.child(btn);
+        }
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(4.0))
+            .child(switcher)
+            .child(div().w(px(1.0)).h(px(14.0)).mx(px(2.0)).bg(p.border_subtle))
+    }
+
     /// Renders the 34 px tab strip of one split pane with breadcrumbs and split actions.
     fn render_tab_bar(
         pane_id: PaneId,
@@ -5253,6 +5534,13 @@ impl WorkspaceShell {
                 .child(glyph)
         };
 
+        let md_switcher =
+            pane.active_markdown_mode()
+                .zip(active_tab)
+                .map(|(active_mode, active_tab_id)| {
+                    Self::render_markdown_mode_switcher(pane_id, active_mode, active_tab_id, p, cx)
+                });
+
         div()
             .h(px(TAB_BAR_HEIGHT_PX))
             .w_full()
@@ -5284,11 +5572,16 @@ impl WorkspaceShell {
                     .pr(px(8.0))
                     .child(
                         div()
+                            .max_w(px(180.0))
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
                             .pr(px(6.0))
                             .text_size(px(11.0))
                             .text_color(p.text_muted)
                             .child(breadcrumbs),
                     )
+                    .children(md_switcher)
                     .child(action("split-right", "◫", SplitAxis::Horizontal))
                     .child(action("split-down", "⬓", SplitAxis::Vertical)),
             )
@@ -5843,6 +6136,9 @@ fn http_env_root(project_root: Option<&Path>, file_path: Option<&Path>) -> Optio
 }
 
 fn language_label(path: &Path) -> &'static str {
+    if is_markdown_path(path) {
+        return "Markdown";
+    }
     match detect_language(path) {
         Some(SyntaxLanguage::Java) => "Java",
         Some(SyntaxLanguage::Kotlin) => "Kotlin",
@@ -5854,6 +6150,33 @@ fn language_label(path: &Path) -> &'static str {
         Some(SyntaxLanguage::Groovy) => "Groovy",
         None => "Text",
     }
+}
+
+/// Resolves a relative Markdown link target against `doc_path`'s directory without escaping root.
+fn resolve_markdown_relative_path(doc_path: Option<&Path>, target: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(parent) = doc_path.and_then(Path::parent) {
+        for comp in parent.components() {
+            match comp {
+                Component::Normal(seg) => parts.push(seg.to_os_string()),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+            }
+        }
+    }
+    for comp in target.components() {
+        match comp {
+            Component::Normal(seg) => parts.push(seg.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.into_iter().collect())
 }
 
 /// Builds the discrete breadcrumb label (`src › main › java › …`) for the tab bar.
@@ -6083,7 +6406,34 @@ mod tests {
         assert_eq!(language_label(Path::new("build.gradle")), "Groovy");
         assert_eq!(language_label(Path::new("build.gradle.kts")), "Kotlin");
         assert_eq!(language_label(Path::new("Script.groovy")), "Groovy");
-        assert_eq!(language_label(Path::new("README.md")), "Text");
+        assert_eq!(language_label(Path::new("README.md")), "Markdown");
+        assert_eq!(language_label(Path::new("docs/SPEC.markdown")), "Markdown");
+        assert_eq!(language_label(Path::new("notes.txt")), "Text");
+        assert_eq!(
+            resolve_markdown_relative_path(
+                Some(Path::new("docs/guide/intro.md")),
+                Path::new("../SPEC.md"),
+            ),
+            Some(PathBuf::from("docs/SPEC.md"))
+        );
+        assert_eq!(
+            resolve_markdown_relative_path(
+                Some(Path::new("README.md")),
+                Path::new("./docs/API.md"),
+            ),
+            Some(PathBuf::from("docs/API.md"))
+        );
+        assert_eq!(
+            resolve_markdown_relative_path(
+                Some(Path::new("docs/intro.md")),
+                Path::new("../../secret.txt"),
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_markdown_relative_path(Some(Path::new("README.md")), Path::new("/etc/passwd")),
+            None
+        );
         assert_eq!(file_title(Path::new("a/b/C.java")), "C.java");
 
         assert_eq!(line_comment_prefix(Some(Path::new("app.YML"))), "#");
@@ -6187,5 +6537,60 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "plugins")
         );
+    }
+
+    #[test]
+    fn pane_state_tracks_markdown_view_modes_independently_per_tab_and_pane() {
+        let mut left = PaneState::new(PaneId(1));
+        let mut right = PaneState::new(PaneId(2));
+
+        let readme = left.tabs.open_or_focus(
+            Some(Path::new("README.md")),
+            "README.md",
+            language_label(Path::new("README.md")),
+        );
+        left.markdown_modes
+            .insert(readme, MarkdownViewMode::default());
+        assert_eq!(left.active_markdown_mode(), Some(MarkdownViewMode::Split));
+
+        let notes = left.tabs.open_or_focus(
+            Some(Path::new("docs/NOTES.markdown")),
+            "NOTES.markdown",
+            language_label(Path::new("docs/NOTES.markdown")),
+        );
+        left.markdown_modes
+            .insert(notes, MarkdownViewMode::default());
+        assert_eq!(left.active_markdown_mode(), Some(MarkdownViewMode::Split));
+
+        assert!(left.set_markdown_mode(notes, MarkdownViewMode::Preview));
+        assert_eq!(left.active_markdown_mode(), Some(MarkdownViewMode::Preview));
+
+        let java = left.tabs.open_or_focus(
+            Some(Path::new("src/App.java")),
+            "App.java",
+            language_label(Path::new("src/App.java")),
+        );
+        assert_eq!(left.active_markdown_mode(), None);
+        assert!(!left.set_markdown_mode(java, MarkdownViewMode::Editor));
+
+        left.tabs.select_tab(readme);
+        assert!(left.set_markdown_mode(readme, MarkdownViewMode::Editor));
+        assert_eq!(left.active_markdown_mode(), Some(MarkdownViewMode::Editor));
+
+        left.tabs.select_tab(notes);
+        assert_eq!(left.active_markdown_mode(), Some(MarkdownViewMode::Preview));
+
+        let right_readme = right.tabs.open_or_focus(
+            Some(Path::new("README.md")),
+            "README.md",
+            language_label(Path::new("README.md")),
+        );
+        right
+            .markdown_modes
+            .insert(right_readme, MarkdownViewMode::default());
+        assert_eq!(right.active_markdown_mode(), Some(MarkdownViewMode::Split));
+
+        left.remove_tab_state(notes);
+        assert!(!left.markdown_modes.contains_key(&notes));
     }
 }
