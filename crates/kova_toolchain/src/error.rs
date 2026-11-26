@@ -79,6 +79,16 @@ pub enum ToolchainError {
         expected_path: String,
     },
 
+    /// An Omakase tool is configured or installed in an unusable way (missing manifest
+    /// entry, ambiguous launcher, missing platform configuration directory, ...).
+    #[error("invalid Omakase tool `{tool}` installation: {reason}")]
+    InvalidToolInstallation {
+        /// Tool name.
+        tool: String,
+        /// Human-readable description of the problem.
+        reason: String,
+    },
+
     /// An external tool process exited with a non-zero status or failed to start.
     #[error("external tool `{program}` failed ({status}): {stderr}")]
     ProcessFailed {
