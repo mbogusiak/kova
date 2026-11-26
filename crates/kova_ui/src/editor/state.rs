@@ -332,6 +332,140 @@ impl EditorState {
         }
     }
 
+    // ------------------------------------------- JetBrains actions and Vim bridge (KOVA-026)
+
+    /// Returns the byte offset of the primary cursor head.
+    #[must_use]
+    pub fn primary_head(&self) -> usize {
+        self.selections.primary().head()
+    }
+
+    /// Replaces all selections with one selection from `anchor` to `head` (clamped), as used
+    /// to mirror the Vim engine's caret or visual selection.
+    pub fn set_selection(&mut self, anchor: usize, head: usize) {
+        self.marked_range = None;
+        let snap = self.buffer.snapshot();
+        let len = snap.len_bytes();
+        let anchor = snap.clamp_byte_to_char_boundary(anchor.min(len));
+        let head = snap.clamp_byte_to_char_boundary(head.min(len));
+        self.selections = SelectionSet::single(Selection::new(anchor, head));
+    }
+
+    /// Applies `edits` (ranges in pre-edit coordinates) as one undoable transaction.
+    /// Returns `true` if the buffer changed.
+    pub fn apply_edits(&mut self, edits: &[TextEdit], origin: EditOrigin) -> bool {
+        self.marked_range = None;
+        self.record(edits, origin)
+    }
+
+    /// `Cmd+D` / `Ctrl+D`: duplicates every non-empty selection right after itself, and the
+    /// whole line of every empty caret (the caret moves onto the copy below).
+    pub fn duplicate_lines_or_selections(&mut self) -> bool {
+        self.sync_external_edits();
+        self.marked_range = None;
+        let snap = self.buffer.snapshot();
+        let mut edits: Vec<TextEdit> = Vec::with_capacity(self.selections.len());
+        let mut rows: Vec<usize> = Vec::new();
+        for sel in self.selections.as_slice() {
+            if sel.is_empty() {
+                let Ok(pt) = snap.byte_to_point(snap.clamp_byte_to_char_boundary(sel.head()))
+                else {
+                    continue;
+                };
+                if rows.contains(&pt.row) {
+                    continue;
+                }
+                rows.push(pt.row);
+                let start = line_start_byte(&snap, pt.row);
+                let end = line_end_with_ending_byte(&snap, pt.row);
+                let mut text = slice_text(&snap, start..end);
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                edits.push(TextEdit::new(start..start, text.as_str()));
+            } else {
+                let range = sel.range();
+                let text = slice_text(&snap, range.clone());
+                edits.push(TextEdit::new(range.end..range.end, text.as_str()));
+            }
+        }
+        if edits.is_empty() {
+            return false;
+        }
+        self.record(&edits, EditOrigin::Compound)
+    }
+
+    /// `Cmd+/` / `Ctrl+/`: toggles the line comment `prefix` (`//`, `#`) on every line touched
+    /// by a selection. When every non-blank line is already commented the prefix (and one
+    /// following space) is removed; otherwise `prefix` plus a space is added at the line start.
+    pub fn toggle_line_comment(&mut self, prefix: &str) -> bool {
+        if prefix.is_empty() {
+            return false;
+        }
+        self.sync_external_edits();
+        self.marked_range = None;
+        let snap = self.buffer.snapshot();
+        let mut rows: Vec<usize> = Vec::new();
+        for sel in self.selections.as_slice() {
+            let range = sel.range();
+            let (Ok(first), Ok(last)) = (
+                snap.byte_to_point(snap.clamp_byte_to_char_boundary(range.start)),
+                snap.byte_to_point(snap.clamp_byte_to_char_boundary(range.end)),
+            ) else {
+                continue;
+            };
+            // A selection ending at column 0 does not include that line.
+            let last_row = if !sel.is_empty() && last.column == 0 && last.row > first.row {
+                last.row - 1
+            } else {
+                last.row
+            };
+            rows.extend(first.row..=last_row);
+        }
+        rows.sort_unstable();
+        rows.dedup();
+
+        let lines: Vec<(usize, String)> = rows
+            .into_iter()
+            .map(|row| (row, slice_text(&snap, line_content_range(&snap, row))))
+            .filter(|(_, text)| !text.trim().is_empty())
+            .collect();
+        if lines.is_empty() {
+            return false;
+        }
+        let all_commented = lines
+            .iter()
+            .all(|(_, text)| text.trim_start().starts_with(prefix));
+        let mut insert = String::with_capacity(prefix.len() + 1);
+        insert.push_str(prefix);
+        insert.push(' ');
+        let edits: Vec<TextEdit> = lines
+            .iter()
+            .map(|(row, text)| {
+                let start = line_start_byte(&snap, *row);
+                if all_commented {
+                    let indent = text.len() - text.trim_start().len();
+                    let after = &text[indent + prefix.len()..];
+                    let extra = usize::from(after.starts_with(' '));
+                    let from = start + indent;
+                    TextEdit::delete(from..from + prefix.len() + extra)
+                } else {
+                    TextEdit::new(start..start, insert.as_str())
+                }
+            })
+            .collect();
+        self.record(&edits, EditOrigin::Compound)
+    }
+
+    /// `Ctrl+G` (macOS) / `Alt+J` (Linux): selects the word under the caret, or adds a selection
+    /// for the next occurrence of the primary selection. Returns `true` if a selection changed.
+    pub fn add_next_occurrence(&mut self) -> bool {
+        self.sync_external_edits();
+        self.marked_range = None;
+        let snap = self.buffer.snapshot();
+        self.selections.add_next_occurrence(&snap)
+    }
+
     // ------------------------------------------------------------------- mouse
 
     /// Replaces all selections with a single caret at `byte` (plain click).
@@ -562,6 +696,19 @@ fn line_end_with_ending_byte(snap: &BufferSnapshot, row: usize) -> usize {
     let start = line_start_byte(snap, row);
     snap.line_slice_with_ending(row)
         .map_or(start, |s| start + s.len_bytes())
+}
+
+/// Byte range of `row` without its line ending.
+fn line_content_range(snap: &BufferSnapshot, row: usize) -> Range<usize> {
+    let start = line_start_byte(snap, row);
+    start..start + snap.line_len_bytes(row).unwrap_or(0)
+}
+
+/// Copies `range` of the document into a `String` (empty when out of bounds).
+fn slice_text(snap: &BufferSnapshot, range: Range<usize>) -> String {
+    snap.slice_bytes(range)
+        .map(|s| s.chunks().collect())
+        .unwrap_or_default()
 }
 
 /// Character class used for double-click word selection.
@@ -892,5 +1039,52 @@ mod tests {
             INPUT_LATENCY_MAX
         );
         assert!(stats.max_observed < Duration::from_millis(5));
+    }
+
+    #[test]
+    fn duplicate_line_and_selection() {
+        let mut st = EditorState::from_text("alpha\nbeta");
+        st.set_line_col(2, 3);
+        assert!(st.duplicate_lines_or_selections());
+        assert_eq!(st.snapshot().text(), "alpha\nbeta\nbeta");
+        assert_eq!(
+            st.primary_line_col(),
+            (3, 3),
+            "caret moves onto the copy below"
+        );
+
+        st.set_selection(0, 2);
+        assert!(st.duplicate_lines_or_selections());
+        assert_eq!(st.snapshot().text(), "alalpha\nbeta\nbeta");
+        assert!(st.undo());
+        assert_eq!(st.snapshot().text(), "alpha\nbeta\nbeta");
+    }
+
+    #[test]
+    fn toggle_line_comment_adds_and_removes_prefix() {
+        let mut st = EditorState::from_text("    int a;\n\nint b;\nint c;");
+        // Lines 1..=3 (selection ends at column 0 of line 4).
+        let end = st.snapshot().text().find("int c").unwrap_or(0);
+        st.set_selection(0, end);
+        assert!(st.toggle_line_comment("//"));
+        assert_eq!(st.snapshot().text(), "//     int a;\n\n// int b;\nint c;");
+        let end = st.snapshot().text().find("int c").unwrap_or(0);
+        st.set_selection(0, end);
+        assert!(st.toggle_line_comment("//"));
+        assert_eq!(st.snapshot().text(), "    int a;\n\nint b;\nint c;");
+
+        let mut toml = EditorState::from_text("key = 1");
+        assert!(toml.toggle_line_comment("#"));
+        assert_eq!(toml.snapshot().text(), "# key = 1");
+        assert!(!toml.toggle_line_comment(""));
+    }
+
+    #[test]
+    fn add_next_occurrence_selects_word_then_next_match() {
+        let mut st = EditorState::from_text("foo bar foo");
+        assert!(st.add_next_occurrence());
+        assert_eq!(st.cursor_count(), 1);
+        assert!(st.add_next_occurrence());
+        assert_eq!(st.cursor_count(), 2);
     }
 }

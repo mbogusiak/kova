@@ -9,6 +9,7 @@ pub mod line_cache;
 pub mod shared;
 pub mod state;
 pub mod viewport;
+pub mod vim;
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -24,15 +25,14 @@ use kova_buffer::{Buffer, BufferSnapshot, BufferVersion, Motion, SelectionSet};
 use smallvec::SmallVec;
 
 use crate::editor::element::EditorCanvasElement;
-use crate::editor::input::{
-    CursorShape, EditorKeyCommand, InputLatencyStats, KeyMods, map_editor_key,
-};
+use crate::editor::input::{EditorKeyCommand, InputLatencyStats, KeyMods, map_editor_key};
 use crate::editor::line_cache::ShapedLineCache;
 pub use crate::editor::shared::SharedBuffer;
 use crate::editor::state::EditorState;
 use crate::editor::viewport::{
     DEFAULT_EDITOR_FONT_SIZE_PX, SCROLLBAR_RIGHT_MARGIN_PX, ViewportMetrics,
 };
+use crate::editor::vim::{CursorRenderKind, VimBridge, VimKeyResult};
 
 const SCROLL_LINES_MULTIPLIER: f32 = 3.0;
 const SCROLLBAR_HIT_WIDTH_PX: f32 = 12.0;
@@ -125,7 +125,8 @@ pub struct EditorView {
     drag_mode: DragMode,
     last_drag_position: Option<Point<Pixels>>,
     autoscroll_running: bool,
-    cursor_shape: CursorShape,
+    /// Modal Vim bridge while Vim mode is enabled (`KOVA-026`).
+    vim: Option<VimBridge>,
     cursor_visible: bool,
     blink_epoch: u64,
     input_latency: InputLatencyStats,
@@ -163,7 +164,7 @@ impl EditorView {
             drag_mode: DragMode::None,
             last_drag_position: None,
             autoscroll_running: false,
-            cursor_shape: CursorShape::Bar,
+            vim: None,
             cursor_visible: true,
             blink_epoch: 0,
             input_latency: InputLatencyStats::default(),
@@ -398,8 +399,99 @@ impl EditorView {
         self.state.selections()
     }
 
-    pub(crate) const fn cursor_shape(&self) -> CursorShape {
-        self.cursor_shape
+    /// Caret kind for the current Vim state ([`CursorRenderKind::Bar`] without Vim).
+    #[must_use]
+    pub fn cursor_render_kind(&self) -> CursorRenderKind {
+        self.vim
+            .as_ref()
+            .map_or(CursorRenderKind::Bar, VimBridge::cursor_render_kind)
+    }
+
+    /// Whether modal Vim editing is enabled for this view.
+    #[must_use]
+    pub const fn is_vim_enabled(&self) -> bool {
+        self.vim.is_some()
+    }
+
+    /// Whether Vim owns plain keys right now (enabled and not in `INSERT`).
+    #[must_use]
+    pub fn vim_owns_keys(&self) -> bool {
+        self.vim.as_ref().is_some_and(VimBridge::owns_keys)
+    }
+
+    /// Vim status for the status bar (`None` when Vim is disabled).
+    #[must_use]
+    pub fn vim_status(&self) -> Option<kova_core::vim::VimStatus> {
+        self.vim.as_ref().map(VimBridge::status)
+    }
+
+    /// Enables (starting in `NORMAL` on the current caret) or disables modal Vim editing.
+    /// Buffers, scroll offset, cursors and undo history are untouched.
+    pub fn set_vim_enabled(&mut self, enabled: bool, cx: &mut Context<'_, Self>) {
+        if enabled == self.vim.is_some() {
+            return;
+        }
+        self.vim = if enabled {
+            self.state.sync_external_edits();
+            Some(VimBridge::new(&mut self.state))
+        } else {
+            None
+        };
+        cx.notify();
+    }
+
+    /// Feeds one key to the Vim engine (see [`VimBridge::handle_key`]).
+    pub fn handle_vim_key(
+        &mut self,
+        stroke: kova_core::KeyStroke,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) -> VimKeyResult {
+        let Some(vim) = self.vim.as_mut() else {
+            return VimKeyResult::PassThrough;
+        };
+        let started = Instant::now();
+        let result = vim.handle_key(&mut self.state, stroke);
+        if matches!(result, VimKeyResult::Handled { .. }) {
+            self.reset_cursor_blink(window, cx);
+            self.finish_input(started, true, cx);
+        }
+        result
+    }
+
+    /// Returns the Vim engine to `NORMAL` mode (no-op without Vim).
+    pub fn force_vim_normal(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(vim) = self.vim.as_mut() {
+            vim.force_normal(&mut self.state);
+            cx.notify();
+        }
+    }
+
+    fn vim_text_input(&mut self, text: &str, started: Instant, cx: &mut Context<'_, Self>) {
+        if let Some(vim) = self.vim.as_mut() {
+            let _ = vim.handle_text_input(&mut self.state, text);
+        }
+        self.finish_input(started, true, cx);
+    }
+
+    /// `Cmd+D` / `Ctrl+D`: duplicate the current line(s) or selection.
+    pub fn duplicate_lines(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.run_edit(window, cx, |state, _| state.duplicate_lines_or_selections());
+    }
+
+    /// `Cmd+/` / `Ctrl+/`: toggle the line comment `prefix` on the selected lines.
+    pub fn toggle_line_comment(
+        &mut self,
+        prefix: &str,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.run_edit(window, cx, |state, _| state.toggle_line_comment(prefix));
+    }
+
+    /// `Ctrl+G` (macOS) / `Alt+J` (Linux): add a selection for the next occurrence.
+    pub fn add_next_occurrence(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.run_edit(window, cx, |state, _| state.add_next_occurrence());
     }
 
     pub(crate) const fn is_cursor_visible(&self) -> bool {

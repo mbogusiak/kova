@@ -58,6 +58,11 @@ impl EntityInputHandler for EditorView {
     ) {
         let started = Instant::now();
         self.reset_cursor_blink(window, cx);
+        if self.vim_owns_keys() {
+            // Vim NORMAL / VISUAL: committed text only completes `f{char}` / `r{char}`.
+            self.vim_text_input(new_text, started, cx);
+            return;
+        }
         let _changed = self
             .state
             .replace_text_in_range(range_utf16.as_ref(), new_text);
@@ -72,6 +77,10 @@ impl EntityInputHandler for EditorView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.vim_owns_keys() {
+            // No composition preview in Vim NORMAL / VISUAL; the commit arrives above.
+            return;
+        }
         let started = Instant::now();
         self.reset_cursor_blink(window, cx);
         let _changed = self.state.replace_and_mark_text_in_range(

@@ -12,13 +12,13 @@ use gpui::{
 use kova_buffer::BufferSnapshot;
 use smallvec::SmallVec;
 
-use crate::editor::input::CursorShape;
 use crate::editor::line_cache::LineCacheKey;
 use crate::editor::viewport::{
     GUTTER_DIGITS_GAP_PX, GUTTER_FOLD_SLOT_PX, GUTTER_GIT_BAR_SLOT_PX, GUTTER_RIGHT_PAD_PX,
     GUTTER_RUN_SLOT_PX, SCROLLBAR_RIGHT_MARGIN_PX, SCROLLBAR_THUMB_RADIUS_PX,
     SCROLLBAR_THUMB_WIDTH_PX, ViewportMetrics,
 };
+use crate::editor::vim::CursorRenderKind;
 use crate::editor::{EditorView, VisibleShapedLine};
 use crate::theme::{KovaTheme, hsla_from_rgba};
 
@@ -88,7 +88,9 @@ impl Element for EditorCanvasElement {
 
     #[allow(
         clippy::cast_precision_loss,
-        reason = "viewport line counts and widths fit cleanly within f32"
+        clippy::too_many_lines,
+        reason = "viewport line counts and widths fit cleanly within f32; one linear \
+                  per-frame pipeline (metrics, shaping, overlays) kept in order"
     )]
     fn prepaint(
         &mut self,
@@ -197,7 +199,17 @@ impl Element for EditorCanvasElement {
             let geom =
                 OverlayGeometry::new(bounds, gutter_width_px, &metrics, editor.scroll_offset());
             let focused = editor.focus_handle().is_focused(window);
-            let overlays = compute_overlays(editor, &snapshot, &visible_range, geom, focused);
+            let mut overlays = compute_overlays(editor, &snapshot, &visible_range, geom, focused);
+            if focused {
+                let inverse = hsla_from_rgba(theme.text().inverse);
+                shape_caret_glyphs(
+                    &mut overlays,
+                    &editor_font,
+                    editor_font_size,
+                    inverse,
+                    window,
+                );
+            }
 
             EditorPrepaintState {
                 bounds,
@@ -363,9 +375,14 @@ impl OverlayGeometry {
 #[derive(Debug)]
 struct Overlays {
     selections: Vec<Bounds<Pixels>>,
-    carets: Vec<Bounds<Pixels>>,
+    /// Caret rectangles with their corner radius.
+    carets: Vec<(Bounds<Pixels>, f32)>,
+    /// Glyph under each block caret: `(origin, text)` (shaped in prepaint into `caret_glyphs`).
+    block_glyphs: Vec<(gpui::Point<Pixels>, SharedString)>,
+    /// Glyphs redrawn above block carets in `text.inverse`, bold.
+    caret_glyphs: Vec<(gpui::Point<Pixels>, ShapedLine)>,
     ime_underlines: Vec<Bounds<Pixels>>,
-    caret_shape: CursorShape,
+    caret_kind: CursorRenderKind,
     focused: bool,
     caret_visible: bool,
 }
@@ -404,15 +421,14 @@ fn paint_content(
     }
     if overlays.focused && overlays.caret_visible {
         let caret_color = hsla_from_rgba(theme.editor().cursor);
-        let radius = match overlays.caret_shape {
-            CursorShape::Bar => px(1.0),
-            CursorShape::Block => px(2.0),
-            CursorShape::Underline => px(0.0),
-        };
-        for &rect in &overlays.carets {
+        for &(rect, radius) in &overlays.carets {
             let mut quad = fill(rect, caret_color);
-            quad.corner_radii = radius.into();
+            quad.corner_radii = px(radius).into();
             window.paint_quad(quad);
+        }
+        // Block caret: redraw the covered glyph in `text.inverse` for WCAG AAA contrast.
+        for (origin, glyph) in &overlays.caret_glyphs {
+            drop(glyph.paint(*origin, line_height, window, cx));
         }
     }
 }
@@ -475,8 +491,10 @@ fn compute_overlays(
     let mut out = Overlays {
         selections: Vec::new(),
         carets: Vec::new(),
+        block_glyphs: Vec::new(),
+        caret_glyphs: Vec::new(),
         ime_underlines: Vec::new(),
-        caret_shape: editor.cursor_shape(),
+        caret_kind: editor.cursor_render_kind(),
         focused,
         caret_visible: editor.is_cursor_visible(),
     };
@@ -516,14 +534,28 @@ fn compute_overlays(
             geom.scroll_x,
         );
         let y = row_y(pt.row);
-        let cell = geom.char_advance.max(2.0);
-        out.carets.push(match out.caret_shape {
-            CursorShape::Bar => Bounds::new(point(px(x), px(y)), size(px(2.0), px(lh))),
-            CursorShape::Block => Bounds::new(point(px(x), px(y)), size(px(cell), px(lh))),
-            CursorShape::Underline => {
-                Bounds::new(point(px(x), px(y + lh - 2.0)), size(px(cell), px(2.0)))
-            }
+        // Width of the glyph under the caret; one `char_advance` at the end of the line.
+        let rel = pt.column.saturating_sub(*byte_start).min(shaped.text.len());
+        let glyph = shaped.text[rel..].chars().next().filter(|c| *c != '\n');
+        let cell = glyph.map_or(geom.char_advance, |c| {
+            let next = rel + c.len_utf8();
+            (f32::from(shaped.x_for_index(next)) - f32::from(shaped.x_for_index(rel)))
+                .max(geom.char_advance * 0.5)
         });
+        let caret = out.caret_kind.rect(x, y, cell, lh);
+        out.carets.push((
+            Bounds::new(
+                point(px(caret.x), px(caret.y)),
+                size(px(caret.width), px(caret.height)),
+            ),
+            caret.radius,
+        ));
+        if out.caret_kind.redraws_glyph()
+            && let Some(c) = glyph.filter(|c| !c.is_whitespace())
+        {
+            out.block_glyphs
+                .push((point(px(x), px(y)), SharedString::from(c.to_string())));
+        }
     }
 
     if let Some(marked) = editor.marked_range() {
@@ -563,6 +595,36 @@ impl EditorCanvasElement {
             }
         });
     }
+}
+
+/// Shapes the glyphs under block carets in bold `text.inverse` (`KOVA-026` FR-4.2, NFR-3).
+fn shape_caret_glyphs(
+    overlays: &mut Overlays,
+    editor_font: &gpui::Font,
+    font_size: Pixels,
+    color: gpui::Hsla,
+    window: &mut Window,
+) {
+    let mut font = editor_font.clone();
+    font.weight = gpui::FontWeight::BOLD;
+    overlays.caret_glyphs = overlays
+        .block_glyphs
+        .drain(..)
+        .map(|(origin, text)| {
+            let run = TextRun {
+                len: text.len(),
+                font: font.clone(),
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let shaped = window
+                .text_system()
+                .shape_line(text, font_size, &[run], None);
+            (origin, shaped)
+        })
+        .collect();
 }
 
 fn measure_char_advance(

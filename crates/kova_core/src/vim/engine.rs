@@ -247,6 +247,41 @@ impl VimEngine {
         self.want_col = None;
     }
 
+    /// Swaps in `buffer` after the document was edited outside the engine (a sibling split
+    /// sharing the document, an IDE action, an IME composition or a mouse paste).
+    ///
+    /// The mode, registers, the last `f`/`t` search and the dot-repeat record survive; the
+    /// cursor and visual anchor are clamped to the new text. The engine's own undo/redo
+    /// stacks are dropped because their byte ranges refer to the previous text (the caller's
+    /// document history stays authoritative for IDE undo).
+    pub fn replace_buffer(&mut self, buffer: Buffer) {
+        self.buffer = buffer;
+        self.undo.clear();
+        self.redo.clear();
+        self.tx_cursor_before = None;
+        self.tx_edits.clear();
+        self.dirty = false;
+        self.last_visual = None;
+        self.last_error = None;
+        self.want_col = None;
+        if self.mode != VimMode::Insert {
+            self.pending = Pending::default();
+            self.cmd_keys.clear();
+            self.change_flag = false;
+        }
+        let snap = self.buffer.snapshot();
+        let clamp_mode = |offset: usize, mode: VimMode| {
+            let o = snap.clamp_byte_to_char_boundary(offset.min(snap.len_bytes()));
+            if mode == VimMode::Insert {
+                o
+            } else {
+                clamp_normal(&snap, o)
+            }
+        };
+        self.cursor = clamp_mode(self.cursor, self.mode);
+        self.anchor = clamp_mode(self.anchor, self.mode);
+    }
+
     /// Active visual selection as a byte range (end exclusive).
     #[must_use]
     pub fn selection(&self) -> Option<Range<usize>> {

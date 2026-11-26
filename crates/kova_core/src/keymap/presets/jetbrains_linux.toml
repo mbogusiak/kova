@@ -468,3 +468,113 @@ action = "git.update_project"
 context = "Workspace"
 key = "ctrl+alt+shift+v"
 action = "vim.toggle"
+
+# ==============================================================================
+# Focus / Tiling window management (KOVA-026, Omarchy keyboard-first). Tiling
+# modifier on Linux: `super+alt`. Vim users also get `Ctrl+W h/j/k/l/s/v`.
+# ==============================================================================
+
+[[bindings]]
+context = "Workspace"
+key = "super+alt+t"
+action = "view.toggle_tiling_mode"
+
+[[bindings]]
+context = "Workspace"
+key = "super+alt+left"
+action = "window.focus_left"
+
+[[bindings]]
+context = "Workspace"
+key = "super+alt+right"
+action = "window.focus_right"
+
+[[bindings]]
+context = "Workspace"
+key = "super+alt+up"
+action = "window.focus_up"
+
+[[bindings]]
+context = "Workspace"
+key = "super+alt+down"
+action = "window.focus_down"
+
+[[bindings]]
+context = "Workspace"
+key = "super+alt+shift+left"
+action = "window.move_tab_left"
+
+[[bindings]]
+context = "Workspace"
+key = "super+alt+shift+right"
+action = "window.move_tab_right"
+
+[[bindings]]
+context = "Workspace"
+key = "super+alt+shift+up"
+action = "window.move_tab_up"
+
+[[bindings]]
+context = "Workspace"
+key = "super+alt+shift+down"
+action = "window.move_tab_down"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+alt+super+left"
+action = "window.resize_left"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+alt+super+right"
+action = "window.resize_right"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+alt+super+up"
+action = "window.resize_up"
+
+[[bindings]]
+context = "Workspace"
+key = "ctrl+alt+super+down"
+action = "window.resize_down"
+
+[[bindings]]
+context = "Workspace"
+key = "super+alt+backslash"
+action = "window.split_right"
+
+[[bindings]]
+context = "Workspace"
+key = "super+alt+minus"
+action = "window.split_down"
+
+[[bindings]]
+context = "EditorVimNormal"
+key = "ctrl+w h"
+action = "window.focus_left"
+
+[[bindings]]
+context = "EditorVimNormal"
+key = "ctrl+w l"
+action = "window.focus_right"
+
+[[bindings]]
+context = "EditorVimNormal"
+key = "ctrl+w k"
+action = "window.focus_up"
+
+[[bindings]]
+context = "EditorVimNormal"
+key = "ctrl+w j"
+action = "window.focus_down"
+
+[[bindings]]
+context = "EditorVimNormal"
+key = "ctrl+w v"
+action = "window.split_right"
+
+[[bindings]]
+context = "EditorVimNormal"
+key = "ctrl+w s"
+action = "window.split_down"

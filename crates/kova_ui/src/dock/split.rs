@@ -20,6 +20,14 @@ pub enum SplitAxis {
     Vertical,
 }
 
+/// Progress of [`SplitTree::resize_pane`] while unwinding the recursion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeWalk {
+    NotFound,
+    Found,
+    Done,
+}
+
 /// Axis-aligned rectangle in logical pixels used for headless pane geometry.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaneRect {
@@ -285,6 +293,59 @@ impl SplitTree {
         }
     }
 
+    /// Splits `target` along `axis` with `new_pane` in the left/top child (`MoveTabToSplit`
+    /// towards `Left` / `Up` when no neighbour exists). Returns `true` if `target` was split.
+    pub fn split_pane_before(&mut self, target: PaneId, axis: SplitAxis, new_pane: PaneId) -> bool {
+        match self {
+            Self::Leaf(id) if *id == target => {
+                let original = *id;
+                *self = Self::Split {
+                    axis,
+                    ratio: SPLIT_DEFAULT_RATIO,
+                    left: Box::new(Self::Leaf(new_pane)),
+                    right: Box::new(Self::Leaf(original)),
+                };
+                true
+            }
+            Self::Leaf(_) => false,
+            Self::Split { left, right, .. } => {
+                left.split_pane_before(target, axis, new_pane)
+                    || right.split_pane_before(target, axis, new_pane)
+            }
+        }
+    }
+
+    /// Moves the divider of the innermost `axis` split enclosing `pane` by `delta` (ratio of
+    /// the split, positive = towards right/bottom), clamped like [`Self::set_ratio_for`].
+    /// Returns `true` when such a split exists (`ResizeSplit` from the keyboard).
+    pub fn resize_pane(&mut self, pane: PaneId, axis: SplitAxis, delta: f32) -> bool {
+        self.resize_walk(pane, axis, delta) == ResizeWalk::Done
+    }
+
+    fn resize_walk(&mut self, pane: PaneId, axis: SplitAxis, delta: f32) -> ResizeWalk {
+        match self {
+            Self::Leaf(id) if *id == pane => ResizeWalk::Found,
+            Self::Leaf(_) => ResizeWalk::NotFound,
+            Self::Split {
+                axis: split_axis,
+                ratio,
+                left,
+                right,
+            } => {
+                let mut walk = left.resize_walk(pane, axis, delta);
+                if walk == ResizeWalk::NotFound {
+                    walk = right.resize_walk(pane, axis, delta);
+                }
+                if walk == ResizeWalk::Found && *split_axis == axis {
+                    *ratio = Self::clamp_ratio(*ratio + delta);
+                    ResizeWalk::Done
+                } else {
+                    walk
+                }
+            }
+        }
+    }
+
     /// Clamps a split ratio to `[SPLIT_MIN_RATIO, SPLIT_MAX_RATIO]`.
     #[must_use]
     pub fn clamp_ratio(ratio: f32) -> f32 {
@@ -369,5 +430,27 @@ mod tests {
         assert!((SplitTree::clamp_ratio(0.05) - SPLIT_MIN_RATIO).abs() < f32::EPSILON);
         assert!((SplitTree::clamp_ratio(0.95) - SPLIT_MAX_RATIO).abs() < f32::EPSILON);
         assert!((SplitTree::clamp_ratio(f32::NAN) - SPLIT_DEFAULT_RATIO).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn keyboard_resize_and_split_before() {
+        let mut tree = SplitTree::new(PaneId(1));
+        assert!(tree.split_pane_before(PaneId(1), SplitAxis::Horizontal, PaneId(2)));
+        assert_eq!(tree.pane_ids(), vec![PaneId(2), PaneId(1)]);
+        assert!(tree.split_pane(PaneId(1), SplitAxis::Vertical, PaneId(3)));
+        // Pane 3 sits in a vertical split nested in the horizontal one.
+        assert!(tree.resize_pane(PaneId(3), SplitAxis::Horizontal, 0.1));
+        assert!(tree.resize_pane(PaneId(3), SplitAxis::Vertical, -0.5));
+        let SplitTree::Split { ratio, right, .. } = &tree else {
+            panic!("root must be a split");
+        };
+        assert!((ratio - 0.6).abs() < 1e-6);
+        let SplitTree::Split { ratio: inner, .. } = right.as_ref() else {
+            panic!("right child must be a split");
+        };
+        assert!((inner - SPLIT_MIN_RATIO).abs() < 1e-6);
+        assert!(!tree.resize_pane(PaneId(2), SplitAxis::Vertical, 0.1));
+        assert!(!tree.resize_pane(PaneId(9), SplitAxis::Horizontal, 0.1));
+        assert!(!tree.split_pane_before(PaneId(9), SplitAxis::Vertical, PaneId(4)));
     }
 }

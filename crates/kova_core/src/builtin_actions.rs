@@ -211,6 +211,39 @@ pub mod ids {
     pub const GIT_ROLLBACK: &str = "git.rollback";
     /// Toggle modal Vim editing mode on or off.
     pub const VIM_TOGGLE: &str = "vim.toggle";
+
+    // --- Focus / Tiling window management (KOVA-026) ---
+
+    /// Toggle the dense Omarchy/Hyprland tiling layout (8 px margins, 6 px gaps, focus ring).
+    pub const VIEW_TOGGLE_TILING_MODE: &str = "view.toggle_tiling_mode";
+    /// Move keyboard focus to the island on the left of the focused one.
+    pub const WINDOW_FOCUS_LEFT: &str = "window.focus_left";
+    /// Move keyboard focus to the island on the right of the focused one.
+    pub const WINDOW_FOCUS_RIGHT: &str = "window.focus_right";
+    /// Move keyboard focus to the island above the focused one.
+    pub const WINDOW_FOCUS_UP: &str = "window.focus_up";
+    /// Move keyboard focus to the island below the focused one.
+    pub const WINDOW_FOCUS_DOWN: &str = "window.focus_down";
+    /// Move the active editor tab to the split on the left (creating it when missing).
+    pub const WINDOW_MOVE_TAB_LEFT: &str = "window.move_tab_left";
+    /// Move the active editor tab to the split on the right (creating it when missing).
+    pub const WINDOW_MOVE_TAB_RIGHT: &str = "window.move_tab_right";
+    /// Move the active editor tab to the split above (creating it when missing).
+    pub const WINDOW_MOVE_TAB_UP: &str = "window.move_tab_up";
+    /// Move the active editor tab to the split below (creating it when missing).
+    pub const WINDOW_MOVE_TAB_DOWN: &str = "window.move_tab_down";
+    /// Split the active editor pane side by side.
+    pub const WINDOW_SPLIT_RIGHT: &str = "window.split_right";
+    /// Split the active editor pane top / bottom.
+    pub const WINDOW_SPLIT_DOWN: &str = "window.split_down";
+    /// Move the nearest split divider of the active pane to the left.
+    pub const WINDOW_RESIZE_LEFT: &str = "window.resize_left";
+    /// Move the nearest split divider of the active pane to the right.
+    pub const WINDOW_RESIZE_RIGHT: &str = "window.resize_right";
+    /// Move the nearest split divider of the active pane up.
+    pub const WINDOW_RESIZE_UP: &str = "window.resize_up";
+    /// Move the nearest split divider of the active pane down.
+    pub const WINDOW_RESIZE_DOWN: &str = "window.resize_down";
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -909,6 +942,111 @@ const BUILTIN_SPECS: &[BuiltinActionSpec] = &[
         "Toggle Vim Mode",
         ActionCategory::Vim,
         "Enable or disable modal Vim editing",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::VIEW_TOGGLE_TILING_MODE,
+        "Toggle Tiling Mode",
+        ActionCategory::View,
+        "Switch between Islands and dense Omarchy tiling layout",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_FOCUS_LEFT,
+        "Focus Left Island",
+        ActionCategory::View,
+        "Move keyboard focus to the island on the left",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_FOCUS_RIGHT,
+        "Focus Right Island",
+        ActionCategory::View,
+        "Move keyboard focus to the island on the right",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_FOCUS_UP,
+        "Focus Island Above",
+        ActionCategory::View,
+        "Move keyboard focus to the island above",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_FOCUS_DOWN,
+        "Focus Island Below",
+        ActionCategory::View,
+        "Move keyboard focus to the island below",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_MOVE_TAB_LEFT,
+        "Move Tab to Left Split",
+        ActionCategory::View,
+        "Move the active tab to the split on the left",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_MOVE_TAB_RIGHT,
+        "Move Tab to Right Split",
+        ActionCategory::View,
+        "Move the active tab to the split on the right",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_MOVE_TAB_UP,
+        "Move Tab to Split Above",
+        ActionCategory::View,
+        "Move the active tab to the split above",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_MOVE_TAB_DOWN,
+        "Move Tab to Split Below",
+        ActionCategory::View,
+        "Move the active tab to the split below",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_SPLIT_RIGHT,
+        "Split Right",
+        ActionCategory::View,
+        "Split the active editor pane side by side",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_SPLIT_DOWN,
+        "Split Down",
+        ActionCategory::View,
+        "Split the active editor pane top and bottom",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_RESIZE_LEFT,
+        "Resize Split Left",
+        ActionCategory::View,
+        "Move the active split divider to the left",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_RESIZE_RIGHT,
+        "Resize Split Right",
+        ActionCategory::View,
+        "Move the active split divider to the right",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_RESIZE_UP,
+        "Resize Split Up",
+        ActionCategory::View,
+        "Move the active split divider up",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::WINDOW_RESIZE_DOWN,
+        "Resize Split Down",
+        ActionCategory::View,
+        "Move the active split divider down",
         WhenScope::Workspace,
     ),
 ];

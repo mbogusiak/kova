@@ -844,3 +844,39 @@ fn handle_text_input_ime_and_await() {
     e.feed(ESC);
     assert_eq!(e.text(), "bżk żółć🚀");
 }
+
+#[test]
+fn replace_buffer_keeps_mode_and_registers_and_clamps_cursor() {
+    let mut e = VimEngine::from_text("alpha beta gamma");
+    e.feed("wyw$");
+    assert_eq!(e.register('"').map(|r| r.text.as_str()), Some("beta "));
+    let before_mode = e.mode();
+
+    // A sibling split shortened the document behind the engine's back.
+    e.replace_buffer(Buffer::from_text("abc"));
+    assert_eq!(e.mode(), before_mode);
+    assert_eq!(e.text(), "abc");
+    assert_eq!(
+        e.cursor(),
+        2,
+        "cursor clamps onto the last char in Normal mode"
+    );
+    assert_eq!(e.register('"').map(|r| r.text.as_str()), Some("beta "));
+
+    // Engine undo history referred to the old text and is dropped: `u` is a no-op.
+    e.feed("u");
+    assert_eq!(e.text(), "abc");
+
+    // Editing continues normally on the new buffer.
+    e.feed("0P");
+    assert_eq!(e.text(), "beta abc");
+
+    // In Insert mode the cursor may sit at the end of the text.
+    e.feed("A");
+    e.replace_buffer(Buffer::from_text("xy"));
+    assert_eq!(e.mode(), VimMode::Insert);
+    assert_eq!(e.cursor(), 2);
+    assert_eq!(e.handle_text_input("ż"), VimOutcome::Handled);
+    e.feed(ESC);
+    assert_eq!(e.text(), "xyż");
+}
