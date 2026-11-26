@@ -1,0 +1,13 @@
+id = "hello-kova"
+name = "Hello Kova (Kotlin/Wasm)"
+version = "0.1.0"
+entrypoint = "hello-kova.wasm"
+api_version = "0.1.0"
+
+[permissions]
+fs_read = []
+fs_write = false
+network = []
+process_spawn = false
+editor_read = true
+editor_write = false
