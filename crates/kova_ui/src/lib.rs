@@ -11,6 +11,7 @@ pub mod editor;
 pub mod git;
 pub mod http_runner;
 pub mod keymap;
+pub mod plugin_ui;
 pub mod settings;
 pub mod shell;
 pub mod terminal;
@@ -34,6 +35,7 @@ pub use editor::{EditorEvent, EditorView};
 pub use git::{
     CheckState, CommitPanel, CommitPanelEvent, CommitPanelModel, EditorGitState, StageOp,
 };
+pub use plugin_ui::{PluginToolWindow, PluginUiEventSink};
 pub use shell::{StartupMetrics, WorkspaceShell};
 pub use terminal::{TerminalDock, TerminalLaunch, TerminalView};
 pub use test_runner::{TestRunRequest, TestRunSink, TestRunnerAction, TestRunnerModel};
