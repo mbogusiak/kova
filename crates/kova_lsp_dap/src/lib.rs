@@ -16,6 +16,10 @@
 //!   (`Alt+Enter`), *Rename* (`Shift+F6`) and [`lsp::NormalizedWorkspaceEdit`],
 //! - [`lsp::definition`]: *Go to Definition* with automatic Vineflower decompilation.
 //!
+//! The [`manager`] module (KOVA-038) provides the multi-project [`manager::JdtlsSessionManager`]
+//! with RSS budgets, idle auto-hibernation of background `jdt.ls` processes and transparent,
+//! single-flight wake-up.
+//!
 //! The [`bsp`] module (KOVA-040) talks to Gradle / Maven build servers: test runs stream
 //! [`bsp::BspEvent`]s feeding the headless `kova_tools::junit::TestRun` tree.
 //!
@@ -27,6 +31,7 @@ pub mod bsp;
 pub mod dap;
 pub mod error;
 pub mod lsp;
+pub mod manager;
 
 pub use error::LspDapError;
 
