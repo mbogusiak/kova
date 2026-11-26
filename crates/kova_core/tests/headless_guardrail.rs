@@ -11,15 +11,18 @@ use std::process::Command;
 
 const UI_CRATES: [&str; 2] = ["kova_app", "kova_ui"];
 
-/// Optional reference plugins (KOVA-048): WASM components outside the core.
-const PLUGIN_CRATES: [&str; 4] = [
+/// Optional reference plugins (KOVA-048) and the SDK example plugin (KOVA-046):
+/// WASM components outside the core.
+const PLUGIN_CRATES: [&str; 5] = [
+    "hello_kova",
     "kova-ai",
     "kova-database",
     "kova-kotlin-lsp",
     "kova-scala-metals",
 ];
 
-const EXPECTED_MEMBERS: [&str; 17] = [
+const EXPECTED_MEMBERS: [&str; 18] = [
+    "hello_kova",
     "kova-ai",
     "kova-database",
     "kova-kotlin-lsp",
@@ -39,7 +42,8 @@ const EXPECTED_MEMBERS: [&str; 17] = [
     "kova_ui",
 ];
 
-const EXPECTED_HEADLESS: [&str; 15] = [
+const EXPECTED_HEADLESS: [&str; 16] = [
+    "hello_kova",
     "kova-ai",
     "kova-database",
     "kova-kotlin-lsp",
@@ -445,7 +449,7 @@ fn fixture(members: &[&str], edges: &[(&str, &str, Option<&str>)]) -> serde_json
 }
 
 #[test]
-fn workspace_has_exactly_17_members() {
+fn workspace_has_exactly_18_members() {
     let meta = load_workspace_metadata();
     let graph = parse_graph(&meta).expect("failed to parse workspace metadata");
     let mut member_names: Vec<&str> = graph
@@ -454,12 +458,12 @@ fn workspace_has_exactly_17_members() {
         .map(|id| graph.names.get(id).map_or("", String::as_str))
         .collect();
     member_names.sort_unstable();
-    assert_eq!(member_names.len(), 17);
+    assert_eq!(member_names.len(), 18);
     assert_eq!(member_names, EXPECTED_MEMBERS);
 }
 
 #[test]
-fn headless_set_is_exactly_the_expected_15() {
+fn headless_set_is_exactly_the_expected_16() {
     let meta = load_workspace_metadata();
     let graph = parse_graph(&meta).expect("failed to parse workspace metadata");
     let roots = headless_roots(&graph);
@@ -468,7 +472,7 @@ fn headless_set_is_exactly_the_expected_15() {
         .map(|id| graph.names.get(id).map_or("", String::as_str))
         .collect();
     root_names.sort_unstable();
-    assert_eq!(root_names.len(), 15);
+    assert_eq!(root_names.len(), 16);
     assert_eq!(root_names, EXPECTED_HEADLESS);
 }
 

@@ -14,6 +14,7 @@ members = [
     "crates/kova_plugin_host",  # Sandbox Wasmtime + kontrakty WIT + mostek deklaratywnego UI
     "crates/kova_ui",           # Komponenty GPUI: IntelliJ New UI Dock, Focus/Tiling Layout, Edytor, Okno Ustawień
     "sdk/kova_plugin_rs",       # Oficjalne SDK w Rust do pisania wtyczek WASM
+    "sdk/kova_plugin_rs/examples/hello_kova", # Minimalna wtyczka przykładowa SDK (KOVA-046)
     "plugins/kova-ai",          # Wtyczka referencyjna: opcjonalny asystent AI (BYOK / Ollama / ACP)
     "plugins/kova-database",    # Wtyczka referencyjna: eksplorator schematów i podgląd wyników zapytań
     "plugins/kova-kotlin-lsp",  # Opcjonalny pakiet językowy: Kotlin LSP

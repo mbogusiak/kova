@@ -7,9 +7,15 @@ rust-version.workspace = true
 authors.workspace      = true
 license.workspace      = true
 publish.workspace      = true
+# `examples/hello_kova` is a separate workspace member (a cdylib plugin), not a cargo example.
+autoexamples           = false
 
 [dependencies]
 wit-bindgen = { workspace = true }
+
+[dev-dependencies]
+kova_plugin_host = { workspace = true }
+tempfile         = { workspace = true }
 
 [lints]
 workspace = true
