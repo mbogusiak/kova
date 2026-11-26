@@ -165,6 +165,59 @@ fn tree_sitter_captures_resolve_for_http_toml_and_json() {
 }
 
 #[test]
+fn captures_resolve_for_yaml_xml_and_groovy() {
+    for (capture, kind) in [
+        ("@label", SyntaxTokenKind::Property),
+        ("@property", SyntaxTokenKind::Property),
+        ("@string.special", SyntaxTokenKind::Constant),
+        ("@string", SyntaxTokenKind::String),
+        ("@string.escape", SyntaxTokenKind::StringEscape),
+        ("@number", SyntaxTokenKind::Number),
+        ("@boolean", SyntaxTokenKind::Boolean),
+        ("@comment", SyntaxTokenKind::Comment),
+        ("@attribute", SyntaxTokenKind::Annotation),
+        ("@type", SyntaxTokenKind::Type),
+    ] {
+        assert_eq!(resolve_capture(SyntaxLanguage::Yaml, capture), Some(kind));
+    }
+
+    for (capture, kind) in [
+        ("@tag", SyntaxTokenKind::Keyword),
+        ("@tag.attribute", SyntaxTokenKind::Property),
+        ("@tag.delimiter", SyntaxTokenKind::Punctuation),
+        ("@constant.character", SyntaxTokenKind::StringEscape),
+        ("@string.special.symbol", SyntaxTokenKind::StringEscape),
+        ("@string", SyntaxTokenKind::String),
+        ("@comment", SyntaxTokenKind::Comment),
+        ("@type", SyntaxTokenKind::Type),
+    ] {
+        assert_eq!(resolve_capture(SyntaxLanguage::Xml, capture), Some(kind));
+    }
+
+    for (capture, kind) in [
+        ("@keyword", SyntaxTokenKind::Keyword),
+        ("@keyword.control", SyntaxTokenKind::KeywordControl),
+        ("@type", SyntaxTokenKind::Type),
+        ("@type.builtin", SyntaxTokenKind::TypeBuiltin),
+        ("@annotation", SyntaxTokenKind::Annotation),
+        ("@function.call", SyntaxTokenKind::Function),
+        ("@property", SyntaxTokenKind::Property),
+        ("@constant", SyntaxTokenKind::Constant),
+        ("@variable.parameter", SyntaxTokenKind::Parameter),
+        ("@string", SyntaxTokenKind::String),
+        ("@string.escape", SyntaxTokenKind::StringEscape),
+        ("@number", SyntaxTokenKind::Number),
+        ("@boolean", SyntaxTokenKind::Boolean),
+        ("@operator", SyntaxTokenKind::Operator),
+        ("@punctuation", SyntaxTokenKind::Punctuation),
+        ("@comment", SyntaxTokenKind::Comment),
+        ("@comment.documentation", SyntaxTokenKind::CommentDoc),
+    ] {
+        assert_eq!(resolve_capture(SyntaxLanguage::Groovy, capture), Some(kind));
+    }
+}
+
+#[test]
 fn registry_manages_builtin_and_custom_themes() {
     let mut registry = ThemeRegistry::new();
     assert_eq!(registry.len(), 2);

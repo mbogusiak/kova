@@ -1,4 +1,4 @@
-//! Tree-sitter syntax highlight tokens and capture resolution for Java, Kotlin, HTTP, TOML, and JSON.
+//! Syntax highlight tokens and capture resolution for Java, Kotlin, HTTP, TOML, JSON, YAML, XML, and Groovy.
 
 use std::fmt;
 
@@ -272,7 +272,7 @@ impl SyntaxTokenKind {
     ];
 }
 
-/// Languages with first-class Tree-sitter grammar support in `kova_syntax`.
+/// Languages with first-class syntax support in `kova_syntax`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyntaxLanguage {
     /// Java source files (`.java`).
@@ -285,6 +285,12 @@ pub enum SyntaxLanguage {
     Toml,
     /// Structured JSON data files (`.json`).
     Json,
+    /// YAML configuration and manifest files (`.yaml`, `.yml`).
+    Yaml,
+    /// XML, Maven POM, and XML Schema files (`.xml`, `.pom`, `.xsd`).
+    Xml,
+    /// Groovy sources and Gradle Groovy DSL build scripts (`.groovy`, `.gradle`).
+    Groovy,
 }
 
 /// Resolves a Tree-sitter capture name (with or without leading `@`) into an Aether [`SyntaxTokenKind`].
@@ -327,7 +333,14 @@ fn resolve_language_specific(language: SyntaxLanguage, capture: &str) -> Option<
         (SyntaxLanguage::Http, "number.http.status" | "constant.http.version") => {
             Some(SyntaxTokenKind::HttpStatus)
         }
-        (SyntaxLanguage::Toml | SyntaxLanguage::Json, "label") => Some(SyntaxTokenKind::Property),
+        (SyntaxLanguage::Toml | SyntaxLanguage::Json | SyntaxLanguage::Yaml, "label")
+        | (SyntaxLanguage::Xml, "tag.attribute") => Some(SyntaxTokenKind::Property),
+        (SyntaxLanguage::Yaml, "string.special") => Some(SyntaxTokenKind::Constant),
+        (SyntaxLanguage::Xml, "tag") => Some(SyntaxTokenKind::Keyword),
+        (SyntaxLanguage::Xml, "tag.delimiter") => Some(SyntaxTokenKind::Punctuation),
+        (SyntaxLanguage::Xml, "constant.character" | "string.special.symbol") => {
+            Some(SyntaxTokenKind::StringEscape)
+        }
         _ => None,
     }
 }

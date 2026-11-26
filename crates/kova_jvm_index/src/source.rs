@@ -71,7 +71,13 @@ fn parse_with_thread_local(
         path: String::from("<tree-sitter-registry>"),
         message: format!("language {language:?} is not registered"),
     })?;
-    let ts_lang = entry.ts_language().clone();
+    let ts_lang = entry
+        .ts_language()
+        .cloned()
+        .ok_or_else(|| JvmIndexError::Io {
+            path: String::from("<tree-sitter-registry>"),
+            message: format!("language {language:?} has no Tree-sitter grammar"),
+        })?;
 
     let cell = match language {
         JvmSourceLang::Java => &JAVA_PARSER,

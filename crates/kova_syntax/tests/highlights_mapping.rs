@@ -12,12 +12,18 @@ use kova_syntax::{
 };
 use kova_theme::{AetherTheme, BuiltinTheme, SyntaxLanguage, SyntaxTokenKind, resolve_capture};
 
-const ALL_LANGUAGES: [SyntaxLanguage; 5] = [
+const TREE_SITTER_LANGUAGES: [SyntaxLanguage; 5] = [
     SyntaxLanguage::Java,
     SyntaxLanguage::Kotlin,
     SyntaxLanguage::Http,
     SyntaxLanguage::Toml,
     SyntaxLanguage::Json,
+];
+
+const SCANNER_LANGUAGES: [SyntaxLanguage; 3] = [
+    SyntaxLanguage::Yaml,
+    SyntaxLanguage::Xml,
+    SyntaxLanguage::Groovy,
 ];
 
 fn setup() -> (SyntaxEngine, Highlighter) {
@@ -106,22 +112,30 @@ fn assert_kinds(spans: &[HighlightSpan], expected: &[SyntaxTokenKind]) {
 #[test]
 fn all_default_grammars_and_queries_compile() {
     let registry = LanguageRegistry::with_defaults().expect("with_defaults succeeds");
-    assert_eq!(registry.len(), 5);
-    for lang in ALL_LANGUAGES {
+    assert_eq!(registry.len(), 8);
+    for lang in TREE_SITTER_LANGUAGES {
         assert!(registry.contains(lang), "missing {lang:?}");
         let entry = registry.get(lang).expect("entry exists");
         assert_eq!(entry.language(), lang);
+        assert!(entry.is_tree_sitter());
         assert!(
             entry.highlight_query().is_some(),
             "missing highlight query for {lang:?}"
         );
+    }
+    for lang in SCANNER_LANGUAGES {
+        assert!(registry.contains(lang), "missing {lang:?}");
+        let entry = registry.get(lang).expect("entry exists");
+        assert_eq!(entry.language(), lang);
+        assert!(!entry.is_tree_sitter());
+        assert!(entry.highlight_query().is_none());
     }
 }
 
 #[test]
 fn all_query_captures_resolve_in_kova_theme() {
     let registry = LanguageRegistry::with_defaults().expect("with_defaults succeeds");
-    for lang in ALL_LANGUAGES {
+    for lang in TREE_SITTER_LANGUAGES {
         let entry = registry.get(lang).expect("entry exists");
         let hq = entry.highlight_query().expect("highlight query exists");
         let unmapped = hq.unmapped_captures();

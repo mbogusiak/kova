@@ -1235,12 +1235,14 @@ impl EditorView {
         cx: &mut Context<'_, Self>,
     ) {
         let lang = self.language_hint;
-        let is_json = self
-            .syntax
-            .as_ref()
-            .is_some_and(|s| s.language() == kova_theme::SyntaxLanguage::Json);
+        let use_brace_reformat = self.syntax.as_ref().is_some_and(|s| {
+            matches!(
+                s.language(),
+                kova_theme::SyntaxLanguage::Json | kova_theme::SyntaxLanguage::Groovy
+            )
+        });
         self.run_edit(window, cx, |state, _| {
-            if is_json {
+            if use_brace_reformat {
                 state.reformat_code_with_braces(true, indent_width)
             } else {
                 state.reformat_code(lang, indent_width)

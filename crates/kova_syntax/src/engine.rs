@@ -15,6 +15,7 @@ use kova_theme::SyntaxLanguage;
 use crate::error::SyntaxError;
 use crate::input::parse_rope_with;
 use crate::registry::{LanguageEntry, LanguageRegistry};
+use crate::scanner::{ScanBudget, parse_snapshot};
 use crate::tree::{SyntaxEdit, SyntaxTree};
 
 /// Default per-job parse timeout (`250 ms`).
@@ -420,21 +421,53 @@ fn execute_parse(
         return Ok(prev.clone());
     }
 
+    let started = Instant::now();
+
+    let Some(ts_language) = entry.ts_language() else {
+        return execute_scanner_parse(entry.language(), snapshot, started, config, cancel);
+    };
+
+    execute_tree_sitter_parse(
+        entry.language(),
+        ts_language,
+        snapshot,
+        compatible_prev,
+        started,
+        config,
+        cancel,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal helper separating Tree-sitter execution from scanner dispatch"
+)]
+fn execute_tree_sitter_parse(
+    language: SyntaxLanguage,
+    ts_language: &tree_sitter::Language,
+    snapshot: &BufferSnapshot,
+    compatible_prev: Option<(&SyntaxTree, &[SyntaxEdit])>,
+    started: Instant,
+    config: SyntaxEngineConfig,
+    cancel: Option<&CancelContext<'_>>,
+) -> Result<SyntaxTree, SyntaxError> {
     let (edited_old_tree, incremental) = match compatible_prev {
-        Some((prev, edits)) => (Some(prev.with_edits(edits)), true),
+        Some((prev, edits)) => match prev.with_edits(edits) {
+            Some(edited) => (Some(edited), true),
+            None => (None, false),
+        },
         None => (None, false),
     };
 
-    let started = Instant::now();
     let mut abort_reason: Option<AbortReason> = None;
 
     let tree_opt = with_parser(config.reuse_thread_local_parsers, |parser| {
-        parser.set_language(entry.ts_language()).map_err(|err| {
-            SyntaxError::LanguageLoadFailed {
-                language: entry.language(),
+        parser
+            .set_language(ts_language)
+            .map_err(|err| SyntaxError::LanguageLoadFailed {
+                language,
                 reason: err.to_string(),
-            }
-        })?;
+            })?;
 
         let mut progress = |_state: &tree_sitter::ParseState| -> ControlFlow<()> {
             if let Some(ctx) = cancel
@@ -503,10 +536,40 @@ fn execute_parse(
     Ok(SyntaxTree::new(
         snapshot.id(),
         snapshot.version(),
-        entry.language(),
+        language,
         tree,
         elapsed,
         incremental,
+    ))
+}
+
+fn execute_scanner_parse(
+    language: SyntaxLanguage,
+    snapshot: &BufferSnapshot,
+    started: Instant,
+    config: SyntaxEngineConfig,
+    cancel: Option<&CancelContext<'_>>,
+) -> Result<SyntaxTree, SyntaxError> {
+    let cancel_fn = cancel.map(|ctx| move || ctx.check_cancelled());
+    let cancel_ref: Option<&dyn Fn() -> Option<BufferVersion>> = cancel_fn.as_ref().map(|f| {
+        let r: &dyn Fn() -> Option<BufferVersion> = f;
+        r
+    });
+    let mut budget = ScanBudget::new(
+        started,
+        config.parse_timeout,
+        cancel_ref,
+        snapshot.version(),
+    );
+    let doc = parse_snapshot(language, snapshot, &mut budget)?;
+    let elapsed = started.elapsed();
+    Ok(SyntaxTree::from_scanned(
+        snapshot.id(),
+        snapshot.version(),
+        language,
+        doc,
+        elapsed,
+        false,
     ))
 }
 
@@ -639,7 +702,10 @@ mod tests {
             .parse_sync(SyntaxLanguage::Json, &snap0, Some((&tree0, &[])))
             .unwrap();
         assert_eq!(noop.version(), tree0.version());
-        assert_eq!(noop.root_node().to_sexp(), tree0.root_node().to_sexp());
+        assert_eq!(
+            noop.root_node().unwrap().to_sexp(),
+            tree0.root_node().unwrap().to_sexp()
+        );
 
         // Multi-cursor / multi-line edit tracked by EditLog.
         let initial = snap0.text();
@@ -670,8 +736,8 @@ mod tests {
             .unwrap();
         assert!(!tree1_full.was_incremental());
         assert_eq!(
-            tree1_inc.root_node().to_sexp(),
-            tree1_full.root_node().to_sexp()
+            tree1_inc.root_node().unwrap().to_sexp(),
+            tree1_full.root_node().unwrap().to_sexp()
         );
     }
 

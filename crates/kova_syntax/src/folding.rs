@@ -90,6 +90,14 @@ pub fn extract_folds_with_registry(
         return Vec::new();
     }
 
+    if let Some(doc) = tree.scanned() {
+        return if registry.contains(tree.language()) {
+            doc.folds().to_vec()
+        } else {
+            Vec::new()
+        };
+    }
+
     let mut folds = Vec::new();
 
     if let Some(fold_query) = registry
@@ -116,9 +124,12 @@ fn collect_query_folds(
     let rope = snapshot.rope();
     let language = tree.language();
 
+    let Some(root_node) = tree.root_node() else {
+        return;
+    };
     let mut cursor = QueryCursor::new();
     let provider = RopeTextProvider::from_snapshot(snapshot);
-    let mut matches = cursor.matches(fold_query.query(), tree.root_node(), provider);
+    let mut matches = cursor.matches(fold_query.query(), root_node, provider);
 
     while let Some(mat) = matches.next() {
         for cap in mat.captures {
@@ -274,7 +285,9 @@ fn collect_import_folds(tree: &SyntaxTree, snapshot: &BufferSnapshot, out: &mut 
         _ => return,
     };
 
-    let root = tree.root_node();
+    let Some(root) = tree.root_node() else {
+        return;
+    };
     let mut cursor = root.walk();
     let total_bytes = snapshot.len_bytes();
     let rope = snapshot.rope();
@@ -378,8 +391,11 @@ fn collect_region_folds(tree: &SyntaxTree, snapshot: &BufferSnapshot, out: &mut 
     let rope = snapshot.rope();
     let mut stack: Vec<(usize, usize)> = Vec::new();
 
+    let Some(root) = tree.root_node() else {
+        return;
+    };
     // Non-recursive TreeCursor DFS over the entire AST so deeply nested files never overflow.
-    let mut cursor = tree.root_node().walk();
+    let mut cursor = root.walk();
     loop {
         let node = cursor.node();
         let kind = node.kind();
@@ -427,7 +443,7 @@ fn collect_region_folds(tree: &SyntaxTree, snapshot: &BufferSnapshot, out: &mut 
     }
 }
 
-fn dedup_and_sort_folds(folds: &mut Vec<FoldRange>) {
+pub(crate) fn dedup_and_sort_folds(folds: &mut Vec<FoldRange>) {
     folds.sort_unstable_by_key(|f| {
         (
             f.start_line,
