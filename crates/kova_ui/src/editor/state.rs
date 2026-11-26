@@ -1,6 +1,7 @@
 //! Headless editing state behind [`crate::editor::EditorView`].
 //!
-//! [`EditorState`] owns the [`Buffer`], the Undo/Redo [`History`] tree, the multi-cursor
+//! [`EditorState`] holds a [`SharedBuffer`] handle (the [`Buffer`] plus its Undo/Redo
+//! [`History`] tree, shared with sibling split panes showing the same file), the multi-cursor
 //! [`SelectionSet`], the in-app multi-cursor clipboard and the IME composition range.
 //! It has no GPUI dependency, so every keyboard, mouse, clipboard and IME mutation can be
 //! tested without a window. Every text mutation goes through
@@ -9,19 +10,23 @@
 use std::ops::Range;
 use std::time::Instant;
 
+#[cfg(doc)]
+use kova_buffer::History;
 use kova_buffer::{
-    Buffer, BufferSnapshot, ClipboardEntry, EditOrigin, History, HistoryConfig, Motion,
-    MotionConfig, MultiCursorClipboard, Selection, SelectionSet, TextEdit, copy_selections,
-    cut_selections, next_grapheme_boundary, paste, prev_grapheme_boundary,
+    Buffer, BufferSnapshot, BufferVersion, ClipboardEntry, EditOrigin, Motion, MotionConfig,
+    MultiCursorClipboard, Selection, SelectionSet, TextEdit, copy_selections, cut_selections,
+    next_grapheme_boundary, paste, prev_grapheme_boundary,
 };
 
 use crate::editor::input::split_paste_for_cursors;
+use crate::editor::shared::SharedBuffer;
 
 /// Headless editor model: buffer, history, selections, clipboard ring and IME marked range.
 #[derive(Debug)]
 pub struct EditorState {
-    buffer: Buffer,
-    history: History,
+    buffer: SharedBuffer,
+    /// Document version this state's selections were last valid for.
+    seen_version: BufferVersion,
     selections: SelectionSet,
     clipboard: MultiCursorClipboard,
     marked_range: Option<Range<usize>>,
@@ -32,9 +37,16 @@ impl EditorState {
     /// Creates a state with a single caret at the start of `buffer`.
     #[must_use]
     pub fn new(buffer: Buffer) -> Self {
+        Self::with_shared_buffer(SharedBuffer::new(buffer))
+    }
+
+    /// Creates a state over an existing [`SharedBuffer`] (the same file in another split),
+    /// with its own caret at the start of the document.
+    #[must_use]
+    pub fn with_shared_buffer(buffer: SharedBuffer) -> Self {
         Self {
+            seen_version: buffer.version(),
             buffer,
-            history: History::new(HistoryConfig::default()),
             selections: SelectionSet::caret(0),
             clipboard: MultiCursorClipboard::default(),
             marked_range: None,
@@ -72,10 +84,60 @@ impl EditorState {
         self.marked_range.clone()
     }
 
-    /// Returns the Undo/Redo history tree.
+    /// Returns a clone of the [`SharedBuffer`] handle backing this state.
     #[must_use]
-    pub const fn history(&self) -> &History {
-        &self.history
+    pub fn shared_buffer(&self) -> SharedBuffer {
+        self.buffer.clone()
+    }
+
+    /// Returns `true` when the shared document history has a transaction to undo.
+    #[must_use]
+    pub fn can_undo(&self) -> bool {
+        self.buffer.can_undo()
+    }
+
+    /// Re-validates the selections after a sibling split edited the shared document.
+    ///
+    /// Selections are clamped to valid grapheme boundaries of the current document and the IME
+    /// composition is dropped. Returns `true` when the document changed since the last sync.
+    pub fn sync_external_edits(&mut self) -> bool {
+        let version = self.buffer.version();
+        if version == self.seen_version {
+            return false;
+        }
+        self.seen_version = version;
+        self.marked_range = None;
+        let snap = self.buffer.snapshot();
+        let len = snap.len_bytes();
+        let clamped: Vec<Selection> = self
+            .selections
+            .as_slice()
+            .iter()
+            .map(|sel| Selection::new(sel.anchor().min(len), sel.head().min(len)).clamp(&snap))
+            .collect();
+        self.selections =
+            SelectionSet::from_selections(clamped, self.selections.primary_index(), &snap);
+        true
+    }
+
+    /// Moves the primary caret to the 1-based `(line, column)` (columns in characters),
+    /// clamping out-of-range positions. Used by *Structure* and *Problems* navigation.
+    pub fn set_line_col(&mut self, line: usize, col: usize) {
+        self.sync_external_edits();
+        let snap = self.buffer.snapshot();
+        let row = line
+            .saturating_sub(1)
+            .min(snap.len_lines().saturating_sub(1));
+        let line_start = snap.rope().line_to_byte(row);
+        let line_len = snap.line_len_bytes(row).unwrap_or(0);
+        let start_char = snap.byte_to_char(line_start).unwrap_or(0);
+        let line_chars = snap
+            .slice_bytes(line_start..line_start + line_len)
+            .map_or(0, |s| s.len_chars());
+        let byte = snap
+            .char_to_byte(start_char + col.saturating_sub(1).min(line_chars))
+            .unwrap_or(line_start);
+        self.set_caret(byte);
     }
 
     /// Returns the 0-based `(row, byte_column)` of the primary cursor head.
@@ -106,6 +168,7 @@ impl EditorState {
 
     /// Replaces every selection with `text` (typing, `Enter`, `Tab`). Returns `true` if the buffer changed.
     pub fn insert_text(&mut self, text: &str) -> bool {
+        self.sync_external_edits();
         self.marked_range = None;
         let edits: Vec<TextEdit> = self
             .selections
@@ -141,19 +204,25 @@ impl EditorState {
     /// Reverts the latest history transaction. Returns `true` if anything was undone.
     pub fn undo(&mut self) -> bool {
         self.marked_range = None;
-        matches!(
-            self.history.undo(&mut self.buffer, &mut self.selections),
-            Ok(true)
-        )
+        self.sync_external_edits();
+        let selections = &mut self.selections;
+        let undone = self
+            .buffer
+            .with_document(|buffer, history| history.undo(buffer, selections));
+        self.seen_version = self.buffer.version();
+        matches!(undone, Ok(true))
     }
 
     /// Re-applies the latest undone transaction. Returns `true` if anything was redone.
     pub fn redo(&mut self) -> bool {
         self.marked_range = None;
-        matches!(
-            self.history.redo(&mut self.buffer, &mut self.selections),
-            Ok(true)
-        )
+        self.sync_external_edits();
+        let selections = &mut self.selections;
+        let redone = self
+            .buffer
+            .with_document(|buffer, history| history.redo(buffer, selections));
+        self.seen_version = self.buffer.version();
+        matches!(redone, Ok(true))
     }
 
     // --------------------------------------------------------------- clipboard
@@ -170,14 +239,19 @@ impl EditorState {
     /// Copies like [`Self::copy`] and deletes the selected text as one undo transaction.
     pub fn cut(&mut self) -> Option<String> {
         self.marked_range = None;
-        let cut = cut_selections(
-            &mut self.clipboard,
-            &mut self.buffer,
-            &mut self.selections,
-            &mut self.history,
-            false,
-            Instant::now(),
-        );
+        self.sync_external_edits();
+        let (clipboard, selections) = (&mut self.clipboard, &mut self.selections);
+        let cut = self.buffer.with_document(|buffer, history| {
+            cut_selections(
+                clipboard,
+                buffer,
+                selections,
+                history,
+                false,
+                Instant::now(),
+            )
+        });
+        self.seen_version = self.buffer.version();
         match cut {
             Ok(true) => self.clipboard.latest().map(|e| e.text.clone()),
             _ => None,
@@ -202,15 +276,14 @@ impl EditorState {
                 }
             }
         };
+        self.sync_external_edits();
         let before = self.buffer.version();
-        paste(
-            &entry,
-            &mut self.buffer,
-            &mut self.selections,
-            &mut self.history,
-            Instant::now(),
-        )
-        .is_ok_and(|v| v != before)
+        let selections = &mut self.selections;
+        let pasted = self.buffer.with_document(|buffer, history| {
+            paste(&entry, buffer, selections, history, Instant::now())
+        });
+        self.seen_version = self.buffer.version();
+        pasted.is_ok_and(|v| v != before)
     }
 
     // -------------------------------------------------------------- navigation
@@ -429,22 +502,21 @@ impl EditorState {
     // ---------------------------------------------------------------- internal
 
     fn record(&mut self, edits: &[TextEdit], origin: EditOrigin) -> bool {
+        self.sync_external_edits();
         let before = self.buffer.version();
-        self.history
-            .record_and_apply(
-                &mut self.buffer,
-                &mut self.selections,
-                edits,
-                origin,
-                Instant::now(),
-            )
-            .is_ok_and(|v| v != before)
+        let selections = &mut self.selections;
+        let applied = self.buffer.with_document(|buffer, history| {
+            history.record_and_apply(buffer, selections, edits, origin, Instant::now())
+        });
+        self.seen_version = self.buffer.version();
+        applied.is_ok_and(|v| v != before)
     }
 
     fn delete_with<F>(&mut self, origin: EditOrigin, range_for: F) -> bool
     where
         F: Fn(&BufferSnapshot, &Selection) -> Range<usize>,
     {
+        self.sync_external_edits();
         self.marked_range = None;
         let snap = self.buffer.snapshot();
         let mut ranges: Vec<Range<usize>> = self
@@ -571,13 +643,45 @@ mod tests {
     }
 
     #[test]
+    fn split_states_share_one_document_and_undo_history() {
+        let mut left = EditorState::from_text("class A {}\nint x;\n");
+        let mut right = EditorState::with_shared_buffer(left.shared_buffer());
+
+        // Right caret sits at the very end; left then deletes the second line.
+        right.select_all();
+        right.escape();
+        right.set_caret(usize::MAX);
+        assert_eq!(right.primary_line_col(), (3, 1));
+
+        left.select_lines(1, 1);
+        assert!(left.delete_backward());
+        assert_eq!(text(&right), "class A {}\n");
+
+        // The stale right selection is clamped before the next edit lands.
+        assert!(right.sync_external_edits());
+        assert!(!right.sync_external_edits());
+        assert!(right.insert_text("// end"));
+        assert_eq!(text(&left), "class A {}\n// end");
+
+        // Undo is per document: undoing in the left pane reverts the right pane's edit.
+        assert!(right.can_undo());
+        assert!(left.undo());
+        assert_eq!(text(&right), "class A {}\n");
+
+        left.set_line_col(1, 7);
+        assert_eq!(left.primary_line_col(), (1, 7));
+        left.set_line_col(99, 99);
+        assert_eq!(left.primary_line_col(), (2, 1));
+    }
+
+    #[test]
     fn typing_and_backspace_are_undoable() {
         let mut st = EditorState::from_text("");
         assert!(st.insert_text("zażółć"));
         assert!(st.insert_text("\n"));
         assert!(st.delete_backward());
         assert_eq!(text(&st), "zażółć");
-        assert!(st.history().can_undo());
+        assert!(st.can_undo());
         while st.undo() {}
         assert_eq!(text(&st), "");
         assert!(st.redo());

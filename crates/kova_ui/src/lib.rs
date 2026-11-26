@@ -3,11 +3,19 @@
 //! GPU presentation layer (GPUI) — one of the only two crates allowed to depend
 //! on windowing (`kova_ui` and `kova_app`).
 
+pub mod dock;
 pub mod editor;
 pub mod shell;
 pub mod theme;
 
-pub use editor::EditorView;
+pub use dock::{
+    BadgeVariant, BottomPanelModel, BottomTab, DockLayoutState, DockSide, DockToolId,
+    FocusedRegion, PaneId, PaneRect, ProblemEntry, ProblemRow, ProblemSeverity, ProjectNode,
+    ProjectNodeKind, ProjectTreeModel, SplitAxis, SplitTree, StatusBarState, StructureModel,
+    StructureSymbolItem, TabGroupModel, TabId, TabItem, TreeActivation, VimModeBadge,
+};
+pub use editor::shared::SharedBuffer;
+pub use editor::{EditorEvent, EditorView};
 pub use shell::{StartupMetrics, WorkspaceShell};
 pub use theme::{KovaTheme, ThemeState, hsla_from_rgba, rgba_to_gpui};
 

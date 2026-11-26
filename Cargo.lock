@@ -3250,6 +3250,7 @@ dependencies = [
  "gpui",
  "kova_buffer",
  "kova_core",
+ "kova_syntax",
  "kova_theme",
  "smallvec",
 ]
