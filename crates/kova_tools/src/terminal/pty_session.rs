@@ -20,6 +20,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use super::env_builder::TerminalEnv;
 use super::error::TerminalError;
+use super::shell_integration::prepare_login_shell;
 use super::term_state::{TermState, TerminalSize, TerminalSnapshot};
 
 /// Default scrollback for sessions that do not configure one.
@@ -60,12 +61,20 @@ pub struct PtySpawnConfig {
 }
 
 impl PtySpawnConfig {
-    /// Runs the user's shell ([`default_shell`]) as a login shell in `cwd`.
+    /// Runs `program` (default: [`default_shell`]) as an interactive login shell in `cwd`,
+    /// with `java_home` exported and re-applied after the user's startup files.
     #[must_use]
-    pub fn shell(cwd: Option<&Path>, env: TerminalEnv) -> Self {
+    pub fn login_shell(
+        program: Option<PathBuf>,
+        cwd: Option<&Path>,
+        java_home: Option<&Path>,
+    ) -> Self {
+        let program = program.unwrap_or_else(default_shell);
+        let mut env = TerminalEnv::from_process(java_home);
+        let args = prepare_login_shell(&program, java_home, &mut env, |key| std::env::var_os(key));
         Self {
-            program: default_shell(),
-            args: vec!["-l".to_owned()],
+            program,
+            args,
             cwd: cwd.map(Path::to_path_buf),
             env,
             size: TerminalSize::default(),

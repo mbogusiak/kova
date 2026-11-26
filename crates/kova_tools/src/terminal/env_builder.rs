@@ -63,6 +63,11 @@ impl TerminalEnv {
         }
     }
 
+    /// Drops the override for `key`, if any.
+    pub fn remove(&mut self, key: &str) {
+        self.vars.retain(|(k, _)| k != key);
+    }
+
     /// Returns the override for `key`, if any.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&OsStr> {

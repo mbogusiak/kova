@@ -17,9 +17,9 @@ use gpui::{
 use kova_config::KovaSettings;
 use kova_theme::TerminalPalette;
 use kova_tools::terminal::{
-    KeyModifiers, PtySession, PtySpawnConfig, SnapshotCell, TermMode, TermState, TerminalEnv,
-    TerminalError, TerminalSize, TerminalSnapshot, encode_key, encode_paste, encode_scroll,
-    resolve_background, resolve_foreground, resolve_project_java_home,
+    KeyModifiers, PtySession, PtySpawnConfig, SnapshotCell, TermMode, TermState, TerminalError,
+    TerminalSize, TerminalSnapshot, encode_key, encode_paste, encode_scroll, resolve_background,
+    resolve_foreground, resolve_project_java_home,
 };
 
 use crate::theme::{KovaTheme, hsla_from_rgba};
@@ -81,11 +81,11 @@ impl TerminalLaunch {
         } else {
             None
         };
-        let env = TerminalEnv::from_process(java_home.as_deref());
-        let mut config = PtySpawnConfig::shell(self.cwd.as_deref(), env);
-        if let Some(shell) = &self.shell {
-            config.program.clone_from(shell);
-        }
+        let mut config = PtySpawnConfig::login_shell(
+            self.shell.clone(),
+            self.cwd.as_deref(),
+            java_home.as_deref(),
+        );
         config.scrollback = self.scrollback;
         (config, java_home)
     }
@@ -406,13 +406,18 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
+        // macOS: Option composes characters (`ą`, `ł`, `@` on non-US layouts) like in the
+        // editor; elsewhere, or when nothing was composed, Alt acts as Meta (`ESC` prefix).
+        let composed = cfg!(target_os = "macos")
+            && m.alt
+            && !m.control
+            && keystroke.key_char.as_deref().is_some_and(|c| !c.is_empty());
         let mods = KeyModifiers {
             ctrl: m.control,
-            alt: m.alt,
+            alt: m.alt && !composed,
             shift: m.shift,
         };
-        // Option/Alt acts as Meta: send `ESC` + the unmodified key, not the composed glyph.
-        let text = if m.alt {
+        let text = if mods.alt {
             None
         } else {
             keystroke.key_char.clone()

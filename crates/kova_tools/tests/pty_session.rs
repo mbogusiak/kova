@@ -11,7 +11,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use kova_tools::terminal::{PtySession, PtySpawnConfig, TerminalEnv, TerminalSize};
+use kova_tools::terminal::{
+    PtySession, PtySpawnConfig, TerminalEnv, TerminalSize, prepare_login_shell,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -117,4 +119,52 @@ fn spawn_failure_is_reported() {
     let err = PtySession::spawn(&PtySpawnConfig::command("/nonexistent/kova-shell", &[]))
         .expect_err("missing program must fail");
     assert!(err.to_string().contains("kova-shell"), "{err}");
+}
+
+/// Startup files that reset `JAVA_HOME` / `PATH` (SDKMAN style) must not win over Kova.
+fn assert_injection_survives_startup_files(shell: &str, rc_files: &[&str]) {
+    if !Path::new(shell).exists() {
+        return;
+    }
+    let home = tempfile::tempdir().expect("tempdir");
+    for rc in rc_files {
+        std::fs::write(
+            home.path().join(rc),
+            "export RC_SEEN=1\nexport JAVA_HOME=/wrong/jdk\nexport PATH=\"/wrong/jdk/bin:$PATH\"\n",
+        )
+        .expect("write rc");
+    }
+    let java_home = Path::new("/opt/kova-jdk-21");
+    let home_dir = home.path().to_path_buf();
+    let lookup = |key: &str| match key {
+        "HOME" => Some(home_dir.clone().into_os_string()),
+        "PATH" => std::env::var_os("PATH"),
+        _ => None,
+    };
+    let mut env = TerminalEnv::build(Some(java_home), lookup);
+    env.set("HOME", home.path());
+    let mut config = PtySpawnConfig::command(shell, &[]);
+    config.args = prepare_login_shell(Path::new(shell), Some(java_home), &mut env, lookup);
+    config.env = env;
+    config.cwd = Some(home.path().to_path_buf());
+    let session = PtySession::spawn(&config).expect("spawn");
+    session
+        .write_bytes(b"echo \"RC=$RC_SEEN JH=$JAVA_HOME\"; echo \"P1=${PATH%%:*}\"; exit\r")
+        .expect("write");
+    let text = wait_for_text(&session, "P1=/");
+    assert!(text.contains("RC=1 JH=/opt/kova-jdk-21"), "screen:\n{text}");
+    assert!(text.contains("P1=/opt/kova-jdk-21/bin"), "screen:\n{text}");
+}
+
+#[test]
+fn zsh_startup_files_cannot_override_the_project_jdk() {
+    assert_injection_survives_startup_files(
+        "/bin/zsh",
+        &[".zshenv", ".zprofile", ".zshrc", ".zlogin"],
+    );
+}
+
+#[test]
+fn bash_startup_files_cannot_override_the_project_jdk() {
+    assert_injection_survives_startup_files("/bin/bash", &[".bash_profile"]);
 }
