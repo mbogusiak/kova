@@ -22,6 +22,7 @@ use kova_toolchain::{
     OmakaseToolkit, PinnedArtifactSpec, ProgressCallback, ProgressEvent, ToolchainError,
     VineflowerDecompiler, build_jdtls_launch_spec,
 };
+use kova_toolchain::{JavaDebugStatus, ensure_java_debug, java_debug_status};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
@@ -906,4 +907,73 @@ async fn real_vineflower_decompiles_jdk_class() {
     assert_eq!(result.fqcn, "java.util.AbstractMap");
     assert!(result.source_code.contains("class AbstractMap"));
     assert!(result.source_code.contains("SimpleEntry"));
+}
+
+// ---------------------------------------------------------------------------
+// java-debug adapter (KOVA-041)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn java_debug_is_installed_once_and_updated_when_the_pin_changes() {
+    let fx = fixture();
+    let manager = OmakaseManager::new(fx.paths.clone(), fx.manifest.clone());
+    assert_eq!(
+        java_debug_status(&manager).expect("status"),
+        JavaDebugStatus::Missing {
+            pinned_version: "1.0.0".to_owned()
+        }
+    );
+
+    let adapter = ensure_java_debug(&manager, &fx.transport, None)
+        .await
+        .expect("install");
+    assert!(adapter.updated);
+    assert_eq!(adapter.version, "1.0.0");
+    assert!(adapter.jar.starts_with(fx.paths.java_debug_dir()));
+    assert_eq!(fs::read(&adapter.jar).expect("jar"), b"java-debug-jar");
+    assert_eq!(adapter.bundle(), adapter.jar.display().to_string());
+    assert!(matches!(
+        java_debug_status(&manager).expect("status"),
+        JavaDebugStatus::UpToDate { ref version, .. } if version == "1.0.0"
+    ));
+
+    // Idempotent: no second download.
+    let downloads = fx.transport.downloads();
+    let again = ensure_java_debug(&manager, &fx.transport, None)
+        .await
+        .expect("again");
+    assert!(!again.updated);
+    assert_eq!(fx.transport.downloads(), downloads);
+
+    // A new pinned version is reported and installed in place.
+    let bytes = b"java-debug-jar-1.1".to_vec();
+    let newer = spec(
+        OmakaseTool::JavaDebug,
+        "1.1.0",
+        &bytes,
+        OmakasePackageFormat::RawJar,
+    );
+    let mut artifacts = BTreeMap::new();
+    artifacts.insert(newer.url.clone(), bytes);
+    let transport = MockTransport::new(artifacts);
+    let manager = OmakaseManager::new(
+        fx.paths.clone(),
+        fx.manifest
+            .clone()
+            .with_override(OmakaseTool::JavaDebug, newer),
+    );
+    assert_eq!(
+        java_debug_status(&manager).expect("status"),
+        JavaDebugStatus::UpdateAvailable {
+            installed_version: "1.0.0".to_owned(),
+            pinned_version: "1.1.0".to_owned(),
+        }
+    );
+    let updated = ensure_java_debug(&manager, &transport, None)
+        .await
+        .expect("update");
+    assert!(updated.updated);
+    assert_eq!(updated.version, "1.1.0");
+    assert_eq!(fs::read(&updated.jar).expect("jar"), b"java-debug-jar-1.1");
+    assert!(!java_debug_status(&manager).expect("status").needs_install());
 }

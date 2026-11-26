@@ -35,6 +35,9 @@ use kova_syntax::{
 };
 use kova_theme::SyntaxLanguage;
 
+mod debug;
+
+use crate::debugger::{DebugCommandSink, DebuggerModel};
 use crate::dock::bottom_panel::BOTTOM_TAB_BAR_HEIGHT_PX;
 use crate::dock::focus::{
     LEFT_STRIPE_WIDTH_PX, RIGHT_STRIPE_WIDTH_PX, STATUSBAR_HEIGHT_PX, TITLEBAR_HEIGHT_PX,
@@ -409,6 +412,10 @@ pub struct WorkspaceShell {
     run_configs: Vec<RunConfiguration>,
     /// Last `kova.toml` load / save error.
     run_configs_error: Option<String>,
+    /// JVM debugger state (`KOVA-041`).
+    debugger: DebuggerModel,
+    /// Host executor of debug sessions (`kova_lsp_dap::dap`).
+    debug_sink: Option<DebugCommandSink>,
 }
 
 impl fmt::Debug for WorkspaceShell {
@@ -528,6 +535,8 @@ impl WorkspaceShell {
             test_sink: None,
             run_configs: Vec::new(),
             run_configs_error: None,
+            debugger: DebuggerModel::default(),
+            debug_sink: None,
         }
     }
 
@@ -809,6 +818,16 @@ impl WorkspaceShell {
                 let request = RunEntryPointRequested::from_entry_point(entry, path);
                 self.handle_run_request(&request);
                 cx.notify();
+            }
+            EditorEvent::ToggleBreakpoint(row) => {
+                let key = self
+                    .panes
+                    .get(&pane)
+                    .and_then(|state| state.tabs.tabs().iter().find(|t| t.id == tab))
+                    .and_then(|t| t.path.clone());
+                if let Some(key) = key {
+                    self.toggle_breakpoint_at(&key, *row, cx);
+                }
             }
         }
     }
@@ -1272,6 +1291,7 @@ impl WorkspaceShell {
             }
             window.focus(editor.read(cx).focus_handle());
         }
+        self.refresh_debug_gutters(cx);
         self.project_tree.reveal_path(rel_path);
         self.set_active_pane(pane_id, cx);
         self.dock_layout.focus(FocusedRegion::EditorPane(pane_id));
@@ -1710,6 +1730,11 @@ impl WorkspaceShell {
             cx.stop_propagation();
             return;
         }
+        // *Evaluate Expression* (`Alt+F8`) owns every key while open (`KOVA-041`).
+        if self.handle_evaluate_key(keystroke, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if self.ex_line.is_some() {
             self.handle_ex_key(keystroke, window, cx);
             cx.stop_propagation();
@@ -1908,6 +1933,7 @@ impl WorkspaceShell {
                 cx,
             ),
             ShellAction::OpenSettings => self.open_settings(window, cx),
+            ShellAction::Debug(action) => self.run_debug_action(action, window, cx),
         }
     }
 
@@ -2528,6 +2554,7 @@ impl WorkspaceShell {
                 "7" => Some(DockToolId::Structure),
                 "f12" => Some(DockToolId::Terminal),
                 "8" => Some(DockToolId::Tests),
+                "5" => Some(DockToolId::Debug),
                 _ => None,
             };
             if let Some(tool) = tool {
@@ -3288,6 +3315,7 @@ impl WorkspaceShell {
             .into_any_element(),
             BottomTab::Run => self.render_run_body(p, cx).into_any_element(),
             BottomTab::Tests => self.render_tests_body(p, cx),
+            BottomTab::Debug => self.render_debug_body(p, cx),
             BottomTab::Terminal => match &self.terminal {
                 Some((dock, _)) => div()
                     .flex_1()
@@ -4130,6 +4158,10 @@ impl Render for WorkspaceShell {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .child(self.render_titlebar(p))
             .child(workspace);
+        let root = match self.render_evaluate_overlay(p, cx) {
+            Some(overlay) => root.child(overlay),
+            None => root,
+        };
         match settings_overlay {
             Some(overlay) => root.child(overlay),
             None => root,

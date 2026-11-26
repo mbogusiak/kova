@@ -1,4 +1,4 @@
-//! Bottom panel model (`Problems`, `Run`, `Tests`, `Terminal`).
+//! Bottom panel model (`Problems`, `Run`, `Tests`, `Debug`, `Terminal`).
 //!
 //! The active tab is not stored here: it is derived from
 //! [`DockLayoutState::bottom_open`](crate::dock::DockLayoutState::bottom_open) so the stripe icons,
@@ -20,11 +20,19 @@ pub enum BottomTab {
     Terminal,
     /// `JUnit` Test Runner (`Alt+8`, `KOVA-040`).
     Tests,
+    /// JVM Debugger (`Alt+5`, `KOVA-041`), sharing the dock layout with the Test Runner.
+    Debug,
 }
 
 impl BottomTab {
     /// All bottom panel tabs in display order.
-    pub const ALL: [Self; 4] = [Self::Problems, Self::Run, Self::Tests, Self::Terminal];
+    pub const ALL: [Self; 5] = [
+        Self::Problems,
+        Self::Run,
+        Self::Tests,
+        Self::Debug,
+        Self::Terminal,
+    ];
 
     /// Returns the display title of this bottom panel tab.
     #[must_use]
@@ -34,6 +42,7 @@ impl BottomTab {
             Self::Run => "Run",
             Self::Terminal => "Terminal",
             Self::Tests => "Tests",
+            Self::Debug => "Debug",
         }
     }
 
@@ -45,6 +54,7 @@ impl BottomTab {
             Self::Run => DockToolId::Run,
             Self::Terminal => DockToolId::Terminal,
             Self::Tests => DockToolId::Tests,
+            Self::Debug => DockToolId::Debug,
         }
     }
 
@@ -56,6 +66,7 @@ impl BottomTab {
             DockToolId::Run => Some(Self::Run),
             DockToolId::Terminal => Some(Self::Terminal),
             DockToolId::Tests => Some(Self::Tests),
+            DockToolId::Debug => Some(Self::Debug),
             DockToolId::Project | DockToolId::Commit | DockToolId::Structure => None,
         }
     }

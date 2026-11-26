@@ -111,6 +111,15 @@ pub enum LspDapError {
         reason: String,
     },
 
+    /// A debug adapter answered a request with `success: false` (KOVA-041).
+    #[error("debug adapter request `{command}` failed: {message}")]
+    DapRequestFailed {
+        /// DAP command.
+        command: String,
+        /// Adapter error message (e.g. the compiler error of an evaluated expression).
+        message: String,
+    },
+
     /// An I/O operation failed.
     #[error("I/O error at `{path}`: {message}")]
     Io {

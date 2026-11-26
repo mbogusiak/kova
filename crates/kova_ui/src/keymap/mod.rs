@@ -221,6 +221,29 @@ pub enum ShellAction {
     OpenSearchEverywhere,
     /// Open *Settings* (`Cmd+,`).
     OpenSettings,
+    /// JVM debugger command (`KOVA-041`).
+    Debug(DebugShellAction),
+}
+
+/// Debugger commands bound by the `JetBrains` keymap (`KOVA-041`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DebugShellAction {
+    /// *Toggle Line Breakpoint* (`Ctrl+F8` / `Cmd+F8`).
+    ToggleBreakpoint,
+    /// *Step Over* (`F8`).
+    StepOver,
+    /// *Step Into* (`F7`).
+    StepInto,
+    /// *Step Out* (`Shift+F8`).
+    StepOut,
+    /// *Resume Program* (`F9` / `Cmd+Alt+R`).
+    Resume,
+    /// *Evaluate Expression* (`Alt+F8`).
+    EvaluateExpression,
+    /// *Debug* the entry point at the caret (`Ctrl+Shift+F9` / `Ctrl+Shift+D`).
+    DebugContext,
+    /// *Stop* (`Ctrl+F2` / `Cmd+F2`).
+    Stop,
 }
 
 impl ShellAction {
@@ -235,6 +258,7 @@ impl ShellAction {
             ids::TOOL_WINDOW_PROBLEMS => Self::ToggleTool(DockToolId::Problems),
             ids::TOOL_WINDOW_GIT => Self::ToggleTool(DockToolId::Commit),
             ids::TOOL_WINDOW_TERMINAL => Self::ToggleTool(DockToolId::Terminal),
+            ids::TOOL_WINDOW_DEBUG => Self::ToggleTool(DockToolId::Debug),
             ids::TOOL_WINDOW_HIDE_ALL => Self::ToggleFocusMode(FocusModeVariant::HideDocks),
             ids::VIEW_TOGGLE_FOCUS_MODE => Self::ToggleFocusMode(FocusModeVariant::Zen),
             ids::VIEW_TOGGLE_TILING_MODE => Self::ToggleTilingMode,
@@ -262,6 +286,16 @@ impl ShellAction {
             ids::EDITOR_ADD_NEXT_OCCURRENCE => Self::AddNextOccurrence,
             ids::NAVIGATION_SEARCH_EVERYWHERE => Self::OpenSearchEverywhere,
             ids::VIEW_OPEN_SETTINGS => Self::OpenSettings,
+            ids::DEBUG_TOGGLE_LINE_BREAKPOINT => Self::Debug(DebugShellAction::ToggleBreakpoint),
+            ids::DEBUG_STEP_OVER => Self::Debug(DebugShellAction::StepOver),
+            ids::DEBUG_STEP_INTO => Self::Debug(DebugShellAction::StepInto),
+            ids::DEBUG_STEP_OUT => Self::Debug(DebugShellAction::StepOut),
+            ids::DEBUG_RESUME => Self::Debug(DebugShellAction::Resume),
+            ids::DEBUG_EVALUATE_EXPRESSION => Self::Debug(DebugShellAction::EvaluateExpression),
+            ids::RUN_DEBUG_CONTEXT | ids::RUN_DEBUG_LAST => {
+                Self::Debug(DebugShellAction::DebugContext)
+            }
+            ids::RUN_STOP => Self::Debug(DebugShellAction::Stop),
             _ => return None,
         })
     }
@@ -749,6 +783,61 @@ mod tests {
         };
         assert_eq!(key_route(text), KeyRoute::TextInput);
         assert_eq!(key_route(RouteFlags::default()), KeyRoute::Keymap);
+    }
+
+    #[test]
+    fn jetbrains_debugger_keys_dispatch_debug_actions() {
+        let now = Instant::now();
+        let cases: [(&str, DebugShellAction); 5] = [
+            ("f7", DebugShellAction::StepInto),
+            ("f8", DebugShellAction::StepOver),
+            ("shift-f8", DebugShellAction::StepOut),
+            ("f9", DebugShellAction::Resume),
+            ("alt-f8", DebugShellAction::EvaluateExpression),
+        ];
+        let mut linux = KeyDispatchLayer::new(Platform::Linux);
+        for (key, action) in cases {
+            for leaf in [FocusContext::Workspace, FocusContext::EditorText] {
+                assert_eq!(
+                    press(&mut linux, key, leaf, false, now),
+                    DispatchOutcome::Action(ShellAction::Debug(action)),
+                    "{key} in {leaf:?}"
+                );
+            }
+        }
+        assert_eq!(
+            press(&mut linux, "ctrl-f8", FocusContext::EditorText, false, now),
+            DispatchOutcome::Action(ShellAction::Debug(DebugShellAction::ToggleBreakpoint))
+        );
+        assert_eq!(
+            press(
+                &mut linux,
+                "ctrl-shift-f9",
+                FocusContext::Workspace,
+                false,
+                now
+            ),
+            DispatchOutcome::Action(ShellAction::Debug(DebugShellAction::DebugContext))
+        );
+        // macOS: same stepping keys; *Resume* is `Cmd+Alt+R` in the JetBrains macOS keymap.
+        let mut mac = KeyDispatchLayer::new(Platform::MacOs);
+        for (key, action) in [
+            ("f7", DebugShellAction::StepInto),
+            ("f8", DebugShellAction::StepOver),
+            ("shift-f8", DebugShellAction::StepOut),
+            ("alt-f8", DebugShellAction::EvaluateExpression),
+            ("cmd-alt-r", DebugShellAction::Resume),
+        ] {
+            assert_eq!(
+                press(&mut mac, key, FocusContext::Workspace, false, now),
+                DispatchOutcome::Action(ShellAction::Debug(action)),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            press(&mut mac, "cmd-f8", FocusContext::EditorText, false, now),
+            DispatchOutcome::Action(ShellAction::Debug(DebugShellAction::ToggleBreakpoint))
+        );
     }
 
     #[test]

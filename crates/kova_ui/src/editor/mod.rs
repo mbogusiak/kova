@@ -122,6 +122,18 @@ pub enum EditorEvent {
     Focused,
     /// A gutter `▶` icon (or `Ctrl+Shift+R` on its line) asked to run an entry point.
     RunEntryPoint(Box<EntryPoint>),
+    /// A click on the line numbers asked to toggle a breakpoint on buffer row `usize`
+    /// (`KOVA-041`).
+    ToggleBreakpoint(usize),
+}
+
+/// Debugger decorations of the gutter (`KOVA-041`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DebugGutter {
+    /// Breakpoint icons by 0-based buffer row.
+    pub breakpoints: std::collections::BTreeMap<usize, crate::debugger::BreakpointIcon>,
+    /// 0-based buffer row of the current execution point.
+    pub execution_row: Option<usize>,
 }
 
 /// Virtualized GPUI code editor view operating strictly on $O(1)$ [`BufferSnapshot`]s.
@@ -155,6 +167,7 @@ pub struct EditorView {
     syntax_revision: u64,
     fold_map: FoldMap,
     fold_pills: Vec<(Bounds<Pixels>, usize)>,
+    debug_gutter: DebugGutter,
 }
 
 impl EditorView {
@@ -197,7 +210,75 @@ impl EditorView {
             syntax_revision: 0,
             fold_map: FoldMap::new(),
             fold_pills: Vec::new(),
+            debug_gutter: DebugGutter::default(),
         }
+    }
+
+    /// Text of the primary selection, if it is not empty (*Evaluate Expression* prefill).
+    #[must_use]
+    pub fn primary_selection_text(&self) -> Option<String> {
+        let range = self.state.selections().primary().range();
+        if range.is_empty() {
+            return None;
+        }
+        let snapshot = self.state.snapshot();
+        snapshot
+            .slice_bytes(range)
+            .ok()
+            .map(|slice| slice.to_string())
+    }
+
+    /// Entry point to debug: the one on the caret line, else the file's `main`, else its
+    /// test class (`KOVA-041`).
+    #[must_use]
+    pub fn debug_entry_point(&self) -> Option<EntryPoint> {
+        let syntax = self.syntax.as_ref()?;
+        let row = self.state.primary_point().0;
+        syntax
+            .entry_point_at(row)
+            .or_else(|| {
+                syntax.entry_points().iter().find(|e| {
+                    matches!(
+                        e.kind,
+                        kova_syntax::EntryPointKind::JavaMain
+                            | kova_syntax::EntryPointKind::KotlinMain
+                    )
+                })
+            })
+            .or_else(|| {
+                syntax
+                    .entry_points()
+                    .iter()
+                    .find(|e| e.kind == kova_syntax::EntryPointKind::JvmTestClass)
+            })
+            .cloned()
+    }
+
+    /// 0-based buffer row of the primary caret.
+    #[must_use]
+    pub fn caret_row(&self) -> usize {
+        self.state.primary_point().0
+    }
+
+    /// Breakpoints and execution point painted in the gutter.
+    #[must_use]
+    pub const fn debug_gutter(&self) -> &DebugGutter {
+        &self.debug_gutter
+    }
+
+    /// Replaces the debugger gutter decorations; scrolls the execution point into view when
+    /// it moved.
+    pub fn set_debug_gutter(&mut self, gutter: DebugGutter, cx: &mut Context<'_, Self>) {
+        if gutter == self.debug_gutter {
+            return;
+        }
+        let moved = gutter.execution_row.is_some()
+            && gutter.execution_row != self.debug_gutter.execution_row;
+        self.debug_gutter = gutter;
+        if let (true, Some(row)) = (moved, self.debug_gutter.execution_row) {
+            self.reveal_row(row);
+        }
+        cx.notify();
     }
 
     /// Creates an [`EditorView`] initialized from an in-memory UTF-8 string.
@@ -834,6 +915,24 @@ impl EditorView {
         .detach();
     }
 
+    /// Expands folds hiding buffer `row` and centres it when it is outside the viewport.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "line indices fit cleanly within f32 mantissa"
+    )]
+    fn reveal_row(&mut self, row: usize) {
+        self.fold_map.reveal_line(row);
+        let total_lines = self.visual_line_count();
+        let lh = self.last_viewport.line_height.max(1.0);
+        let vh = self.last_viewport.viewport_height.max(lh);
+        let top = self.fold_map.visual_row_of(row) as f32 * lh;
+        if top < self.scroll_offset.y || top + lh > self.scroll_offset.y + vh {
+            self.scroll_offset.y = self
+                .last_viewport
+                .clamp_scroll_y(top - (vh - lh) / 2.0, total_lines);
+        }
+    }
+
     /// Scrolls by the minimal delta that keeps the primary cursor inside the viewport
     /// with a 2-line vertical and 4-character horizontal margin.
     #[allow(
@@ -1214,7 +1313,11 @@ impl EditorView {
                 })
             }
             GutterSlot::Fold => self.toggle_fold_row(row),
-            GutterSlot::Other => false,
+            GutterSlot::Other => {
+                // IntelliJ New UI: a click on the line number toggles a breakpoint.
+                cx.emit(EditorEvent::ToggleBreakpoint(row));
+                true
+            }
         }
     }
 

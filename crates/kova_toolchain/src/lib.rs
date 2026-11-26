@@ -5,6 +5,7 @@
 
 pub mod download;
 pub mod error;
+pub mod java_debug;
 pub mod jdk;
 pub mod jdtls;
 pub mod omakase;
@@ -16,6 +17,7 @@ pub use download::{
     extract_archive_safe, verify_sha256_file,
 };
 pub use error::ToolchainError;
+pub use java_debug::{JavaDebugAdapter, JavaDebugStatus, ensure_java_debug, java_debug_status};
 pub use jdk::{
     JDTLS_MIN_JAVA_MAJOR, JavaVersion, JdkDiscoveryRoots, JdkInstallation, JdkRequirement,
     JdkSource, JdkVendor, ReleaseMetadata, SystemJvmRoot, TemurinAsset, TemurinClient,
