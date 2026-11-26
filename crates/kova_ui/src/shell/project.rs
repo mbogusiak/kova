@@ -133,6 +133,10 @@ impl WorkspaceShell {
         self.commit_panel_open = false;
         self.commit_panel = None;
         self.search_everywhere.close();
+        self.find_in_files.close();
+        self.find_in_files_task = None;
+        self.recent_files.clear();
+        self.last_run = None;
         self.git_discover_task = None;
         self.status_bar.git_branch.clear();
         self.set_git_repo(None, None, cx);
@@ -144,6 +148,7 @@ impl WorkspaceShell {
         self.settings_open
             || self.commit_panel_open
             || self.search_everywhere.is_open()
+            || self.find_in_files.is_open()
             || self.ex_line.is_some()
             || self.debugger.evaluate_modal().is_some()
     }

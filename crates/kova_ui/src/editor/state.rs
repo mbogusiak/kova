@@ -17,9 +17,11 @@ use kova_buffer::{
     MultiCursorClipboard, Selection, SelectionSet, TextEdit, copy_selections, cut_selections,
     next_grapheme_boundary, paste, prev_grapheme_boundary,
 };
+use kova_core::navigation::SourceLanguageKind;
 
 use crate::editor::input::split_paste_for_cursors;
 use crate::editor::shared::SharedBuffer;
+use crate::editor::syntax::EditorSyntax;
 
 /// Headless editor model: buffer, history, selections, clipboard ring and IME marked range.
 #[derive(Debug)]
@@ -32,6 +34,8 @@ pub struct EditorState {
     marked_range: Option<Range<usize>>,
     motion_config: MotionConfig,
     read_only: bool,
+    selection_stack: Vec<(BufferVersion, Selection)>,
+    occurrence_stack: Vec<(BufferVersion, SelectionSet)>,
 }
 
 impl EditorState {
@@ -53,6 +57,8 @@ impl EditorState {
             marked_range: None,
             motion_config: MotionConfig::default(),
             read_only: false,
+            selection_stack: Vec::new(),
+            occurrence_stack: Vec::new(),
         }
     }
 
@@ -120,6 +126,7 @@ impl EditorState {
         }
         self.seen_version = version;
         self.marked_range = None;
+        self.clear_selection_stacks();
         let snap = self.buffer.snapshot();
         let len = snap.len_bytes();
         let clamped: Vec<Selection> = self
@@ -220,6 +227,7 @@ impl EditorState {
             return false;
         }
         self.marked_range = None;
+        self.clear_selection_stacks();
         self.sync_external_edits();
         let selections = &mut self.selections;
         let undone = self
@@ -235,6 +243,7 @@ impl EditorState {
             return false;
         }
         self.marked_range = None;
+        self.clear_selection_stacks();
         self.sync_external_edits();
         let selections = &mut self.selections;
         let redone = self
@@ -261,6 +270,7 @@ impl EditorState {
             return None;
         }
         self.marked_range = None;
+        self.clear_selection_stacks();
         self.sync_external_edits();
         let (clipboard, selections) = (&mut self.clipboard, &mut self.selections);
         let cut = self.buffer.with_document(|buffer, history| {
@@ -290,6 +300,7 @@ impl EditorState {
             return false;
         }
         self.marked_range = None;
+        self.clear_selection_stacks();
         let entry = match self.clipboard.latest() {
             Some(latest) if latest.text == text => latest.clone(),
             _ => {
@@ -316,6 +327,7 @@ impl EditorState {
     /// Moves (or extends with `extend`) every selection by `motion`.
     pub fn move_selections(&mut self, motion: Motion, extend: bool) {
         self.marked_range = None;
+        self.clear_selection_stacks();
         let snap = self.buffer.snapshot();
         self.selections
             .move_by(&snap, motion, extend, self.motion_config);
@@ -332,6 +344,7 @@ impl EditorState {
     /// Selects the whole buffer.
     pub fn select_all(&mut self) {
         self.marked_range = None;
+        self.clear_selection_stacks();
         let snap = self.buffer.snapshot();
         self.selections.select_all(&snap);
     }
@@ -339,6 +352,7 @@ impl EditorState {
     /// Collapses multiple cursors to the primary one, or clears a single selection.
     pub fn escape(&mut self) {
         self.marked_range = None;
+        self.clear_selection_stacks();
         if self.selections.len() > 1 {
             self.selections.collapse_to_primary();
         } else {
@@ -349,6 +363,7 @@ impl EditorState {
 
     /// Adds a cursor on the line above (`up == true`) or below the existing cursors.
     pub fn add_cursor_vertical(&mut self, up: bool) {
+        self.clear_selection_stacks();
         let snap = self.buffer.snapshot();
         if up {
             self.selections.add_cursor_above(&snap, self.motion_config);
@@ -369,6 +384,7 @@ impl EditorState {
     /// to mirror the Vim engine's caret or visual selection.
     pub fn set_selection(&mut self, anchor: usize, head: usize) {
         self.marked_range = None;
+        self.clear_selection_stacks();
         let snap = self.buffer.snapshot();
         let len = snap.len_bytes();
         let anchor = snap.clamp_byte_to_char_boundary(anchor.min(len));
@@ -487,8 +503,383 @@ impl EditorState {
     pub fn add_next_occurrence(&mut self) -> bool {
         self.sync_external_edits();
         self.marked_range = None;
+        self.selection_stack.clear();
         let snap = self.buffer.snapshot();
-        self.selections.add_next_occurrence(&snap)
+        let before = self.selections.clone();
+        if self.selections.add_next_occurrence(&snap) {
+            self.occurrence_stack.push((snap.version(), before));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `Ctrl+Shift+G` (macOS) / `Alt+Shift+J` (Linux): unselects the most recently added
+    /// occurrence cursor (or removes the primary cursor if multiple cursors exist).
+    pub fn unselect_occurrence(&mut self) -> bool {
+        self.sync_external_edits();
+        self.marked_range = None;
+        self.selection_stack.clear();
+        let version = self.buffer.snapshot().version();
+        while let Some((ver, prev)) = self.occurrence_stack.pop() {
+            if ver == version {
+                self.selections = prev;
+                return true;
+            }
+        }
+        self.selections.remove_primary()
+    }
+
+    /// `Ctrl+Cmd+G` (macOS) / `Ctrl+Alt+Shift+J` (Linux): selects all non-overlapping
+    /// occurrences of the active selection or word under caret.
+    pub fn select_all_occurrences(&mut self) -> bool {
+        self.sync_external_edits();
+        self.marked_range = None;
+        self.selection_stack.clear();
+        let snap = self.buffer.snapshot();
+        let before = self.selections.clone();
+        if self.selections.select_all_occurrences(&snap) {
+            self.occurrence_stack.push((snap.version(), before));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `Cmd+Backspace` (macOS) / `Ctrl+Y` (Linux): deletes the full line(s) touched by every
+    /// cursor/selection in a single undo transaction.
+    pub fn delete_lines(&mut self) -> bool {
+        if self.read_only {
+            return false;
+        }
+        self.sync_external_edits();
+        self.marked_range = None;
+        let snap = self.buffer.snapshot();
+        if snap.len_bytes() == 0 {
+            return false;
+        }
+        let mut intervals: Vec<(usize, usize)> = Vec::with_capacity(self.selections.len());
+        for sel in self.selections.as_slice() {
+            let range = sel.range();
+            let (Ok(first), Ok(last)) = (
+                snap.byte_to_point(snap.clamp_byte_to_char_boundary(range.start)),
+                snap.byte_to_point(snap.clamp_byte_to_char_boundary(range.end)),
+            ) else {
+                continue;
+            };
+            let last_row = if !sel.is_empty() && last.column == 0 && last.row > first.row {
+                last.row - 1
+            } else {
+                last.row
+            };
+            intervals.push((first.row, last_row));
+        }
+        if intervals.is_empty() {
+            return false;
+        }
+        intervals.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(intervals.len());
+        for (start_row, end_row) in intervals {
+            if let Some(prev) = merged.last_mut()
+                && start_row <= prev.1 + 1
+            {
+                prev.1 = prev.1.max(end_row);
+            } else {
+                merged.push((start_row, end_row));
+            }
+        }
+
+        let len_lines = snap.len_lines();
+        let mut edits = Vec::with_capacity(merged.len());
+        for (r_start, r_end) in merged {
+            let mut del_start = line_start_byte(&snap, r_start);
+            let del_end = line_end_with_ending_byte(&snap, r_end);
+            let has_trailing_nl = del_end > line_content_range(&snap, r_end).end;
+            if r_end + 1 >= len_lines && !has_trailing_nl && r_start > 0 {
+                // Deleting the final line without a trailing newline also removes the preceding EOL.
+                del_start = line_content_range(&snap, r_start - 1).end;
+            }
+            if del_start < del_end {
+                edits.push(TextEdit::delete(del_start..del_end));
+            }
+        }
+        if edits.is_empty() {
+            return false;
+        }
+        self.record(&edits, EditOrigin::DeleteBackward)
+    }
+
+    /// `Cmd+Alt+/` (macOS) / `Ctrl+Shift+/` (Linux): toggles block comments (`open` / `close`)
+    /// around each non-empty selection or the enclosing block/caret on empty selections.
+    pub fn toggle_block_comment(&mut self, open: &str, close: &str) -> bool {
+        if self.read_only || open.is_empty() || close.is_empty() {
+            return false;
+        }
+        self.sync_external_edits();
+        self.marked_range = None;
+        let snap = self.buffer.snapshot();
+        let total = snap.len_bytes();
+        let mut edits: Vec<TextEdit> = Vec::new();
+        let mut planned_sels: Vec<(usize, usize, bool)> = Vec::with_capacity(self.selections.len());
+        let mut delta: isize = 0;
+
+        for sel in self.selections.as_slice() {
+            let reversed = sel.is_reversed();
+            if sel.is_empty() {
+                let caret = snap.clamp_byte_to_char_boundary(sel.head());
+                let Ok(pt) = snap.byte_to_point(caret) else {
+                    continue;
+                };
+                let line_range = line_content_range(&snap, pt.row);
+                let line_text = slice_text(&snap, line_range.clone());
+                let rel = caret.saturating_sub(line_range.start).min(line_text.len());
+                if let Some((open_rel, close_rel)) =
+                    enclosing_block_comment_in_line(&line_text, rel, open, close)
+                {
+                    let open_abs = line_range.start + open_rel;
+                    let close_abs = line_range.start + close_rel;
+                    edits.push(TextEdit::delete(open_abs..open_abs + open.len()));
+                    edits.push(TextEdit::delete(close_abs..close_abs + close.len()));
+                    let new_pos = shift_isize(caret, delta).saturating_sub(open.len());
+                    planned_sels.push((new_pos, new_pos, false));
+                    delta -= isize::try_from(open.len() + close.len()).unwrap_or(0);
+                } else {
+                    let snippet = format!("{open}  {close}");
+                    edits.push(TextEdit::new(caret..caret, snippet.as_str()));
+                    let new_pos = shift_isize(caret, delta) + open.len() + 1;
+                    planned_sels.push((new_pos, new_pos, false));
+                    delta += isize::try_from(snippet.len()).unwrap_or(0);
+                }
+            } else {
+                let range = sel.range();
+                let selected = slice_text(&snap, range.clone());
+                if selected.len() >= open.len() + close.len()
+                    && selected.starts_with(open)
+                    && selected.ends_with(close)
+                {
+                    edits.push(TextEdit::delete(range.start..range.start + open.len()));
+                    edits.push(TextEdit::delete(range.end - close.len()..range.end));
+                    let new_start = shift_isize(range.start, delta);
+                    let new_end =
+                        shift_isize(range.end, delta).saturating_sub(open.len() + close.len());
+                    planned_sels.push((new_start, new_end, reversed));
+                    delta -= isize::try_from(open.len() + close.len()).unwrap_or(0);
+                } else if range.start >= open.len()
+                    && range.end + close.len() <= total
+                    && slice_text(&snap, range.start - open.len()..range.start) == open
+                    && slice_text(&snap, range.end..range.end + close.len()) == close
+                {
+                    edits.push(TextEdit::delete(range.start - open.len()..range.start));
+                    edits.push(TextEdit::delete(range.end..range.end + close.len()));
+                    let new_start = shift_isize(range.start, delta).saturating_sub(open.len());
+                    let new_end = shift_isize(range.end, delta).saturating_sub(open.len());
+                    planned_sels.push((new_start, new_end, reversed));
+                    delta -= isize::try_from(open.len() + close.len()).unwrap_or(0);
+                } else {
+                    edits.push(TextEdit::new(range.start..range.start, open));
+                    edits.push(TextEdit::new(range.end..range.end, close));
+                    let new_start = shift_isize(range.start, delta);
+                    let new_end = shift_isize(range.end, delta) + open.len() + close.len();
+                    planned_sels.push((new_start, new_end, reversed));
+                    delta += isize::try_from(open.len() + close.len()).unwrap_or(0);
+                }
+            }
+        }
+        if edits.is_empty() {
+            return false;
+        }
+        let primary_idx = self.selections.primary_index();
+        let changed = self.record(&edits, EditOrigin::Compound);
+        if changed && !planned_sels.is_empty() {
+            let post = self.buffer.snapshot();
+            let next_sels: Vec<Selection> = planned_sels
+                .into_iter()
+                .map(|(start, end, rev)| {
+                    if rev {
+                        Selection::new(end, start)
+                    } else {
+                        Selection::new(start, end)
+                    }
+                })
+                .collect();
+            self.selections = SelectionSet::from_selections(next_sels, primary_idx, &post);
+        }
+        changed
+    }
+
+    /// `Alt+Shift+Up/Down`: swaps the active line (or selected block of lines) with the adjacent
+    /// line above (`up = true`) or below (`up = false`), preserving selection and relative offset.
+    pub fn move_lines(&mut self, up: bool) -> bool {
+        if self.read_only {
+            return false;
+        }
+        self.sync_external_edits();
+        self.marked_range = None;
+        let snap = self.buffer.snapshot();
+        let primary = *self.selections.primary();
+        let range = primary.range();
+        let (Ok(first_pt), Ok(last_pt)) = (
+            snap.byte_to_point(snap.clamp_byte_to_char_boundary(range.start)),
+            snap.byte_to_point(snap.clamp_byte_to_char_boundary(range.end)),
+        ) else {
+            return false;
+        };
+        let first = first_pt.row;
+        let last = if !primary.is_empty() && last_pt.column == 0 && last_pt.row > first {
+            last_pt.row - 1
+        } else {
+            last_pt.row
+        };
+        if up && first == 0 {
+            return false;
+        }
+        if !up && last + 1 >= snap.len_lines() {
+            return false;
+        }
+
+        let (span, replacement, shift_bytes): (Range<usize>, String, isize) = if up {
+            let other = first - 1;
+            let other_range = line_content_range(&snap, other);
+            let block_start = line_start_byte(&snap, first);
+            let block_end = line_content_range(&snap, last).end;
+            let sep = slice_text(&snap, other_range.end..block_start);
+            let other_text = slice_text(&snap, other_range.clone());
+            let block_text = slice_text(&snap, block_start..block_end);
+            let shift = isize::try_from(other_range.start).unwrap_or(0)
+                - isize::try_from(block_start).unwrap_or(0);
+            (
+                other_range.start..block_end,
+                format!("{block_text}{sep}{other_text}"),
+                shift,
+            )
+        } else {
+            let other = last + 1;
+            let block_start = line_start_byte(&snap, first);
+            let block_end = line_content_range(&snap, last).end;
+            let other_range = line_content_range(&snap, other);
+            let sep = slice_text(&snap, block_end..other_range.start);
+            let block_text = slice_text(&snap, block_start..block_end);
+            let other_text = slice_text(&snap, other_range.clone());
+            let shift = isize::try_from(other_text.len() + sep.len()).unwrap_or(0);
+            (
+                block_start..other_range.end,
+                format!("{other_text}{sep}{block_text}"),
+                shift,
+            )
+        };
+
+        let changed = self.record(
+            &[TextEdit::new(span, replacement.as_str())],
+            EditOrigin::Compound,
+        );
+        if changed {
+            let post = self.buffer.snapshot();
+            let shift_offset = |off: usize| -> usize {
+                let shifted = isize::try_from(off)
+                    .unwrap_or(0)
+                    .saturating_add(shift_bytes)
+                    .max(0);
+                usize::try_from(shifted).unwrap_or(0).min(post.len_bytes())
+            };
+            let new_anchor = shift_offset(primary.anchor());
+            let new_head = shift_offset(primary.head());
+            self.selections =
+                SelectionSet::single(Selection::new(new_anchor, new_head).clamp(&post));
+        }
+        changed
+    }
+
+    /// `Alt+Up` (macOS) / `Ctrl+W` (Linux): hierarchically expands the primary selection from
+    /// caret -> word -> AST node (or delimiters/line) -> whole buffer, pushing onto history.
+    pub fn extend_selection(&mut self, syntax: Option<&EditorSyntax>) -> bool {
+        self.sync_external_edits();
+        self.marked_range = None;
+        self.occurrence_stack.clear();
+        let snap = self.buffer.snapshot();
+        if snap.len_bytes() == 0 {
+            return false;
+        }
+        let primary = *self.selections.primary();
+        let range = primary.range();
+
+        let mut next: Option<Range<usize>> = None;
+        if primary.is_empty() {
+            let word = word_range_at(&snap, primary.head());
+            if !word.is_empty()
+                && slice_text(&snap, word.clone())
+                    .chars()
+                    .next()
+                    .is_some_and(is_word_char)
+            {
+                next = Some(word);
+            }
+        }
+        if next.is_none()
+            && let Some(syn) = syntax
+            && syn.snapshot().version() == snap.version()
+        {
+            next = syn.enclosing_node_range(range.start, range.end);
+        }
+        if next.is_none() {
+            next = fallback_extend_range(&snap, &range);
+        }
+        let Some(next_range) = next else {
+            return false;
+        };
+        if next_range == range || next_range.start > range.start || next_range.end < range.end {
+            return false;
+        }
+        self.selection_stack.push((snap.version(), primary));
+        self.selections = SelectionSet::single(Selection::new(next_range.start, next_range.end));
+        true
+    }
+
+    /// `Alt+Down` (macOS) / `Ctrl+Shift+W` (Linux): restores the previous selection from the
+    /// [`Self::extend_selection`] stack.
+    pub fn shrink_selection(&mut self) -> bool {
+        self.sync_external_edits();
+        self.marked_range = None;
+        self.occurrence_stack.clear();
+        let snap = self.buffer.snapshot();
+        let version = snap.version();
+        while let Some((ver, prev)) = self.selection_stack.pop() {
+            if ver == version {
+                self.selections = SelectionSet::single(prev.clamp(&snap));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `Cmd+Alt+L` (macOS) / `Ctrl+Alt+L` (Linux): trims trailing whitespace and normalizes
+    /// brace indentation (`indent_width` spaces per level) in one undo transaction.
+    pub fn reformat_code(&mut self, language: SourceLanguageKind, indent_width: usize) -> bool {
+        let brace_indent = !matches!(language, SourceLanguageKind::Unknown);
+        self.reformat_code_with_braces(brace_indent, indent_width)
+    }
+
+    /// Formats the document using optional brace-based indentation plus trailing-whitespace trimming.
+    pub fn reformat_code_with_braces(&mut self, brace_indent: bool, indent_width: usize) -> bool {
+        if self.read_only {
+            return false;
+        }
+        self.sync_external_edits();
+        self.marked_range = None;
+        let snap = self.buffer.snapshot();
+        let original = snap.text();
+        let formatted = format_document_text(&original, brace_indent, indent_width.max(1));
+        if formatted == original {
+            return false;
+        }
+        let (line, col) = self.primary_line_col();
+        let changed = self.record(
+            &[TextEdit::new(0..snap.len_bytes(), formatted.as_str())],
+            EditOrigin::Compound,
+        );
+        if changed {
+            self.set_line_col(line, col);
+        }
+        changed
     }
 
     // ------------------------------------------------------------------- mouse
@@ -496,6 +887,7 @@ impl EditorState {
     /// Replaces all selections with a single caret at `byte` (plain click).
     pub fn set_caret(&mut self, byte: usize) {
         self.marked_range = None;
+        self.clear_selection_stacks();
         let snap = self.buffer.snapshot();
         self.selections = SelectionSet::caret(snap.clamp_byte_to_char_boundary(byte));
     }
@@ -503,6 +895,7 @@ impl EditorState {
     /// Keeps the primary anchor and moves the head to `byte` (`Shift+Click`, drag).
     pub fn extend_primary_to(&mut self, byte: usize) {
         self.marked_range = None;
+        self.clear_selection_stacks();
         let snap = self.buffer.snapshot();
         let anchor = self.selections.primary().anchor();
         let head = snap.clamp_byte_to_char_boundary(byte);
@@ -512,6 +905,7 @@ impl EditorState {
     /// Adds a caret at `byte` and makes it primary (`Alt+Click`).
     pub fn add_cursor_at(&mut self, byte: usize) {
         self.marked_range = None;
+        self.clear_selection_stacks();
         let snap = self.buffer.snapshot();
         let caret = Selection::caret(snap.clamp_byte_to_char_boundary(byte));
         self.selections.push(caret, true, &snap);
@@ -520,6 +914,7 @@ impl EditorState {
     /// Selects the word under `byte` (double click).
     pub fn select_word_at(&mut self, byte: usize) {
         self.marked_range = None;
+        self.clear_selection_stacks();
         let snap = self.buffer.snapshot();
         let range = word_range_at(&snap, byte);
         self.selections = SelectionSet::single(Selection::new(range.start, range.end));
@@ -529,6 +924,7 @@ impl EditorState {
     /// (triple click, gutter click and gutter drag).
     pub fn select_lines(&mut self, anchor_row: usize, head_row: usize) {
         self.marked_range = None;
+        self.clear_selection_stacks();
         let snap = self.buffer.snapshot();
         let (anchor, head) = if head_row >= anchor_row {
             (
@@ -668,11 +1064,17 @@ impl EditorState {
 
     // ---------------------------------------------------------------- internal
 
+    fn clear_selection_stacks(&mut self) {
+        self.selection_stack.clear();
+        self.occurrence_stack.clear();
+    }
+
     fn record(&mut self, edits: &[TextEdit], origin: EditOrigin) -> bool {
         if self.read_only {
             return false;
         }
         self.sync_external_edits();
+        self.clear_selection_stacks();
         let before = self.buffer.version();
         let selections = &mut self.selections;
         let applied = self.buffer.with_document(|buffer, history| {
@@ -809,6 +1211,270 @@ fn word_range_at(snap: &BufferSnapshot, byte: usize) -> Range<usize> {
     let start = chars[lo].0;
     let end = chars.get(hi).map_or(line.len(), |&(i, _)| i);
     (line_start + start)..(line_start + end)
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '$'
+}
+
+fn shift_isize(offset: usize, delta: isize) -> usize {
+    let shifted = isize::try_from(offset)
+        .unwrap_or(0)
+        .saturating_add(delta)
+        .max(0);
+    usize::try_from(shifted).unwrap_or(0)
+}
+
+fn enclosing_block_comment_in_line(
+    line: &str,
+    rel: usize,
+    open: &str,
+    close: &str,
+) -> Option<(usize, usize)> {
+    let open_rel = line[..rel].rfind(open)?;
+    let search_from = open_rel + open.len();
+    if search_from > rel {
+        return None;
+    }
+    // If `close` already appeared between `open` and the caret, the caret is outside the block.
+    if line[search_from..rel].contains(close) {
+        return None;
+    }
+    let close_offset = line[rel..].find(close)?;
+    Some((open_rel, rel + close_offset))
+}
+
+fn fallback_extend_range(snap: &BufferSnapshot, range: &Range<usize>) -> Option<Range<usize>> {
+    let len = snap.len_bytes();
+    if len == 0 {
+        return None;
+    }
+    if range.is_empty() {
+        let word = word_range_at(snap, range.start);
+        if !word.is_empty()
+            && slice_text(snap, word.clone())
+                .chars()
+                .next()
+                .is_some_and(is_word_char)
+        {
+            return Some(word);
+        }
+    }
+
+    let start_pt = snap
+        .byte_to_point(snap.clamp_byte_to_char_boundary(range.start))
+        .ok()?;
+    let end_pt = snap
+        .byte_to_point(snap.clamp_byte_to_char_boundary(range.end))
+        .ok()?;
+    if start_pt.row == end_pt.row {
+        let line_range = line_content_range(snap, start_pt.row);
+        let line = slice_text(snap, line_range.clone());
+        let rel_start = range.start.saturating_sub(line_range.start).min(line.len());
+        let rel_end = range.end.saturating_sub(line_range.start).min(line.len());
+
+        if let Some(delim_range) = enclosing_delimiter_range(&line, rel_start..rel_end) {
+            return Some(
+                (line_range.start + delim_range.start)..(line_range.start + delim_range.end),
+            );
+        }
+
+        let trimmed_start = line.len() - line.trim_start().len();
+        let trimmed_end = line.trim_end().len();
+        if trimmed_start < trimmed_end {
+            let trimmed_abs = (line_range.start + trimmed_start)..(line_range.start + trimmed_end);
+            if strictly_contains(&trimmed_abs, range) {
+                return Some(trimmed_abs);
+            }
+        }
+        if strictly_contains(&line_range, range) {
+            return Some(line_range);
+        }
+        let with_eol = line_range.start..line_end_with_ending_byte(snap, start_pt.row);
+        if strictly_contains(&with_eol, range) {
+            return Some(with_eol);
+        }
+    }
+
+    let full = 0..len;
+    strictly_contains(&full, range).then_some(full)
+}
+
+fn strictly_contains(outer: &Range<usize>, inner: &Range<usize>) -> bool {
+    outer.start <= inner.start && outer.end >= inner.end && outer != inner
+}
+
+fn enclosing_delimiter_range(text: &str, inner: Range<usize>) -> Option<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut stack: Vec<(u8, usize)> = Vec::new();
+    let mut best: Option<Range<usize>> = None;
+    let mut in_quote: Option<(u8, usize)> = None;
+    let mut escaped = false;
+
+    for (idx, &b) in bytes.iter().enumerate() {
+        if let Some((quote, q_start)) = in_quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if b == b'\\' {
+                escaped = true;
+                continue;
+            }
+            if b == quote {
+                let candidate =
+                    if q_start + 1 < idx && strictly_contains(&((q_start + 1)..idx), &inner) {
+                        (q_start + 1)..idx
+                    } else {
+                        q_start..(idx + 1)
+                    };
+                if strictly_contains(&candidate, &inner)
+                    && best.as_ref().is_none_or(|b| candidate.len() < b.len())
+                {
+                    best = Some(candidate);
+                }
+                in_quote = None;
+            }
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_quote = Some((b, idx));
+            continue;
+        }
+        match b {
+            b'(' | b'[' | b'{' => stack.push((b, idx)),
+            b')' | b']' | b'}' => {
+                let expected = match b {
+                    b')' => b'(',
+                    b']' => b'[',
+                    _ => b'{',
+                };
+                if let Some((open_b, open_idx)) = stack.pop()
+                    && open_b == expected
+                {
+                    let candidate = if open_idx + 1 < idx
+                        && strictly_contains(&((open_idx + 1)..idx), &inner)
+                    {
+                        (open_idx + 1)..idx
+                    } else {
+                        open_idx..(idx + 1)
+                    };
+                    if strictly_contains(&candidate, &inner)
+                        && best.as_ref().is_none_or(|cur| candidate.len() < cur.len())
+                    {
+                        best = Some(candidate);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    best
+}
+
+fn format_document_text(text: &str, brace_indent: bool, indent_width: usize) -> String {
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let trailing_eol = text.ends_with('\n');
+    let lines: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    let line_count = if trailing_eol {
+        lines.len().saturating_sub(1)
+    } else {
+        lines.len()
+    };
+
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    let mut in_block_comment = false;
+
+    for (idx, raw_line) in lines.iter().take(line_count).enumerate() {
+        let trimmed_end = raw_line.trim_end_matches([' ', '\t']);
+        if trimmed_end.trim().is_empty() {
+            if idx + 1 < line_count || trailing_eol {
+                out.push_str(eol);
+            }
+            continue;
+        }
+
+        if brace_indent {
+            let trimmed = trimmed_end.trim_start_matches([' ', '\t']);
+            let leading_close = if in_block_comment {
+                0
+            } else {
+                trimmed
+                    .chars()
+                    .take_while(|c| matches!(c, '}' | ')' | ']'))
+                    .count()
+            };
+            let line_depth = depth.saturating_sub(leading_close);
+            let extra_javadoc_space = usize::from(in_block_comment && trimmed.starts_with('*'));
+            for _ in 0..(line_depth * indent_width + extra_javadoc_space) {
+                out.push(' ');
+            }
+            out.push_str(trimmed);
+            update_brace_depth(trimmed, &mut depth, &mut in_block_comment);
+        } else {
+            out.push_str(trimmed_end);
+        }
+
+        if idx + 1 < line_count || trailing_eol {
+            out.push_str(eol);
+        }
+    }
+
+    out
+}
+
+fn update_brace_depth(line: &str, depth: &mut usize, in_block_comment: &mut bool) {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if *in_block_comment {
+            if b == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                *in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            break;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            *in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            quote = Some(b);
+            i += 1;
+            continue;
+        }
+        match b {
+            b'{' | b'(' | b'[' => *depth += 1,
+            b'}' | b')' | b']' => *depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
 }
 
 #[cfg(test)]
@@ -1138,6 +1804,11 @@ mod tests {
         assert!(!st.apply_edits(&[TextEdit::new(0..0, "z")], EditOrigin::Typing));
         assert!(!st.duplicate_lines_or_selections());
         assert!(!st.toggle_line_comment("//"));
+        assert!(!st.delete_lines());
+        assert!(!st.toggle_block_comment("/*", "*/"));
+        assert!(!st.move_lines(true));
+        assert!(!st.move_lines(false));
+        assert!(!st.reformat_code(SourceLanguageKind::Java, 4));
         assert!(!st.replace_text_in_range(None, "abc"));
         assert!(!st.replace_and_mark_text_in_range(None, "abc", None));
         assert!(!st.undo());
@@ -1146,6 +1817,192 @@ mod tests {
 
         st.select_word_at(6);
         assert_eq!(st.copy().as_deref(), Some("Decompiled"));
+        // Selection actions stay allowed in read-only mode.
+        assert!(st.extend_selection(None));
+        assert!(st.shrink_selection());
+        st.set_caret(6);
+        assert!(st.select_all_occurrences());
+        assert!(st.unselect_occurrence());
         assert_eq!(text(&st), "class Decompiled {}");
+    }
+
+    #[test]
+    fn delete_lines_handles_single_last_multicursor_and_undo() {
+        let mut st = EditorState::from_text("one\ntwo\nthree");
+        st.set_line_col(2, 2);
+        assert!(st.delete_lines());
+        assert_eq!(text(&st), "one\nthree");
+        assert_eq!(st.primary_line_col().0, 2);
+        assert!(st.undo());
+        assert_eq!(text(&st), "one\ntwo\nthree");
+
+        // Deleting last line without trailing newline removes preceding EOL too.
+        st.set_line_col(3, 2);
+        assert!(st.delete_lines());
+        assert_eq!(text(&st), "one\ntwo");
+        assert_eq!(st.primary_line_col(), (2, 4));
+
+        // Multi-cursor delete lines merges into one undo step.
+        let mut multi = EditorState::from_text("a\nb\nc\nd\n");
+        multi.set_caret(0);
+        multi.add_cursor_at(4);
+        assert!(multi.delete_lines());
+        assert_eq!(text(&multi), "b\nd\n");
+        assert!(multi.undo());
+        assert_eq!(text(&multi), "a\nb\nc\nd\n");
+    }
+
+    #[test]
+    fn toggle_block_comment_wraps_unwraps_and_inserts_at_caret() {
+        let mut st = EditorState::from_text("int value = 42;");
+        let start = text(&st).find("value").unwrap();
+        st.set_selection(start, start + "value".len());
+        assert!(st.toggle_block_comment("/*", "*/"));
+        assert_eq!(text(&st), "int /*value*/ = 42;");
+        assert!(st.toggle_block_comment("/*", "*/"));
+        assert_eq!(text(&st), "int value = 42;");
+
+        // Empty caret inside an existing block removes delimiters; outside inserts `/*  */`.
+        let mut empty = EditorState::from_text("alpha /* inside */ omega");
+        let inside = text(&empty).find("inside").unwrap() + 2;
+        empty.set_caret(inside);
+        assert!(empty.toggle_block_comment("/*", "*/"));
+        assert_eq!(text(&empty), "alpha  inside  omega");
+
+        let mut blank = EditorState::from_text("abc");
+        blank.set_caret(1);
+        assert!(blank.toggle_block_comment("/*", "*/"));
+        assert_eq!(text(&blank), "a/*  */bc");
+        assert_eq!(blank.primary_head(), 4);
+    }
+
+    #[test]
+    fn move_lines_swaps_single_and_multiline_blocks_preserving_eof() {
+        let mut st = EditorState::from_text("first\nsecond\nthird");
+        st.set_line_col(3, 3);
+        assert!(!st.move_lines(false));
+        assert!(st.move_lines(true));
+        assert_eq!(text(&st), "first\nthird\nsecond");
+        assert_eq!(st.primary_line_col(), (2, 3));
+        assert!(st.move_lines(true));
+        assert_eq!(text(&st), "third\nfirst\nsecond");
+        assert!(!st.move_lines(true));
+        assert!(st.move_lines(false));
+        assert_eq!(text(&st), "first\nthird\nsecond");
+
+        // Multi-line selection moves together as one undo transaction.
+        let mut block = EditorState::from_text("0\n11\n22\n3");
+        block.set_selection(2, 7); // "11\n22"
+        assert!(block.move_lines(false));
+        assert_eq!(text(&block), "0\n3\n11\n22");
+        let sel = *block.selections().primary();
+        assert_eq!(&text(&block)[sel.range()], "11\n22");
+        assert!(block.undo());
+        assert_eq!(text(&block), "0\n11\n22\n3");
+    }
+
+    #[test]
+    fn extend_and_shrink_selection_uses_ast_and_fallback_stack() {
+        use kova_syntax::{Highlighter, LanguageRegistry, SyntaxEngine, SyntaxEngineConfig};
+        use kova_theme::SyntaxLanguage;
+
+        let src = "class Foo {\n    int bar = (1 + 2);\n}\n";
+        let registry = LanguageRegistry::with_defaults().unwrap();
+        let engine = SyntaxEngine::new(
+            registry.clone(),
+            SyntaxEngineConfig {
+                worker_threads: 1,
+                ..SyntaxEngineConfig::default()
+            },
+        )
+        .unwrap();
+        let mut st = EditorState::from_text(src);
+        let snap = st.snapshot();
+        let tree = engine
+            .parse_sync(SyntaxLanguage::Java, &snap, None)
+            .unwrap();
+        let syntax = EditorSyntax::build(tree, snap, Highlighter::new(registry));
+
+        let bar_pos = src.find("bar").unwrap() + 1;
+        st.set_caret(bar_pos);
+        assert!(st.extend_selection(Some(&syntax)));
+        assert_eq!(&text(&st)[st.selections().primary().range()], "bar");
+
+        let mut steps = Vec::new();
+        while st.extend_selection(Some(&syntax)) {
+            let r = st.selections().primary().range();
+            steps.push(text(&st)[r].to_owned());
+        }
+        assert!(steps.iter().any(|s| s.contains("int bar = (1 + 2);")));
+        assert_eq!(steps.last().map(String::as_str), Some(src));
+
+        // Shrink unwinds back to the original empty caret.
+        for _ in 0..=steps.len() {
+            assert!(st.shrink_selection());
+        }
+        assert!(!st.shrink_selection());
+        assert!(st.selections().primary().is_empty());
+        assert_eq!(st.primary_head(), bar_pos);
+
+        // Fallback without AST handles delimiters, line, and whole buffer.
+        let mut plain = EditorState::from_text("call(alpha, beta)\nnext");
+        let a_pos = text(&plain).find("alpha").unwrap() + 2;
+        plain.set_caret(a_pos);
+        assert!(plain.extend_selection(None));
+        assert_eq!(&text(&plain)[plain.selections().primary().range()], "alpha");
+        assert!(plain.extend_selection(None));
+        assert_eq!(
+            &text(&plain)[plain.selections().primary().range()],
+            "alpha, beta"
+        );
+        assert!(plain.extend_selection(None));
+        assert_eq!(
+            &text(&plain)[plain.selections().primary().range()],
+            "(alpha, beta)"
+        );
+        assert!(plain.extend_selection(None));
+        assert_eq!(
+            &text(&plain)[plain.selections().primary().range()],
+            "call(alpha, beta)"
+        );
+        assert!(plain.shrink_selection());
+        assert_eq!(
+            &text(&plain)[plain.selections().primary().range()],
+            "(alpha, beta)"
+        );
+    }
+
+    #[test]
+    fn reformat_code_indents_braces_ignores_strings_and_trims_trailing_whitespace() {
+        let messy = "class A {   \nString s = \"}{}\";\t\n   int x = 1;  \n   \n}\n";
+        let mut st = EditorState::from_text(messy);
+        st.set_line_col(3, 5);
+        assert!(st.reformat_code(SourceLanguageKind::Java, 4));
+        assert_eq!(
+            text(&st),
+            "class A {\n    String s = \"}{}\";\n    int x = 1;\n\n}\n"
+        );
+        assert!(!st.reformat_code(SourceLanguageKind::Java, 4));
+        assert!(st.undo());
+        assert_eq!(text(&st), messy);
+    }
+
+    #[test]
+    fn unselect_and_select_all_occurrences_preserve_stack() {
+        let mut st = EditorState::from_text("item x = item + item;");
+        st.set_caret(1);
+        assert!(st.add_next_occurrence());
+        assert_eq!(st.cursor_count(), 1);
+        assert!(st.add_next_occurrence());
+        assert_eq!(st.cursor_count(), 2);
+        assert!(st.unselect_occurrence());
+        assert_eq!(st.cursor_count(), 1);
+        assert!(st.unselect_occurrence());
+        assert!(st.selections().primary().is_empty());
+
+        assert!(st.select_all_occurrences());
+        assert_eq!(st.cursor_count(), 3);
+        assert!(st.unselect_occurrence());
+        assert_eq!(st.cursor_count(), 1);
     }
 }

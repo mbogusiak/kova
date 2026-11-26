@@ -187,12 +187,9 @@ pub fn menu_key_bindings(platform: Platform) -> Vec<KeyBinding> {
     let key = |action: &str, fallback: &str| preset_keystroke(platform, action, fallback);
     let mut bindings = Vec::new();
     if platform == Platform::MacOs {
-        // `Ctrl+O` / `Ctrl+Q` belong to the shell and Vim on Linux: menu-only there.
-        bindings.extend([
-            KeyBinding::new("cmd-o", OpenProject, None),
-            KeyBinding::new("cmd-shift-o", OpenFile, None),
-            KeyBinding::new("cmd-q", Quit, None),
-        ]);
+        // `Cmd+O` / `Cmd+Shift+O` belong to IntelliJ Go to Class / Go to File;
+        // `Ctrl+O` / `Ctrl+Q` belong to the shell and Vim on Linux.
+        bindings.push(KeyBinding::new("cmd-q", Quit, None));
     }
     bindings.extend([
         KeyBinding::new(
@@ -371,8 +368,13 @@ mod tests {
                 .map(|(_, key)| key.clone())
                 .unwrap()
         };
-        assert_eq!(find(&mac, "kova_menu::OpenProject"), "cmd-o");
-        assert_eq!(find(&mac, "kova_menu::OpenFile"), "cmd-shift-o");
+        assert!(mac.iter().all(|(action, key)| {
+            !matches!(
+                action.as_str(),
+                "kova_menu::OpenProject" | "kova_menu::OpenFile"
+            ) && key != "cmd-o"
+                && key != "cmd-shift-o"
+        }));
         assert_eq!(find(&mac, "kova_menu::Quit"), "cmd-q");
         assert_eq!(find(&mac, "kova_menu::OpenSettings"), "cmd-,");
         assert_eq!(find(&mac, "kova_menu::CloseTab"), "cmd-w");

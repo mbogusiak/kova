@@ -232,6 +232,51 @@ impl BottomPanelModel {
     pub fn selected_problem(&self) -> Option<&ProblemEntry> {
         self.problems.get(self.selected_problem)
     }
+
+    /// Returns the index of the next diagnostic after `(current_file, line, col)` with wrap-around.
+    #[must_use]
+    pub fn next_problem_index(
+        &self,
+        current_file: Option<&str>,
+        line: usize,
+        col: usize,
+    ) -> Option<usize> {
+        if self.problems.is_empty() {
+            return None;
+        }
+        let Some(file) = current_file else {
+            return Some((self.selected_problem + 1) % self.problems.len());
+        };
+        Some(
+            self.problems
+                .iter()
+                .position(|p| (p.file.as_str(), p.line, p.col) > (file, line, col))
+                .unwrap_or(0),
+        )
+    }
+
+    /// Returns the index of the previous diagnostic before `(current_file, line, col)` with wrap-around.
+    #[must_use]
+    pub fn prev_problem_index(
+        &self,
+        current_file: Option<&str>,
+        line: usize,
+        col: usize,
+    ) -> Option<usize> {
+        if self.problems.is_empty() {
+            return None;
+        }
+        let len = self.problems.len();
+        let Some(file) = current_file else {
+            return Some((self.selected_problem + len - 1) % len);
+        };
+        Some(
+            self.problems
+                .iter()
+                .rposition(|p| (p.file.as_str(), p.line, p.col) < (file, line, col))
+                .unwrap_or(len - 1),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -303,5 +348,26 @@ mod tests {
             assert_eq!(BottomTab::from_tool(tab.tool()), Some(tab));
         }
         assert_eq!(BottomTab::from_tool(DockToolId::Project), None);
+    }
+
+    #[test]
+    fn next_and_prev_problem_index_advance_and_wrap_around() {
+        let empty = BottomPanelModel::default();
+        assert_eq!(empty.next_problem_index(Some("A.java"), 1, 1), None);
+        assert_eq!(empty.prev_problem_index(Some("A.java"), 1, 1), None);
+
+        let model = BottomPanelModel::with_problems(vec![
+            entry("A.java", 4, ProblemSeverity::Error),
+            entry("A.java", 12, ProblemSeverity::Warning),
+            entry("B.java", 3, ProblemSeverity::Error),
+        ]);
+
+        assert_eq!(model.next_problem_index(Some("A.java"), 4, 5), Some(1));
+        assert_eq!(model.next_problem_index(Some("A.java"), 12, 5), Some(2));
+        assert_eq!(model.next_problem_index(Some("B.java"), 3, 5), Some(0));
+
+        assert_eq!(model.prev_problem_index(Some("A.java"), 4, 5), Some(2));
+        assert_eq!(model.prev_problem_index(Some("B.java"), 3, 5), Some(1));
+        assert_eq!(model.prev_problem_index(Some("A.java"), 12, 5), Some(0));
     }
 }

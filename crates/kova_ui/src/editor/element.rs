@@ -1106,6 +1106,8 @@ impl OverlayGeometry {
 #[derive(Debug)]
 struct Overlays {
     selections: Vec<Bounds<Pixels>>,
+    find_matches: Vec<Bounds<Pixels>>,
+    find_match_current: Vec<Bounds<Pixels>>,
     /// Caret rectangles with their corner radius.
     carets: Vec<(Bounds<Pixels>, f32)>,
     /// Glyph under each block caret: `(origin, text)` (shaped in prepaint into `caret_glyphs`).
@@ -1140,6 +1142,18 @@ fn paint_content(
     };
     for &rect in &overlays.selections {
         window.paint_quad(fill(rect, selection_color));
+    }
+    if !overlays.find_matches.is_empty() {
+        let match_color = hsla_from_rgba(theme.editor().find_match);
+        for &rect in &overlays.find_matches {
+            window.paint_quad(fill(rect, match_color));
+        }
+    }
+    if !overlays.find_match_current.is_empty() {
+        let current_color = hsla_from_rgba(theme.editor().find_match_current);
+        for &rect in &overlays.find_match_current {
+            window.paint_quad(fill(rect, current_color));
+        }
     }
     let line_height = px(prepaint.line_height_px);
     for (row, shaped, x_offset) in &prepaint.shaped_lines {
@@ -1222,6 +1236,8 @@ fn compute_overlays(
 ) -> Overlays {
     let mut out = Overlays {
         selections: Vec::new(),
+        find_matches: Vec::new(),
+        find_match_current: Vec::new(),
         carets: Vec::new(),
         block_glyphs: Vec::new(),
         caret_glyphs: Vec::new(),
@@ -1235,6 +1251,8 @@ fn compute_overlays(
     let lh = geom.line_height_px;
     let row_y = |visual_row: usize| geom.row_y(visual_row);
     let visible = editor.visible_shaped_lines();
+
+    collect_find_match_overlays(editor, snapshot, visible, geom, &mut out);
 
     for sel in editor.selections().as_slice() {
         if !sel.is_empty() {
@@ -1317,6 +1335,49 @@ fn compute_overlays(
             Some(Bounds::new(point(px(x1), px(y)), size(px(x2 - x1), px(lh))));
     }
     out
+}
+
+fn collect_find_match_overlays(
+    editor: &EditorView,
+    snapshot: &BufferSnapshot,
+    visible: &[VisibleShapedLine],
+    geom: OverlayGeometry,
+    out: &mut Overlays,
+) {
+    if !editor.is_find_bar_open() || visible.is_empty() {
+        return;
+    }
+    let matches = editor.find_bar().matches();
+    if matches.is_empty() {
+        return;
+    }
+    let first_row = visible[0].row;
+    let last_row = visible[visible.len() - 1].row;
+    let first_byte = snapshot.rope().line_to_byte(first_row);
+    let last_byte =
+        snapshot.rope().line_to_byte(last_row) + snapshot.line_len_bytes(last_row).unwrap_or(0);
+    let start_idx = matches.partition_point(|m| m.end <= first_byte);
+    let current_idx = editor.find_bar().current_match();
+    let lh = geom.line_height_px;
+    for (offset, range) in matches[start_idx..].iter().enumerate() {
+        if range.start >= last_byte {
+            break;
+        }
+        let is_current = current_idx == Some(start_idx + offset);
+        for line in visible {
+            if let Some((x1, x2)) = span_x_range(snapshot, line, range, false, geom) {
+                let rect = Bounds::new(
+                    point(px(x1), px(geom.row_y(line.visual_row))),
+                    size(px(x2 - x1), px(lh)),
+                );
+                if is_current {
+                    out.find_match_current.push(rect);
+                } else {
+                    out.find_matches.push(rect);
+                }
+            }
+        }
+    }
 }
 
 impl EditorCanvasElement {

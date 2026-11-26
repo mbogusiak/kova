@@ -449,6 +449,17 @@ mod tests {
             buf.snapshot().text(),
             "int beta1 = 1;\nint beta2 = 2;\nint beta3 = 3;\n"
         );
+
+        let occ_buf = Buffer::from_text("int item = 1;\nint item = 2;\nint item = 3;\n");
+        let mut occ = SelectionSet::caret(4);
+        assert!(occ.select_all_occurrences(&occ_buf.snapshot()));
+        assert_eq!(occ.len(), 3);
+        assert!(!occ.select_all_occurrences(&occ_buf.snapshot()));
+        assert!(occ.remove_primary());
+        assert_eq!(occ.len(), 2);
+        assert!(occ.remove_primary());
+        assert_eq!(occ.len(), 1);
+        assert!(!occ.remove_primary());
     }
 
     #[test]

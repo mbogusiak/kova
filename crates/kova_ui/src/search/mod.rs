@@ -5,12 +5,17 @@
 //! ([`modal::SearchEverywhereModal`]).
 
 pub mod engine;
+pub mod find_in_files;
 pub mod modal;
 
 use std::path::PathBuf;
 
 pub use engine::{
     MAX_SEARCH_HITS, SearchEngine, char_indices_to_byte_ranges, parse_query_and_line,
+};
+pub use find_in_files::{
+    FindInFilesHit, FindInFilesKeyOutcome, FindInFilesModal, FindInFilesState,
+    MAX_FIND_IN_FILES_HITS, search_text_in_buffers_and_paths,
 };
 pub use modal::{SearchEverywhereModal, SearchEverywhereState, SearchKeyOutcome};
 
