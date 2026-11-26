@@ -9,6 +9,7 @@
 //! All background work starts only after the first frame, keeping cold start `< 120 ms`.
 
 pub mod cli;
+pub mod completion;
 pub mod debug_sessions;
 pub mod definition;
 pub mod io;
@@ -179,6 +180,13 @@ pub enum AppEvent {
         request_id: u64,
         /// Resolution outcome.
         outcome: kova_ui::DefinitionOutcome,
+    },
+    /// Code-completion proposals arrived from Level 1 or Level 2 (`jdt.ls`) (`KOVA-052`).
+    CompletionResolved {
+        /// Request identifier for stale-reply filtering.
+        request_id: u64,
+        /// Resolution outcome.
+        outcome: kova_ui::CompletionOutcome,
     },
 }
 
@@ -362,6 +370,10 @@ pub fn handle_app_event(
             request_id,
             outcome,
         } => shell.apply_definition_result(request_id, outcome, window, cx),
+        AppEvent::CompletionResolved {
+            request_id,
+            outcome,
+        } => shell.apply_completion_result(request_id, outcome, cx),
     }
 }
 
@@ -522,6 +534,7 @@ fn install_shell_sinks(
         events.clone(),
     ));
     shell.set_definition_sink(definition::definition_sink(runtime.clone(), events.clone()));
+    shell.set_completion_sink(completion::completion_sink(runtime.clone(), events.clone()));
 }
 
 fn default_window_options(cx: &App) -> WindowOptions {

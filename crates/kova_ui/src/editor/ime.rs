@@ -10,7 +10,7 @@ use gpui::{
     Bounds, Context, EntityInputHandler, Pixels, Point, UTF16Selection, Window, point, px, size,
 };
 
-use crate::editor::EditorView;
+use crate::editor::{EditorEvent, EditorView};
 
 impl EntityInputHandler for EditorView {
     fn text_for_range(
@@ -70,6 +70,13 @@ impl EntityInputHandler for EditorView {
             .state
             .replace_text_in_range(range_utf16.as_ref(), new_text);
         self.finish_input(started, true, cx);
+        if self.state.cursor_count() == 1 && (new_text == "." || new_text == ":") {
+            let ch = if new_text == "." { '.' } else { ':' };
+            cx.emit(EditorEvent::CompletionAutoTrigger {
+                ch,
+                cursor_byte: self.state.primary_head(),
+            });
+        }
     }
 
     fn replace_and_mark_text_in_range(

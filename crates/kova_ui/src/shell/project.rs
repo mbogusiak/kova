@@ -108,6 +108,8 @@ impl WorkspaceShell {
         self.nav_history.clear();
         self.pending_definition_request = None;
         self.queued_go_to_definition_byte = None;
+        self.close_completion_popup(cx);
+        self.next_completion_request_id = self.next_completion_request_id.wrapping_add(1);
         self.doc_notice = None;
         self.close_after_save = None;
         self.ex_line = None;

@@ -27,6 +27,7 @@ use gpui::{
 };
 use kova_buffer::{Buffer, BufferSnapshot};
 use kova_core::builtin_actions::builtin_action_registry_ref;
+use kova_core::completion::{CompletionTriggerKind, should_auto_trigger_completion};
 use kova_core::jetbrains_keymap_layer_ref;
 use kova_core::navigation::{
     NavLocation, NavigationHistory, SourceLanguageKind, extract_symbol_query,
@@ -41,6 +42,7 @@ use kova_syntax::{
 };
 use kova_theme::SyntaxLanguage;
 
+mod completion;
 mod debug;
 mod git;
 mod project;
@@ -63,10 +65,11 @@ use crate::dock::{
     TreeActivation, VimModeBadge,
 };
 use crate::document::{
-    DefinitionOutcome, DefinitionRequest, DefinitionSink, DefinitionTargetKind, DocumentState,
-    SAVE_PATH_REQUIRED_MESSAGE, SaveAction, SaveSink, SaveTicket, StatusKind,
+    CompletionSink, DefinitionOutcome, DefinitionRequest, DefinitionSink, DefinitionTargetKind,
+    DocumentState, SAVE_PATH_REQUIRED_MESSAGE, SaveAction, SaveSink, SaveTicket, StatusKind,
 };
 use crate::editor::actions::{Save, WORKSPACE_KEY_CONTEXT};
+use crate::editor::completion::CompletionPopupState;
 use crate::editor::syntax::{EditorSyntax, RunEntryPointRequested};
 use crate::editor::vim::VimKeyResult;
 use crate::editor::{EditorEvent, EditorView, SharedBuffer, is_go_to_def_modifiers};
@@ -488,6 +491,13 @@ pub struct WorkspaceShell {
     queued_go_to_definition_byte: Option<usize>,
     /// Document keys opened in read-only mode (decompiled / external library sources).
     read_only_docs: HashSet<PathBuf>,
+    /// Floating code-completion popup state (`KOVA-052`).
+    completion_popup: CompletionPopupState,
+    completion_scroll: UniformListScrollHandle,
+    completion_sink: Option<CompletionSink>,
+    next_completion_request_id: u64,
+    pending_completion_request_id: Option<u64>,
+    completion_origin: Option<(PaneId, TabId)>,
 }
 
 impl fmt::Debug for WorkspaceShell {
@@ -525,37 +535,8 @@ impl WorkspaceShell {
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let root_pane = PaneId(1);
-        let welcome_path = PathBuf::from(WELCOME_DOCUMENT_PATH);
-        let welcome = cx.new(|cx| {
-            let mut editor = EditorView::welcome_demo(cx);
-            editor.set_language_hint(SourceLanguageKind::from_path(&welcome_path));
-            editor
-        });
-        let welcome_buffer = welcome.read(cx).shared_buffer();
-
-        let mut pane = PaneState::new(root_pane);
-        let tab = pane.tabs.open_or_focus(
-            Some(&welcome_path),
-            file_title(&welcome_path),
-            language_label(&welcome_path),
-        );
-        let subscription = Self::subscribe_editor(&welcome, root_pane, tab, cx);
-        pane.editors.insert(tab, welcome);
-        pane.subscriptions.insert(tab, subscription);
-
-        let mut panes = HashMap::new();
-        panes.insert(root_pane, pane);
-        let mut doc_states = HashMap::new();
-        // The welcome buffer has no file on disk: `Cmd+S` asks for a path (*Save As*).
-        doc_states.insert(
-            welcome_path.clone(),
-            DocumentState::opened(None, welcome_buffer.version().as_u64(), false),
-        );
-        let mut documents = HashMap::new();
-        documents.insert(welcome_path.clone(), welcome_buffer);
-
-        let mut project_tree = ProjectTreeModel::from_nodes(demo_project_nodes());
-        project_tree.reveal_path(Path::new(WELCOME_DOCUMENT_PATH));
+        let (welcome_path, panes, documents, doc_states, project_tree) =
+            Self::initial_welcome_workspace(root_pane, cx);
 
         Self {
             process_start,
@@ -628,7 +609,61 @@ impl WorkspaceShell {
             pending_definition_request: None,
             queued_go_to_definition_byte: None,
             read_only_docs: HashSet::new(),
+            completion_popup: CompletionPopupState::new(),
+            completion_scroll: UniformListScrollHandle::new(),
+            completion_sink: None,
+            next_completion_request_id: 1,
+            pending_completion_request_id: None,
+            completion_origin: None,
         }
+    }
+
+    #[allow(
+        clippy::type_complexity,
+        reason = "internal tuple returning the initial welcome workspace collections"
+    )]
+    fn initial_welcome_workspace(
+        root_pane: PaneId,
+        cx: &mut Context<'_, Self>,
+    ) -> (
+        PathBuf,
+        HashMap<PaneId, PaneState>,
+        HashMap<PathBuf, SharedBuffer>,
+        HashMap<PathBuf, DocumentState>,
+        ProjectTreeModel,
+    ) {
+        let welcome_path = PathBuf::from(WELCOME_DOCUMENT_PATH);
+        let welcome = cx.new(|cx| {
+            let mut editor = EditorView::welcome_demo(cx);
+            editor.set_language_hint(SourceLanguageKind::from_path(&welcome_path));
+            editor
+        });
+        let welcome_buffer = welcome.read(cx).shared_buffer();
+
+        let mut pane = PaneState::new(root_pane);
+        let tab = pane.tabs.open_or_focus(
+            Some(&welcome_path),
+            file_title(&welcome_path),
+            language_label(&welcome_path),
+        );
+        let subscription = Self::subscribe_editor(&welcome, root_pane, tab, cx);
+        pane.editors.insert(tab, welcome);
+        pane.subscriptions.insert(tab, subscription);
+
+        let mut panes = HashMap::new();
+        panes.insert(root_pane, pane);
+        let mut doc_states = HashMap::new();
+        // The welcome buffer has no file on disk: `Cmd+S` asks for a path (*Save As*).
+        doc_states.insert(
+            welcome_path.clone(),
+            DocumentState::opened(None, welcome_buffer.version().as_u64(), false),
+        );
+        let mut documents = HashMap::new();
+        documents.insert(welcome_path.clone(), welcome_buffer);
+
+        let mut project_tree = ProjectTreeModel::from_nodes(demo_project_nodes());
+        project_tree.reveal_path(Path::new(WELCOME_DOCUMENT_PATH));
+        (welcome_path, panes, documents, doc_states, project_tree)
     }
 
     /// Sets the project directory whose tree is loaded asynchronously after the first frame.
@@ -872,6 +907,9 @@ impl WorkspaceShell {
     ) {
         match event {
             EditorEvent::Focused => {
+                if self.completion_origin != Some((pane, tab)) {
+                    self.close_completion_popup(cx);
+                }
                 if let Some(state) = self.panes.get_mut(&pane) {
                     state.tabs.select_tab(tab);
                 }
@@ -880,6 +918,13 @@ impl WorkspaceShell {
                 cx.notify();
             }
             EditorEvent::Edited => {
+                if self.completion_popup.is_open() {
+                    if self.completion_origin == Some((pane, tab)) {
+                        self.sync_completion_popup_after_edit(editor, cx);
+                    } else {
+                        self.close_completion_popup(cx);
+                    }
+                }
                 let buffer = editor.read(cx).shared_buffer();
                 let mut dirty_path = None;
                 for state in self.panes.values_mut() {
@@ -935,6 +980,17 @@ impl WorkspaceShell {
                 if !self.dispatch_definition_to_sink(Some(*byte), cx) {
                     self.queued_go_to_definition_byte = Some(*byte);
                     cx.notify();
+                }
+            }
+            EditorEvent::CompletionAutoTrigger { ch, cursor_byte } => {
+                if self.active_editor().is_some_and(|active| active == editor) {
+                    let (snapshot, lang) = {
+                        let ed = editor.read(cx);
+                        (ed.snapshot(), ed.language_hint())
+                    };
+                    if should_auto_trigger_completion(&snapshot, lang, *cursor_byte, *ch) {
+                        self.trigger_completion(CompletionTriggerKind::AutoChar(*ch), cx);
+                    }
                 }
             }
         }
@@ -1319,6 +1375,7 @@ impl WorkspaceShell {
             }
         }
         if changed {
+            self.close_completion_popup(cx);
             self.refresh_analysis(Duration::ZERO, cx);
         }
     }
@@ -1497,6 +1554,7 @@ impl WorkspaceShell {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.close_completion_popup(cx);
         let pane_id = self.active_pane;
         let existing = self
             .panes
@@ -1584,6 +1642,7 @@ impl WorkspaceShell {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.close_completion_popup(cx);
         let path = if let Some(state) = self.panes.get_mut(&pane) {
             state.tabs.select_tab(tab);
             state.tabs.active_tab().and_then(|t| t.path.clone())
@@ -2132,48 +2191,8 @@ impl WorkspaceShell {
     ) {
         self.keymap.cancel_modifier_tap();
         let keystroke = &event.keystroke;
-        if self.settings_open {
-            self.handle_settings_key(keystroke, window, cx);
-            cx.stop_propagation();
+        if self.handle_overlay_key_capture(keystroke, window, cx) {
             return;
-        }
-        if self.handle_commit_panel_key(keystroke, window, cx) {
-            return;
-        }
-        // *Evaluate Expression* (`Alt+F8`) owns every key while open (`KOVA-041`).
-        if self.handle_evaluate_key(keystroke, cx) {
-            cx.stop_propagation();
-            return;
-        }
-        if self.ex_line.is_some() {
-            self.handle_ex_key(keystroke, window, cx);
-            cx.stop_propagation();
-            return;
-        }
-        if self.search_everywhere.is_open() {
-            self.handle_search_everywhere_key(keystroke, window, cx);
-            cx.stop_propagation();
-            return;
-        }
-        if self.find_in_files.is_open() {
-            self.handle_find_in_files_key(keystroke, window, cx);
-            cx.stop_propagation();
-            return;
-        }
-        if self.handle_find_bar_capture(keystroke, window, cx) {
-            return;
-        }
-        // Terminal focused: its own shortcuts first, `Cmd` chords to the IDE keymap, every
-        // other key bubbles to the session (`Ctrl+C`, `Ctrl+W`, `Esc`, `j`/`k` …).
-        if let Some(dock) = self.terminal_focused(window, cx) {
-            if let Some(shortcut) = terminal_shortcut(keystroke, cfg!(target_os = "macos")) {
-                self.run_terminal_shortcut(shortcut, &dock, window, cx);
-                cx.stop_propagation();
-                return;
-            }
-            if !keystroke.modifiers.platform {
-                return;
-            }
         }
         let (editor, ctx) = self.active_editor_and_dispatch_context(window, cx);
         let (vim_status, vim_owns_keys) = editor.as_ref().map_or((None, false), |editor| {
@@ -2234,6 +2253,58 @@ impl WorkspaceShell {
                 self.dispatch_keymap(keystroke, ctx, window, cx);
             }
         }
+    }
+
+    fn handle_overlay_key_capture(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if self.settings_open {
+            self.handle_settings_key(keystroke, window, cx);
+            cx.stop_propagation();
+            return true;
+        }
+        if self.handle_commit_panel_key(keystroke, window, cx) {
+            return true;
+        }
+        // *Evaluate Expression* (`Alt+F8`) owns every key while open (`KOVA-041`).
+        if self.handle_evaluate_key(keystroke, cx) {
+            cx.stop_propagation();
+            return true;
+        }
+        if self.ex_line.is_some() {
+            self.handle_ex_key(keystroke, window, cx);
+            cx.stop_propagation();
+            return true;
+        }
+        if self.search_everywhere.is_open() {
+            self.handle_search_everywhere_key(keystroke, window, cx);
+            cx.stop_propagation();
+            return true;
+        }
+        if self.find_in_files.is_open() {
+            self.handle_find_in_files_key(keystroke, window, cx);
+            cx.stop_propagation();
+            return true;
+        }
+        if self.handle_find_bar_capture(keystroke, window, cx) {
+            return true;
+        }
+        // Terminal focused: its own shortcuts first, `Cmd` chords to the IDE keymap, every
+        // other key bubbles to the session (`Ctrl+C`, `Ctrl+W`, `Esc`, `j`/`k` …).
+        if let Some(dock) = self.terminal_focused(window, cx) {
+            if let Some(shortcut) = terminal_shortcut(keystroke, cfg!(target_os = "macos")) {
+                self.run_terminal_shortcut(shortcut, &dock, window, cx);
+                cx.stop_propagation();
+                return true;
+            }
+            if !keystroke.modifiers.platform {
+                return true;
+            }
+        }
+        self.completion_popup.is_open() && self.handle_completion_key_capture(keystroke, window, cx)
     }
 
     fn handle_find_bar_capture(
@@ -2393,6 +2464,9 @@ impl WorkspaceShell {
             ShellAction::OpenSettings => self.open_settings(window, cx),
             ShellAction::ToggleCommitPanel => self.toggle_commit_panel(window, cx),
             ShellAction::GoToDefinition => self.go_to_definition_at(None, window, cx),
+            ShellAction::CompleteBasic => {
+                self.trigger_completion(CompletionTriggerKind::Invoked, cx);
+            }
             ShellAction::NavigateBack => self.navigate_back(window, cx),
             ShellAction::NavigateForward => self.navigate_forward(window, cx),
             ShellAction::Debug(action) => self.run_debug_action(action, window, cx),
@@ -2442,6 +2516,17 @@ impl WorkspaceShell {
     /// Installs the host *Go to Definition* resolver (`KOVA-051`).
     pub fn set_definition_sink(&mut self, sink: DefinitionSink) {
         self.definition_sink = Some(sink);
+    }
+
+    /// Installs the host code-completion resolver (`KOVA-052`).
+    pub fn set_completion_sink(&mut self, sink: CompletionSink) {
+        self.completion_sink = Some(sink);
+    }
+
+    /// Returns the headless code-completion popup state (`KOVA-052`).
+    #[must_use]
+    pub const fn completion_popup(&self) -> &CompletionPopupState {
+        &self.completion_popup
     }
 
     /// Current cursor navigation history (`Back`/`Forward`).
@@ -2782,6 +2867,7 @@ impl WorkspaceShell {
             return;
         }
         let return_focus = window.focused(cx);
+        self.close_completion_popup(cx);
         self.ex_line = None;
         self.keymap.reset();
         self.chord_hint = None;
@@ -2807,6 +2893,7 @@ impl WorkspaceShell {
             return;
         }
         let return_focus = window.focused(cx);
+        self.close_completion_popup(cx);
         self.ex_line = None;
         self.keymap.reset();
         self.chord_hint = None;
@@ -2820,6 +2907,7 @@ impl WorkspaceShell {
     /// Opens *Recent Files* (`Cmd+E` / `Ctrl+E`) in MRU order.
     pub fn open_recent_files(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let return_focus = window.focused(cx);
+        self.close_completion_popup(cx);
         self.ex_line = None;
         self.keymap.reset();
         self.chord_hint = None;
@@ -2900,6 +2988,7 @@ impl WorkspaceShell {
     /// Opens *Find in Files* (`Cmd+Shift+F` / `Ctrl+Shift+F`) and starts an off-thread scan.
     pub fn open_find_in_files(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let return_focus = window.focused(cx);
+        self.close_completion_popup(cx);
         self.ex_line = None;
         self.keymap.reset();
         self.chord_hint = None;
@@ -3354,6 +3443,7 @@ impl WorkspaceShell {
             }
         }
         self.settings_open = true;
+        self.close_completion_popup(cx);
         self.ex_line = None;
         self.keymap.reset();
         self.chord_hint = None;
@@ -5584,8 +5674,13 @@ impl Render for WorkspaceShell {
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+            .capture_any_mouse_down(cx.listener(Self::handle_completion_outside_click))
             .child(self.render_titlebar(p))
             .child(workspace);
+        let root = match self.render_completion_overlay(cx) {
+            Some(overlay) => root.child(overlay),
+            None => root,
+        };
         let root = match self.render_evaluate_overlay(p, cx) {
             Some(overlay) => root.child(overlay),
             None => root,

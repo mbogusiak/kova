@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use kova_buffer::BufferSnapshot;
 
 /// Hard time budget for Level-1 disk scanning across workspace files.
-const LEVEL1_SCAN_BUDGET: Duration = Duration::from_millis(12);
+pub(crate) const LEVEL1_SCAN_BUDGET: Duration = Duration::from_millis(12);
 
 /// Build/VCS directories skipped during workspace candidate scanning.
 const IGNORED_DIRS: &[&str] = &[
@@ -25,7 +25,7 @@ const IGNORED_DIRS: &[&str] = &[
     ".kova",
 ];
 
-const JAVA_KEYWORDS: &[&str] = &[
+pub(crate) const JAVA_KEYWORDS: &[&str] = &[
     "abstract",
     "assert",
     "boolean",
@@ -87,7 +87,7 @@ const JAVA_KEYWORDS: &[&str] = &[
     "permits",
 ];
 
-const KOTLIN_KEYWORDS: &[&str] = &[
+pub(crate) const KOTLIN_KEYWORDS: &[&str] = &[
     "abstract",
     "actual",
     "annotation",
@@ -154,7 +154,7 @@ const KOTLIN_KEYWORDS: &[&str] = &[
     "while",
 ];
 
-const RUST_KEYWORDS: &[&str] = &[
+pub(crate) const RUST_KEYWORDS: &[&str] = &[
     "Self", "abstract", "as", "async", "await", "become", "box", "break", "const", "continue",
     "crate", "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "if", "impl",
     "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub", "ref",
@@ -203,7 +203,7 @@ impl SourceLanguageKind {
         }
     }
 
-    fn matches_path(self, path: &Path) -> bool {
+    pub(crate) fn matches_path(self, path: &Path) -> bool {
         let other = Self::from_path(path);
         match self {
             Self::Java => other == Self::Java,
@@ -276,11 +276,11 @@ pub struct ResolvedLocation {
     pub symbol_name: String,
 }
 
-const fn is_ident_char(ch: char) -> bool {
+pub(crate) const fn is_ident_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
 
-const fn is_ident_start(ch: char) -> bool {
+pub(crate) const fn is_ident_start(ch: char) -> bool {
     ch.is_ascii_alphabetic() || ch == '_'
 }
 
@@ -358,7 +358,11 @@ fn identifier_range_in_line(
 
 /// Fast single-line lexical check rejecting line comments (`//`), Javadoc continuation lines
 /// (` * ...`), inline block comments (`/* ... */`), and string/char literals.
-fn is_inside_comment_or_string(line: &str, target_rel: usize, lang: SourceLanguageKind) -> bool {
+pub(crate) fn is_inside_comment_or_string(
+    line: &str,
+    target_rel: usize,
+    lang: SourceLanguageKind,
+) -> bool {
     let trimmed = line.trim_start();
     if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
         return true;
@@ -594,7 +598,7 @@ fn extract_import_path_up_to(
     (!cleaned.is_empty()).then(|| cleaned.to_owned())
 }
 
-fn parse_package_and_imports(
+pub(crate) fn parse_package_and_imports(
     text: &str,
     lang: SourceLanguageKind,
 ) -> (Option<String>, Vec<ImportEntry>) {
@@ -1015,7 +1019,7 @@ fn find_local_var_or_param(
     None
 }
 
-fn count_braces(line: &str) -> (isize, isize) {
+pub(crate) fn count_braces(line: &str) -> (isize, isize) {
     let trimmed = line.trim_start();
     if trimmed.starts_with("//") || trimmed.starts_with('*') {
         return (0, 0);
@@ -1164,7 +1168,7 @@ fn match_param_decl_in_line(line: &str, ident: &str, lang: SourceLanguageKind) -
     None
 }
 
-fn split_top_level_commas(s: &str) -> Vec<&str> {
+pub(crate) fn split_top_level_commas(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut angle = 0usize;
     let mut paren = 0usize;
@@ -1186,7 +1190,7 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     parts
 }
 
-fn find_exact_ident_at_start(s: &str, ident: &str) -> Option<usize> {
+pub(crate) fn find_exact_ident_at_start(s: &str, ident: &str) -> Option<usize> {
     if !s.starts_with(ident) {
         return None;
     }
@@ -1198,7 +1202,7 @@ fn find_exact_ident_at_start(s: &str, ident: &str) -> Option<usize> {
 }
 
 /// Matches `<Type> <ident>` at the start of `s`, returning the byte offset of `<ident>` within `s`.
-fn match_java_type_and_name(s: &str, ident: &str) -> Option<usize> {
+pub(crate) fn match_java_type_and_name(s: &str, ident: &str) -> Option<usize> {
     // Skip `<Type>` (identifier + optional generic `<...>` + optional `[]`/`...`).
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -1259,7 +1263,7 @@ fn match_java_type_and_name(s: &str, ident: &str) -> Option<usize> {
 /// Attempts lightweight type inference for a local variable or field `var_name` in `source_text`
 /// before `cursor_byte` (e.g. `OrderService service = ...` -> `"OrderService"`,
 /// `let service = OrderService::new()` -> `"OrderService"`).
-fn infer_receiver_type(
+pub(crate) fn infer_receiver_type(
     source_text: &str,
     cursor_byte: usize,
     var_name: &str,
@@ -1267,18 +1271,24 @@ fn infer_receiver_type(
 ) -> Option<String> {
     let search_slice = source_text.get(..cursor_byte).unwrap_or(source_text);
     for line in search_slice.lines().rev() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("//") || !trimmed.contains(var_name) {
+        let trimmed_line = line.trim();
+        if trimmed_line.starts_with("//") || !trimmed_line.contains(var_name) {
             continue;
         }
-        let found = match lang {
-            SourceLanguageKind::Java => infer_java_receiver_type(trimmed, var_name),
-            SourceLanguageKind::Kotlin => infer_kotlin_receiver_type(trimmed, var_name),
-            SourceLanguageKind::Rust => infer_rust_receiver_type(trimmed, var_name),
-            SourceLanguageKind::Unknown => None,
-        };
-        if found.is_some() {
-            return found;
+        for segment in trimmed_line.split_inclusive([';', '{', '}']).rev() {
+            let trimmed = segment.trim().trim_end_matches(['{', '}']).trim();
+            if trimmed.is_empty() || !trimmed.contains(var_name) {
+                continue;
+            }
+            let found = match lang {
+                SourceLanguageKind::Java => infer_java_receiver_type(trimmed, var_name),
+                SourceLanguageKind::Kotlin => infer_kotlin_receiver_type(trimmed, var_name),
+                SourceLanguageKind::Rust => infer_rust_receiver_type(trimmed, var_name),
+                SourceLanguageKind::Unknown => None,
+            };
+            if found.is_some() {
+                return found;
+            }
         }
     }
     None
@@ -1297,9 +1307,31 @@ fn infer_java_receiver_type(trimmed: &str, var_name: &str) -> Option<String> {
         return Some(ty);
     }
     let (_, rhs) = cleaned.split_once('=')?;
-    let new_ty = rhs.trim().strip_prefix("new ")?;
-    let ty_name: String = new_ty.chars().take_while(|c| is_ident_char(*c)).collect();
-    (!ty_name.is_empty()).then_some(ty_name)
+    let rhs_trim = rhs.trim();
+    if rhs_trim.starts_with('"') {
+        return Some("String".to_owned());
+    }
+    if let Some(new_ty) = rhs_trim.strip_prefix("new ") {
+        let ty_name: String = new_ty.chars().take_while(|c| is_ident_char(*c)).collect();
+        return (!ty_name.is_empty()).then_some(ty_name);
+    }
+    // Common Java static factory calls such as `List.of(...)`, `Optional.of(...)`, `Files.newBufferedReader(...)`.
+    let factory_head: String = rhs_trim.chars().take_while(|c| is_ident_char(*c)).collect();
+    if factory_head
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+        && rhs_trim[factory_head.len()..].starts_with('.')
+    {
+        return match factory_head.as_str() {
+            "List" | "Set" | "Map" | "Optional" | "Stream" | "Path" | "Paths" | "LocalDate"
+            | "LocalDateTime" | "Instant" | "Duration" | "StringBuilder" | "String" => {
+                Some(factory_head)
+            }
+            _ => None,
+        };
+    }
+    None
 }
 
 fn infer_kotlin_receiver_type(trimmed: &str, var_name: &str) -> Option<String> {
@@ -1536,7 +1568,7 @@ fn expected_import_suffixes(query: &SymbolQuery, target_type: Option<&str>) -> V
     suffixes
 }
 
-fn to_snake_case(name: &str) -> String {
+pub(crate) fn to_snake_case(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 4);
     for (i, ch) in name.chars().enumerate() {
         if ch.is_ascii_uppercase() {
@@ -1551,7 +1583,7 @@ fn to_snake_case(name: &str) -> String {
     out
 }
 
-fn is_ignored_path(path: &Path) -> bool {
+pub(crate) fn is_ignored_path(path: &Path) -> bool {
     path.components().any(|comp| {
         comp.as_os_str()
             .to_str()
@@ -1667,7 +1699,7 @@ fn find_type_decl_in_text(
     None
 }
 
-fn find_keyword_decl_in_line(line: &str, keyword: &str, name: &str) -> Option<usize> {
+pub(crate) fn find_keyword_decl_in_line(line: &str, keyword: &str, name: &str) -> Option<usize> {
     let mut from = 0;
     while let Some(found) = line[from..].find(keyword) {
         let start = from + found;

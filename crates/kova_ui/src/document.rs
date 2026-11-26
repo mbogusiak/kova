@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use kova_buffer::BufferSnapshot;
+use kova_core::completion::{CompletionProposal, CompletionTriggerKind};
 
 /// Status-bar message when saving an *Untitled* buffer without a path.
 pub const SAVE_PATH_REQUIRED_MESSAGE: &str = "Save path required (open via `kova <path>`)";
@@ -124,6 +125,54 @@ pub enum DefinitionOutcome {
 
 /// Callback that resolves a [`DefinitionRequest`] off the UI thread (`KOVA-051`).
 pub type DefinitionSink = Arc<dyn Fn(DefinitionRequest) + Send + Sync>;
+
+/// Request to compute code-completion proposals at `cursor_byte` (`KOVA-052`),
+/// dispatched to a host [`CompletionSink`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionRequest {
+    /// Monotonic request identifier so stale async replies can be discarded.
+    pub request_id: u64,
+    /// Open workspace root directory, if any.
+    pub project_root: Option<PathBuf>,
+    /// Active document key (project-relative inside workspace, or absolute outside).
+    pub source_path: PathBuf,
+    /// Full text snapshot of the active document.
+    pub source_text: String,
+    /// Byte offset of the caret when completion was requested.
+    pub cursor_byte: usize,
+    /// Trigger kind (`Invoked` for `Ctrl+Space` or `AutoChar('.')` / `AutoChar(':')`).
+    pub trigger_kind: CompletionTriggerKind,
+    /// In-memory contents of currently open buffers.
+    pub open_buffers: Vec<(PathBuf, String)>,
+    /// Project-relative paths from the workspace tree.
+    pub workspace_files: Vec<PathBuf>,
+}
+
+/// Outcome returned by the host [`CompletionSink`] for a [`CompletionRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionOutcome {
+    /// Proposals ready for display (either immediate Level 1 or merged Level 2 `jdt.ls`).
+    Ready {
+        /// Document byte offset where the replacement token starts (`anchor_byte..caret_byte`).
+        anchor_byte: usize,
+        /// Whether this session is a `::` method reference in Java/Kotlin.
+        is_method_reference: bool,
+        /// Identifier prefix already typed between `anchor_byte` and `cursor_byte`.
+        initial_prefix: String,
+        /// Proposals returned for this stage.
+        proposals: Vec<CompletionProposal>,
+        /// `true` when no further asynchronous stage (e.g. `jdt.ls`) will follow.
+        is_final: bool,
+    },
+    /// No proposals found for this stage.
+    Empty {
+        /// `true` when no further asynchronous stage will follow.
+        is_final: bool,
+    },
+}
+
+/// Callback that resolves a [`CompletionRequest`] off the UI thread (`KOVA-052`).
+pub type CompletionSink = Arc<dyn Fn(CompletionRequest) + Send + Sync>;
 
 /// Severity of the transient status-bar message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

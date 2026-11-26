@@ -5,6 +5,7 @@
 
 pub mod action;
 pub mod builtin_actions;
+pub mod completion;
 pub mod context;
 pub mod keymap;
 pub mod navigation;
@@ -18,6 +19,13 @@ pub use action::{
 pub use builtin_actions::{
     builtin_action_ids, builtin_action_registry, builtin_action_registry_ref,
     register_builtin_actions,
+};
+pub use completion::{
+    CompletionContext, CompletionProposal, CompletionProposalKind, CompletionSeparator,
+    CompletionSource, CompletionTextEdit, CompletionTriggerKind, LocalCompletionResult,
+    RankedProposal, ReceiverAccessKind, ReceiverTarget, extract_completion_context,
+    filter_and_rank_proposals, resolve_local_completion, score_completion_match,
+    should_auto_trigger_completion,
 };
 pub use context::{ContextExpr, ContextExprError, ContextState, FocusContext, FocusStack};
 pub use keymap::{

@@ -2,6 +2,7 @@
 //! keyboard, IME, mouse and clipboard input (`< 5 ms` dispatch).
 
 pub mod actions;
+pub mod completion;
 pub mod element;
 pub mod find;
 pub mod folding;
@@ -25,11 +26,13 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point,
     Render, ScrollWheelEvent, ShapedLine, SharedString, Styled as _, Task, Window, div, px,
 };
-use kova_buffer::{Buffer, BufferSnapshot, BufferVersion, Motion, SelectionSet};
+use kova_buffer::{Buffer, BufferSnapshot, BufferVersion, Motion, SelectionSet, TextEdit};
 use kova_core::navigation::{SourceLanguageKind, navigable_identifier_at_byte};
 use kova_syntax::EntryPoint;
 use kova_tools::git::{GitRepository, gutter_hunks};
 use smallvec::SmallVec;
+
+use crate::editor::completion::{CaretWindowRect, CompletionInsertion};
 
 use crate::editor::element::EditorCanvasElement;
 use crate::editor::find::{FindBarField, FindBarState, FindKeyOutcome, render_find_bar};
@@ -136,6 +139,13 @@ pub enum EditorEvent {
         row: usize,
         /// Byte offset of the clicked identifier.
         byte: usize,
+    },
+    /// User typed `.` or `:` in editable text mode; shell may trigger completion (`KOVA-052`).
+    CompletionAutoTrigger {
+        /// Typed trigger character (`'.'` or `':'`).
+        ch: char,
+        /// Primary caret byte offset immediately after the character was inserted.
+        cursor_byte: usize,
     },
 }
 
@@ -947,6 +957,131 @@ impl EditorView {
         &self.focus_handle
     }
 
+    /// Returns the window-space rectangle of the caret at `byte` (`KOVA-052`).
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "visual row indices fit cleanly within f32 mantissa"
+    )]
+    pub fn caret_window_rect_at(&self, byte: usize) -> Option<CaretWindowRect> {
+        if f32::from(self.last_canvas_bounds.size.width) <= 0.0
+            || f32::from(self.last_canvas_bounds.size.height) <= 0.0
+        {
+            return None;
+        }
+        let snap = self.state.snapshot();
+        let clamped = snap.clamp_byte_to_char_boundary(byte.min(snap.len_bytes()));
+        let pt = snap.byte_to_point(clamped).ok()?;
+        let visual_row = self.fold_map.visual_row_of(pt.row);
+        let lh = self.last_viewport.line_height.max(1.0);
+        let x = f32::from(self.last_canvas_bounds.origin.x) + self.x_for_row_col(pt.row, pt.column);
+        let y = f32::from(self.last_canvas_bounds.origin.y) + (visual_row as f32) * lh
+            - self.scroll_offset.y;
+        Some(CaretWindowRect {
+            x,
+            y,
+            line_height: lh,
+        })
+    }
+
+    /// Returns the window-space rectangle of the primary caret (`KOVA-052`).
+    #[must_use]
+    pub fn primary_caret_window_rect(&self) -> Option<CaretWindowRect> {
+        self.caret_window_rect_at(self.state.primary_head())
+    }
+
+    /// Applies an accepted code-completion [`CompletionInsertion`] (together with any non-conflicting
+    /// `additional_text_edits` such as LSP auto-imports) as one atomic Undo transaction (`KOVA-052`).
+    pub fn apply_completion_insertion(
+        &mut self,
+        replace_range: Range<usize>,
+        insertion: &CompletionInsertion,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if self.state.is_read_only() {
+            return false;
+        }
+        let started = Instant::now();
+        self.reset_cursor_blink(window, cx);
+        self.state.sync_external_edits();
+
+        let snap = self.state.snapshot();
+        let len = snap.len_bytes();
+        let clamped_replace = snap.clamp_byte_to_char_boundary(replace_range.start.min(len))
+            ..snap.clamp_byte_to_char_boundary(replace_range.end.min(len));
+        let lines_before = snap.len_lines();
+        let row_before = snap
+            .byte_to_point(clamped_replace.start)
+            .map_or(0, |p| p.row);
+
+        let mut extra_edits = Vec::new();
+        for edit in &insertion.additional_text_edits {
+            let start = utf16_line_col_to_byte(&snap, edit.start_utf16_line, edit.start_utf16_col);
+            let end = utf16_line_col_to_byte(&snap, edit.end_utf16_line, edit.end_utf16_col);
+            let range = start.min(end)..start.max(end);
+            let overlaps_primary =
+                range.start < clamped_replace.end && range.end > clamped_replace.start;
+            let touches_empty_primary = clamped_replace.is_empty()
+                && range.start <= clamped_replace.start
+                && range.end >= clamped_replace.start;
+            if overlaps_primary
+                || (clamped_replace.is_empty() && range == clamped_replace)
+                || touches_empty_primary
+            {
+                continue;
+            }
+            extra_edits.push(TextEdit::new(range, edit.new_text.as_str()));
+        }
+        extra_edits.sort_by_key(|e| (e.range.start, e.range.end));
+
+        // Deduplicate/remove any overlapping extra edits to satisfy History::record_and_apply.
+        let mut disjoint_extra: Vec<TextEdit> = Vec::with_capacity(extra_edits.len());
+        for edit in extra_edits {
+            if let Some(prev) = disjoint_extra.last()
+                && edit.range.start < prev.range.end
+            {
+                continue;
+            }
+            disjoint_extra.push(edit);
+        }
+
+        let mut delta_before: isize = 0;
+        for edit in &disjoint_extra {
+            if edit.range.end <= clamped_replace.start {
+                let new_len = isize::try_from(edit.replacement.len()).unwrap_or(0);
+                let old_len = isize::try_from(edit.range.end - edit.range.start).unwrap_or(0);
+                delta_before += new_len - old_len;
+            }
+        }
+
+        let mut all_edits = disjoint_extra;
+        all_edits.push(TextEdit::new(
+            clamped_replace.clone(),
+            insertion.text.as_str(),
+        ));
+        all_edits.sort_by_key(|e| (e.range.start, e.range.end));
+
+        let changed = self
+            .state
+            .apply_edits(&all_edits, kova_buffer::EditOrigin::Compound);
+        if changed {
+            let shifted_start = clamped_replace.start.saturating_add_signed(delta_before);
+            let new_caret = shifted_start.saturating_add(insertion.cursor_offset_in_text);
+            self.state.set_caret(new_caret);
+
+            let lines_after = self.state.snapshot().len_lines();
+            if lines_after != lines_before {
+                let delta = isize::try_from(lines_after)
+                    .unwrap_or(isize::MAX)
+                    .saturating_sub(isize::try_from(lines_before).unwrap_or(isize::MAX));
+                self.fold_map.shift_after_edit(row_before, delta);
+            }
+        }
+        self.finish_input(started, changed, cx);
+        changed
+    }
+
     pub(crate) const fn selections(&self) -> &SelectionSet {
         self.state.selections()
     }
@@ -1263,7 +1398,7 @@ impl EditorView {
         let next_prefer = range.start + replacement.len();
         self.run_edit(window, cx, |state, _| {
             state.apply_edits(
-                &[kova_buffer::TextEdit::new(range, replacement.as_str())],
+                &[TextEdit::new(range, replacement.as_str())],
                 kova_buffer::EditOrigin::Compound,
             )
         });
@@ -1287,12 +1422,12 @@ impl EditorView {
             return;
         }
         let replacement = self.find_bar.replace_input().text().to_owned();
-        let edits: Vec<kova_buffer::TextEdit> = self
+        let edits: Vec<TextEdit> = self
             .find_bar
             .matches()
             .iter()
             .cloned()
-            .map(|r| kova_buffer::TextEdit::new(r, replacement.as_str()))
+            .map(|r| TextEdit::new(r, replacement.as_str()))
             .collect();
         self.run_edit(window, cx, |state, _| {
             state.apply_edits(&edits, kova_buffer::EditOrigin::Compound)
@@ -2059,6 +2194,19 @@ impl EditorView {
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
+
+fn utf16_line_col_to_byte(snap: &BufferSnapshot, line: usize, col_utf16: usize) -> usize {
+    let total_lines = snap.len_lines().max(1);
+    let clamped_line = line.min(total_lines.saturating_sub(1));
+    let line_start_byte = snap.rope().line_to_byte(clamped_line);
+    let line_len_bytes = snap.line_len_bytes(clamped_line).unwrap_or(0);
+    let line_start_utf16 = snap.byte_to_utf16(line_start_byte).unwrap_or(0);
+    let line_end_utf16 = snap
+        .byte_to_utf16(line_start_byte + line_len_bytes)
+        .unwrap_or(line_start_utf16);
+    let target_utf16 = (line_start_utf16 + col_utf16).min(line_end_utf16);
+    snap.utf16_to_byte(target_utf16).unwrap_or(line_start_byte)
+}
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
