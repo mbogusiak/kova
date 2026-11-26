@@ -17,10 +17,17 @@ path = "src/main.rs"
 doc  = false
 
 [dependencies]
-gpui.workspace       = true
-kova_core.workspace  = true
-kova_theme.workspace = true
-kova_ui.workspace    = true
+gpui.workspace        = true
+kova_buffer.workspace = true
+kova_config.workspace = true
+kova_core.workspace   = true
+kova_theme.workspace  = true
+kova_ui.workspace     = true
+thiserror.workspace   = true
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { workspace = true, features = ["wayland", "x11"] }

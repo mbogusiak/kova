@@ -296,6 +296,29 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Places the caret at the 1-based `line` / `column` (characters, clamped to the
+    /// buffer; column `1` when `None`) and centers that line vertically in the viewport
+    /// (`kova <file>:<line>:<column>`, `KOVA-016`).
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "line index fits cleanly within f32 mantissa"
+    )]
+    pub fn go_to_line_column(
+        &mut self,
+        line: usize,
+        column: Option<usize>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.state.set_line_col(line, column.unwrap_or(1));
+        let total_lines = self.line_count();
+        let row = line.saturating_sub(1).min(total_lines.saturating_sub(1));
+        let lh = self.last_viewport.line_height.max(1.0);
+        let target = row as f32 * lh - (self.last_viewport.viewport_height - lh) / 2.0;
+        self.scroll_offset.y = self.last_viewport.clamp_scroll_y(target, total_lines);
+        self.ensure_primary_cursor_visible();
+        cx.notify();
+    }
+
     pub(crate) fn editor_font(&self) -> Font {
         Font {
             family: self.font_family.clone(),

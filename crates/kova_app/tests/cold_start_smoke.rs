@@ -12,6 +12,15 @@ use std::process::Command;
 #[ignore = "requires active GPU display server"]
 fn opens_gpui_window_and_closes_within_budgets() {
     let bin = env!("CARGO_BIN_EXE_kova");
+    // Warm-up run (result ignored): the first launch of a freshly linked binary pays a
+    // one-off macOS XProtect / code-signing scan that is not part of Kova's cold start.
+    drop(
+        Command::new(bin)
+            .env("KOVA_STARTUP_PROBE", "1")
+            .env_remove("KOVA_ASSERT_BUDGETS")
+            .output(),
+    );
+
     let Ok(output) = Command::new(bin)
         .env("KOVA_STARTUP_PROBE", "1")
         .env("KOVA_ASSERT_BUDGETS", "1")
