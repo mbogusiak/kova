@@ -1,24 +1,40 @@
-//! Host side of *Go to Definition* (`KOVA-051`):
+//! Host side of *Go to Definition* (`KOVA-051`, `KOVA-061`):
 //!
 //! - **Level 1 (`< 15 ms`):** instant workspace & open-buffer symbol resolution via
 //!   `kova_core::navigation::resolve_local_definition` for Java, Kotlin, and Rust.
-//! - **Level 2 (`jdt.ls` + Vineflower):** when a Java symbol is not in the workspace (e.g. JDK
-//!   or external `.jar` dependency) and a ready [`JdtlsClient`] is available, delegates to
-//!   [`DefinitionResolver::go_to_definition`] and opens external sources or Vineflower-decompiled
-//!   classes in read-only tabs.
+//! - **Level 2 (`jdt.ls` + Vineflower):** when a Java symbol is not in the workspace and a ready
+//!   [`JdtlsClient`] is available, delegates to [`DefinitionResolver::go_to_definition`].
+//! - **Level 1.5 (Zero-`jdt.ls` JDK & library decompiler):** resolves external JDK `.jmod` /
+//!   `rt.jar` and dependency `.jar` (project `libs/`, Gradle, Maven) classes immediately using
+//!   [`ExternalClassLocator`], decompiling with [`VineflowerDecompiler`] when installed or the
+//!   instant pure-Rust `cafebabe` (+ optional `javap -p`) fallback otherwise.
 
-use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use kova_buffer::{Buffer, Utf16Point};
 use kova_config::{EffectiveConfig, JvmSettings, KovaPaths, KovaSettings};
-use kova_core::navigation::{SourceLanguageKind, extract_symbol_query, resolve_local_definition};
+use kova_core::navigation::{
+    ExternalTargetCandidates, SourceLanguageKind, SymbolQuery, extract_symbol_query,
+    resolve_external_fqcn_candidates, resolve_local_definition,
+};
+use kova_jvm_index::{
+    BytecodeScanOptions, DependencyArchiveConfig, DependencyArchiveIndex, ExternalClassLocator,
+    JdkOnDemandIndex, JvmSourceOrigin, JvmSymbolKind, LocatedClassBytes,
+    cache_bytecode_decompilation, decompile_class_bytes_to_java, parse_class_bytes,
+};
 use kova_lsp_dap::lsp::{
-    DefinitionResolver, DefinitionTarget, JdtlsClient, LspLifecycleState, path_to_lsp_uri,
+    DefinitionResolver, DefinitionTarget, JdtlsClient, LspLifecycleState, find_declaration,
+    path_to_lsp_uri,
 };
 use kova_lsp_dap::manager::{JdtlsSessionManager, OsProcessMemoryProbe, SessionManagerConfig};
-use kova_toolchain::VineflowerDecompiler;
+use kova_toolchain::{
+    DecompileTarget, JdkDiscoveryRoots, JdkInstallation, VineflowerDecompiler,
+    decompile_with_javap_fallback, discover_jdks, discover_vineflower_decompiler,
+    select_tool_runtime_jdk,
+};
 use kova_ui::{DefinitionOutcome, DefinitionRequest, DefinitionSink, DefinitionTargetKind};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -28,10 +44,105 @@ use crate::AppEvent;
 /// Timeout applied to Level-2 `textDocument/definition` queries so UI navigation stays snappy.
 const LSP_DEFINITION_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Optional Level-2 LSP + Vineflower backend maintained by the host.
+/// Host configuration for Level-1.5 external JDK/library bytecode navigation (`KOVA-061`).
+#[derive(Debug, Clone)]
+pub struct ExternalDefinitionConfig {
+    /// On-demand JDK `.jmod` / `rt.jar` index.
+    pub jdk_index: Arc<JdkOnDemandIndex>,
+    /// Optional runtime JDK (used for Vineflower or `javap -p` fallback).
+    pub runtime_jdk: Option<JdkInstallation>,
+    /// Optional Vineflower decompiler (when installed locally).
+    pub decompiler: Option<VineflowerDecompiler>,
+    /// Base configuration for project/Gradle/Maven `.jar` dependency indexing.
+    pub base_dependency_config: DependencyArchiveConfig,
+    /// Cache root for decompiled `.java` files (`~/.cache/kova/decompiled`).
+    pub cache_root: PathBuf,
+    /// Whether Vineflower decompilation is enabled (`JvmSettings::auto_decompile_class`).
+    pub auto_decompile_class: bool,
+}
+
+#[derive(Debug)]
+struct ExternalDefinitionRuntime {
+    jdk_index: Arc<JdkOnDemandIndex>,
+    runtime_jdk: Option<JdkInstallation>,
+    decompiler: Option<VineflowerDecompiler>,
+    base_dependency_config: DependencyArchiveConfig,
+    cache_root: PathBuf,
+    auto_decompile_class: bool,
+    dep_indexes: Mutex<HashMap<Option<PathBuf>, Arc<DependencyArchiveIndex>>>,
+}
+
+impl ExternalDefinitionRuntime {
+    fn from_config(cfg: ExternalDefinitionConfig) -> Self {
+        Self {
+            jdk_index: cfg.jdk_index,
+            runtime_jdk: cfg.runtime_jdk,
+            decompiler: cfg.decompiler,
+            base_dependency_config: cfg.base_dependency_config,
+            cache_root: cfg.cache_root,
+            auto_decompile_class: cfg.auto_decompile_class,
+            dep_indexes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn discover_from_host() -> Self {
+        let paths = KovaPaths::resolve().ok();
+        let jdks = paths
+            .as_ref()
+            .map(|p| discover_jdks(&JdkDiscoveryRoots::from_env_and_paths(p)))
+            .unwrap_or_default();
+        let jdk_index = jdks
+            .iter()
+            .find(|j| j.jmods_dir.is_some())
+            .or_else(|| jdks.first())
+            .map_or_else(
+                || Arc::new(JdkOnDemandIndex::empty()),
+                |j| Arc::new(JdkOnDemandIndex::from_jdk_home(&j.home_dir)),
+            );
+        let runtime_jdk = select_tool_runtime_jdk(&jdks, 17)
+            .ok()
+            .or_else(|| jdks.first())
+            .cloned();
+        let decompiler = paths
+            .as_ref()
+            .and_then(|p| discover_vineflower_decompiler(p, &jdks));
+        let cache_root = paths.as_ref().map_or_else(
+            || std::env::temp_dir().join("kova-decompiled"),
+            |p| p.cache_dir().join("decompiled"),
+        );
+        let settings = default_effective_config().settings.jvm;
+        Self::from_config(ExternalDefinitionConfig {
+            jdk_index,
+            runtime_jdk,
+            decompiler,
+            base_dependency_config: DependencyArchiveConfig::from_host_env(None),
+            cache_root,
+            auto_decompile_class: settings.auto_decompile_class,
+        })
+    }
+
+    fn dependency_index_for(&self, project_root: Option<&Path>) -> Arc<DependencyArchiveIndex> {
+        let key = project_root.map(Path::to_path_buf);
+        let mut guard = self
+            .dep_indexes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(existing) = guard.get(&key) {
+            return Arc::clone(existing);
+        }
+        let mut cfg = self.base_dependency_config.clone();
+        cfg.project_root.clone_from(&key);
+        let created = Arc::new(DependencyArchiveIndex::new(cfg));
+        guard.insert(key, Arc::clone(&created));
+        created
+    }
+}
+
+/// Optional Level-2 LSP + Level-1.5 bytecode/Vineflower backend maintained by the host.
 #[derive(Clone, Default)]
 pub struct LspDefinitionBackend {
     inner: Arc<Mutex<Option<ActiveLspBackend>>>,
+    external: Arc<OnceLock<Arc<ExternalDefinitionRuntime>>>,
 }
 
 impl std::fmt::Debug for LspDefinitionBackend {
@@ -48,10 +159,23 @@ struct ActiveLspBackend {
 }
 
 impl LspDefinitionBackend {
-    /// Creates an empty backend with no active `jdt.ls` client yet.
+    /// Creates an empty backend with no active `jdt.ls` client yet; Level-1.5 external lookup
+    /// initializes lazily on first background request.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a backend pre-configured with explicit Level-1.5 external paths/indexes (useful
+    /// in isolated tests that must not touch `$HOME`).
+    #[must_use]
+    pub fn with_external_config(config: ExternalDefinitionConfig) -> Self {
+        let lock = OnceLock::new();
+        drop(lock.set(Arc::new(ExternalDefinitionRuntime::from_config(config))));
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+            external: Arc::new(lock),
+        }
     }
 
     /// Attaches an active [`JdtlsClient`] and [`DefinitionResolver`] for Level-2 queries.
@@ -65,6 +189,13 @@ impl LspDefinitionBackend {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    fn get_or_init_external(&self) -> Arc<ExternalDefinitionRuntime> {
+        Arc::clone(
+            self.external
+                .get_or_init(|| Arc::new(ExternalDefinitionRuntime::discover_from_host())),
+        )
     }
 }
 
@@ -130,8 +261,8 @@ pub fn definition_sink_with_backend(
     })
 }
 
-/// Resolves one [`DefinitionRequest`] using Level 1 first, then optional Level 2 (`jdt.ls` +
-/// Vineflower) for Java symbols not found in the workspace.
+/// Resolves one [`DefinitionRequest`] using Level 1 first, optional Level 2 (`jdt.ls`) when
+/// connected, and Level-1.5 direct JDK/dependency bytecode decompilation as an immediate fallback.
 pub async fn resolve_definition_request(
     request: DefinitionRequest,
     backend: Option<&LspDefinitionBackend>,
@@ -156,11 +287,11 @@ pub async fn resolve_definition_request(
             project_root.as_deref(),
             &workspace_files,
         );
-        Some((symbol_name, snapshot, resolved))
+        Some((symbol_name, snapshot, query, resolved))
     })
     .await;
 
-    let Ok(Some((symbol_name, snapshot, resolved))) = level1 else {
+    let Ok(Some((symbol_name, snapshot, query, resolved))) = level1 else {
         return DefinitionOutcome::NoSymbolAtCursor;
     };
 
@@ -202,7 +333,376 @@ pub async fn resolve_definition_request(
         }
     }
 
+    // Level 1.5: zero-jdt.ls direct lookup + Vineflower/cafebabe decompilation for Java & Kotlin.
+    if matches!(
+        language,
+        SourceLanguageKind::Java | SourceLanguageKind::Kotlin
+    ) && let Some(backend) = backend
+        && let Some(outcome) = resolve_level15_external(
+            backend,
+            &query,
+            &request.source_text,
+            request.project_root.clone(),
+            &symbol_name,
+        )
+        .await
+    {
+        return outcome;
+    }
+
     DefinitionOutcome::NotFound { symbol_name }
+}
+
+async fn resolve_level15_external(
+    backend: &LspDefinitionBackend,
+    query: &SymbolQuery,
+    source_text: &str,
+    project_root: Option<PathBuf>,
+    symbol_name: &str,
+) -> Option<DefinitionOutcome> {
+    let candidates = resolve_external_fqcn_candidates(query, source_text);
+    if candidates.fqcns.is_empty() {
+        return None;
+    }
+
+    let backend_cloned = backend.clone();
+    let candidates_cloned = candidates.clone();
+    let located_res = tokio::task::spawn_blocking(move || {
+        let runtime = backend_cloned.get_or_init_external();
+        let dep_index = runtime.dependency_index_for(project_root.as_deref());
+        let locator = ExternalClassLocator::new(Arc::clone(&runtime.jdk_index), dep_index);
+        let located = locate_external_target(&locator, &candidates_cloned)?;
+        Some((runtime, located))
+    })
+    .await
+    .ok()??;
+
+    let (runtime, located) = located_res;
+    let target_simple = simple_binary_name(&located.fqcn).to_owned();
+
+    // Primary path: Vineflower (if installed & enabled) with persistent cache.
+    if runtime.auto_decompile_class
+        && let Some(decompiler) = &runtime.decompiler
+    {
+        let target = DecompileTarget::ArchiveEntry {
+            archive_path: located.archive_path.clone(),
+            entry_name: located.outer_entry_name.clone(),
+        };
+        if let Ok(decompiled) = decompiler.decompile(&target).await {
+            let (line, column) = find_member_or_type_declaration(
+                &decompiled.source_code,
+                candidates.member_name.as_deref(),
+                &target_simple,
+            );
+            return Some(DefinitionOutcome::Found {
+                target: DefinitionTargetKind::DecompiledClass {
+                    fqcn: decompiled.fqcn,
+                    cache_file: decompiled.cache_file,
+                    source_text: decompiled.source_code,
+                },
+                line,
+                column,
+                symbol_name: symbol_name.to_owned(),
+            });
+        }
+    }
+
+    // Immediate fallback path: pure-Rust cafebabe decompiler (and optional javap -p).
+    let (java_src, cache_file) = decompile_with_fallback(&runtime, &located).await?;
+
+    let (line, column) = find_member_or_type_declaration(
+        &java_src,
+        candidates.member_name.as_deref(),
+        &target_simple,
+    );
+    Some(DefinitionOutcome::Found {
+        target: DefinitionTargetKind::DecompiledClass {
+            fqcn: located.fqcn,
+            cache_file,
+            source_text: java_src,
+        },
+        line,
+        column,
+        symbol_name: symbol_name.to_owned(),
+    })
+}
+
+async fn decompile_with_fallback(
+    runtime: &ExternalDefinitionRuntime,
+    located: &LocatedClassBytes,
+) -> Option<(String, PathBuf)> {
+    let located_for_fallback = located.clone();
+    let cache_root = runtime.cache_root.clone();
+    let fallback_java = tokio::task::spawn_blocking(move || {
+        let source_label = format!(
+            "{}!/{}",
+            located_for_fallback.archive_path.display(),
+            located_for_fallback.entry_name
+        );
+        let java_src = decompile_class_bytes_to_java(
+            &located_for_fallback.bytes,
+            &located_for_fallback.fqcn,
+            &source_label,
+        )
+        .ok()?;
+        let cache_file =
+            cache_bytecode_decompilation(&cache_root, &located_for_fallback, &java_src).ok()?;
+        Some((java_src, cache_file))
+    })
+    .await
+    .ok()
+    .flatten();
+
+    if let Some(pair) = fallback_java {
+        return Some(pair);
+    }
+
+    let jdk = runtime.runtime_jdk.as_ref()?;
+    let java_src = decompile_with_javap_fallback(
+        jdk,
+        &located.archive_path,
+        &located.entry_name,
+        &located.bytes,
+    )
+    .await?;
+    let cache_root = runtime.cache_root.clone();
+    let located_clone = located.clone();
+    let cache_file = tokio::task::spawn_blocking(move || {
+        cache_bytecode_decompilation(&cache_root, &located_clone, &java_src).ok()
+    })
+    .await
+    .ok()??;
+    let source_text = std::fs::read_to_string(&cache_file).ok()?;
+    Some((source_text, cache_file))
+}
+
+fn locate_external_target(
+    locator: &ExternalClassLocator,
+    candidates: &ExternalTargetCandidates,
+) -> Option<LocatedClassBytes> {
+    if candidates.field_chain.is_empty() {
+        return locator.locate_candidates(&candidates.fqcns);
+    }
+
+    for start_fqcn in &candidates.fqcns {
+        let mut cur_fqcn = start_fqcn.clone();
+        let mut chain_ok = true;
+        for field_name in &candidates.field_chain {
+            if let Some(next_fqcn) = locator
+                .jdk_index()
+                .resolve_field_type(&cur_fqcn, field_name, None)
+            {
+                cur_fqcn = next_fqcn;
+                continue;
+            }
+            let Some(owner_bytes) = locator.locate_candidates(std::slice::from_ref(&cur_fqcn))
+            else {
+                chain_ok = false;
+                break;
+            };
+            let Some(next_fqcn) = resolve_field_type_from_bytes(&owner_bytes, field_name) else {
+                chain_ok = false;
+                break;
+            };
+            cur_fqcn = next_fqcn;
+        }
+        if chain_ok && let Some(target) = locator.locate_candidates(&[cur_fqcn]) {
+            return Some(target);
+        }
+    }
+
+    locator.locate_candidates(&candidates.fqcns)
+}
+
+fn resolve_field_type_from_bytes(located: &LocatedClassBytes, field_name: &str) -> Option<String> {
+    let opts = BytecodeScanOptions {
+        include_members: true,
+        include_private_members: true,
+        include_package_private_classes: true,
+        skip_anonymous_and_synthetic: false,
+        ..BytecodeScanOptions::default()
+    };
+    let origin = JvmSourceOrigin::JarEntry {
+        jar_path: located.archive_path.clone(),
+        entry_name: located.entry_name.clone(),
+    };
+    let unit = parse_class_bytes(&located.bytes, origin, &opts).ok()??;
+    let field = unit
+        .members
+        .into_iter()
+        .find(|m| m.kind == JvmSymbolKind::Field && m.name == field_name)?;
+    let trimmed = field.descriptor.trim();
+    trimmed
+        .strip_prefix('L')
+        .and_then(|s| s.strip_suffix(';'))
+        .map(|internal| internal.replace('/', "."))
+}
+
+fn simple_binary_name(fqcn: &str) -> &str {
+    let simple = fqcn.rsplit('.').next().unwrap_or(fqcn);
+    let mut parts = simple.split('$');
+    let outer = parts.next().unwrap_or(simple);
+    parts
+        .rev()
+        .find(|p| !p.is_empty() && !p.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(outer)
+}
+
+/// Locates a 1-based `(line, column)` for `member_name` (if present) or `type_simple_name`
+/// inside decompiled Java source code (`KOVA-061`).
+#[must_use]
+pub fn find_member_or_type_declaration(
+    source: &str,
+    member_name: Option<&str>,
+    type_simple_name: &str,
+) -> (usize, usize) {
+    if let Some(member) = member_name
+        && !member.is_empty()
+    {
+        if let Some(pos) = find_type_decl_1_based(source, member) {
+            return pos;
+        }
+        if let Some(pos) = find_member_decl_1_based(source, member) {
+            return pos;
+        }
+    }
+    if let Some(pos) = find_type_decl_1_based(source, type_simple_name) {
+        return pos;
+    }
+    (1, 1)
+}
+
+fn find_type_decl_1_based(source: &str, name: &str) -> Option<(usize, usize)> {
+    if name.is_empty() {
+        return None;
+    }
+    if let Some(range) = find_declaration(source, name) {
+        return Some((range.start.row + 1, range.start.column + 1));
+    }
+    // Also support `@interface Name` for annotations.
+    for (row, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            continue;
+        }
+        let needle = format!("@interface {name}");
+        if let Some(start) = line.find(&needle) {
+            let after = &line[start + needle.len()..];
+            if after.chars().next().is_none_or(|c| !is_java_ident_char(c)) {
+                let col = line[..start + "@interface ".len()].chars().count() + 1;
+                return Some((row + 1, col));
+            }
+        }
+    }
+    None
+}
+
+fn find_member_decl_1_based(source: &str, member: &str) -> Option<(usize, usize)> {
+    // Pass 1: method or constructor declaration (`member(`).
+    for (row, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if is_non_decl_line(trimmed) {
+            continue;
+        }
+        if let Some(col_byte) = find_method_decl_col_in_line(line, member) {
+            let col = line[..col_byte].chars().count() + 1;
+            return Some((row + 1, col));
+        }
+    }
+
+    // Pass 2: field or enum constant declaration (`Type member;` / `Type member = ...;` / `MEMBER,`).
+    for (row, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if is_non_decl_line(trimmed) {
+            continue;
+        }
+        if let Some(col_byte) = find_field_or_enum_col_in_line(line, trimmed, member) {
+            let col = line[..col_byte].chars().count() + 1;
+            return Some((row + 1, col));
+        }
+    }
+
+    None
+}
+
+fn is_non_decl_line(trimmed: &str) -> bool {
+    trimmed.is_empty()
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("package ")
+        || trimmed.starts_with("import ")
+        || trimmed.starts_with('@')
+}
+
+fn is_java_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+fn find_method_decl_col_in_line(line: &str, member: &str) -> Option<usize> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("if ")
+        || trimmed.starts_with("if(")
+        || trimmed.starts_with("for ")
+        || trimmed.starts_with("for(")
+        || trimmed.starts_with("while ")
+        || trimmed.starts_with("while(")
+        || trimmed.starts_with("switch ")
+        || trimmed.starts_with("catch ")
+        || trimmed.starts_with("return ")
+        || trimmed.starts_with("throw ")
+        || trimmed.starts_with("new ")
+    {
+        return None;
+    }
+
+    let mut from = 0;
+    while let Some(found) = line[from..].find(member) {
+        let start = from + found;
+        let end = start + member.len();
+        let before_ok = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_java_ident_char(c) && c != '.');
+        let after = line[end..].trim_start();
+        if before_ok && after.starts_with('(') {
+            let prefix = line[..start].trim();
+            if !prefix.contains(" = ")
+                && !prefix.ends_with("new")
+                && !prefix.ends_with("return")
+                && !prefix.ends_with("throw")
+            {
+                return Some(start);
+            }
+        }
+        from = end;
+    }
+    None
+}
+
+fn find_field_or_enum_col_in_line(line: &str, trimmed: &str, member: &str) -> Option<usize> {
+    if !trimmed.contains(member) {
+        return None;
+    }
+    let mut from = 0;
+    while let Some(found) = line[from..].find(member) {
+        let start = from + found;
+        let end = start + member.len();
+        let before_ok = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace() || c == ',');
+        let after = line[end..].trim_start();
+        let after_ok = after.starts_with(';') || after.starts_with('=') || after.starts_with(',');
+        if before_ok && after_ok {
+            let prefix = line[..start].trim();
+            if !prefix.starts_with("return") && !prefix.starts_with("throw") {
+                return Some(start);
+            }
+        }
+        from = end;
+    }
+    None
 }
 
 /// Converts a `kova_lsp_dap` [`DefinitionTarget`] into a UI-ready [`DefinitionOutcome`].
@@ -592,5 +1092,557 @@ public class OrderService {
             drop(client.shutdown_graceful(Duration::from_secs(1)).await);
             server_task.abort();
         });
+    }
+
+    fn cp_add_utf8(cp: &mut Vec<Vec<u8>>, s: &str) -> u16 {
+        let mut e = vec![1];
+        e.extend_from_slice(&u16::try_from(s.len()).unwrap().to_be_bytes());
+        e.extend_from_slice(s.as_bytes());
+        cp.push(e);
+        u16::try_from(cp.len()).unwrap()
+    }
+
+    fn cp_add_class(cp: &mut Vec<Vec<u8>>, utf8_idx: u16) -> u16 {
+        let mut e = vec![7];
+        e.extend_from_slice(&utf8_idx.to_be_bytes());
+        cp.push(e);
+        u16::try_from(cp.len()).unwrap()
+    }
+
+    fn build_test_class_bytes(
+        internal_name: &str,
+        super_internal: &str,
+        access_flags: u16,
+        fields: &[(&str, &str, u16)],
+        methods: &[(&str, &str, u16)],
+    ) -> Vec<u8> {
+        let mut cp = Vec::new();
+        let this_u = cp_add_utf8(&mut cp, internal_name);
+        let this_cls = cp_add_class(&mut cp, this_u);
+        let sup_u = cp_add_utf8(&mut cp, super_internal);
+        let sup_cls = cp_add_class(&mut cp, sup_u);
+
+        let mut field_entries = Vec::with_capacity(fields.len());
+        for (name, desc, flags) in fields {
+            let n = cp_add_utf8(&mut cp, name);
+            let d = cp_add_utf8(&mut cp, desc);
+            field_entries.push((n, d, *flags));
+        }
+        let mut method_entries = Vec::with_capacity(methods.len());
+        for (name, desc, flags) in methods {
+            let n = cp_add_utf8(&mut cp, name);
+            let d = cp_add_utf8(&mut cp, desc);
+            method_entries.push((n, d, *flags));
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xCAFE_BABEu32.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&61u16.to_be_bytes());
+        out.extend_from_slice(&u16::try_from(cp.len() + 1).unwrap().to_be_bytes());
+        for entry in cp {
+            out.extend_from_slice(&entry);
+        }
+        out.extend_from_slice(&access_flags.to_be_bytes());
+        out.extend_from_slice(&this_cls.to_be_bytes());
+        out.extend_from_slice(&sup_cls.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes()); // interfaces
+        out.extend_from_slice(&u16::try_from(field_entries.len()).unwrap().to_be_bytes());
+        for (n, d, flags) in field_entries {
+            out.extend_from_slice(&flags.to_be_bytes());
+            out.extend_from_slice(&n.to_be_bytes());
+            out.extend_from_slice(&d.to_be_bytes());
+            out.extend_from_slice(&0u16.to_be_bytes());
+        }
+        out.extend_from_slice(&u16::try_from(method_entries.len()).unwrap().to_be_bytes());
+        for (n, d, flags) in method_entries {
+            out.extend_from_slice(&flags.to_be_bytes());
+            out.extend_from_slice(&n.to_be_bytes());
+            out.extend_from_slice(&d.to_be_bytes());
+            out.extend_from_slice(&0u16.to_be_bytes());
+        }
+        out.extend_from_slice(&0u16.to_be_bytes()); // attributes
+        out
+    }
+
+    fn write_test_zip(path: &Path, entries: &[(&str, Vec<u8>)]) {
+        use std::io::Write as _;
+        use zip::ZipWriter;
+        use zip::write::SimpleFileOptions;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in entries {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn resolve_sync(
+        runtime: &tokio::runtime::Runtime,
+        backend: &LspDefinitionBackend,
+        project_root: Option<PathBuf>,
+        source_path: PathBuf,
+        source_text: &str,
+        needle: &str,
+    ) -> DefinitionOutcome {
+        let cursor_byte = source_text.find(needle).expect("needle in source_text");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = definition_sink_with_backend(runtime.handle().clone(), tx, backend.clone());
+        sink(DefinitionRequest {
+            request_id: 100,
+            project_root,
+            source_path,
+            source_text: source_text.to_owned(),
+            cursor_byte,
+            line: 1,
+            column: 1,
+            open_buffers: vec![],
+            workspace_files: vec![],
+        });
+        let ev = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("sink timeout")
+                .expect("event")
+        });
+        match ev {
+            AppEvent::DefinitionResolved { outcome, .. } => outcome,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    fn build_sample_jdk_jmod(jmods_dir: &Path) {
+        let java_object_bytes =
+            build_test_class_bytes("java/lang/Object", "java/lang/Object", 0x0021, &[], &[]);
+        let string_bytes = build_test_class_bytes(
+            "java/lang/String",
+            "java/lang/Object",
+            0x0031,
+            &[],
+            &[("length", "()I", 0x0001)],
+        );
+        let objects_bytes = build_test_class_bytes(
+            "java/util/Objects",
+            "java/lang/Object",
+            0x0031,
+            &[],
+            &[(
+                "requireNonNull",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                0x0009,
+            )],
+        );
+        let map_bytes =
+            build_test_class_bytes("java/util/Map", "java/lang/Object", 0x0601, &[], &[]);
+        let map_entry_bytes = build_test_class_bytes(
+            "java/util/Map$Entry",
+            "java/lang/Object",
+            0x0601,
+            &[],
+            &[("getKey", "()Ljava/lang/Object;", 0x0401)],
+        );
+        let system_bytes = build_test_class_bytes(
+            "java/lang/System",
+            "java/lang/Object",
+            0x0031,
+            &[("out", "Ljava/io/PrintStream;", 0x0019)],
+            &[],
+        );
+        let print_stream_bytes = build_test_class_bytes(
+            "java/io/PrintStream",
+            "java/lang/Object",
+            0x0021,
+            &[],
+            &[("println", "(Ljava/lang/String;)V", 0x0001)],
+        );
+
+        write_test_zip(
+            &jmods_dir.join("java.base.jmod"),
+            &[
+                ("classes/java/lang/Object.class", java_object_bytes),
+                ("classes/java/lang/String.class", string_bytes),
+                ("classes/java/util/Objects.class", objects_bytes),
+                ("classes/java/util/Map.class", map_bytes),
+                ("classes/java/util/Map$Entry.class", map_entry_bytes),
+                ("classes/java/lang/System.class", system_bytes),
+                ("classes/java/io/PrintStream.class", print_stream_bytes),
+            ],
+        );
+    }
+
+    fn assert_decompiled_outcome(
+        outcome: DefinitionOutcome,
+        expected_fqcn: &str,
+        expected_line_substr: &str,
+    ) -> (PathBuf, String) {
+        match outcome {
+            DefinitionOutcome::Found {
+                target:
+                    DefinitionTargetKind::DecompiledClass {
+                        fqcn,
+                        cache_file,
+                        source_text,
+                    },
+                line,
+                column,
+                ..
+            } => {
+                assert_eq!(fqcn, expected_fqcn);
+                assert_eq!(
+                    cache_file.extension().and_then(|e| e.to_str()),
+                    Some("java")
+                );
+                assert!(cache_file.is_file());
+                assert!(column >= 1);
+                let line_txt = source_text.lines().nth(line - 1).unwrap();
+                assert!(line_txt.contains(expected_line_substr), "{line_txt}");
+                (cache_file, source_text)
+            }
+            other => panic!("unexpected outcome for {expected_fqcn}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn level15_resolves_jdk_jmod_class_with_bytecode_fallback_without_jdtls() {
+        let runtime = build_io_runtime().expect("runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jmods_dir = dir.path().join("jdk/jmods");
+        let cache_root = dir.path().join("cache/decompiled");
+        build_sample_jdk_jmod(&jmods_dir);
+
+        let backend = LspDefinitionBackend::with_external_config(ExternalDefinitionConfig {
+            jdk_index: Arc::new(JdkOnDemandIndex::from_jmods_dir(jmods_dir)),
+            runtime_jdk: None,
+            decompiler: None,
+            base_dependency_config: DependencyArchiveConfig::default(),
+            cache_root: cache_root.clone(),
+            auto_decompile_class: true,
+        });
+
+        let src = "\
+package dev.kova.demo;
+
+import java.util.Objects;
+import java.util.Map;
+
+public class Demo {
+    public void run(String input) {
+        Objects.requireNonNull(input);
+        Map.Entry<String, String> entry = null;
+        System.out.println(input);
+    }
+}
+";
+        let src_path = PathBuf::from("src/Demo.java");
+
+        let (str_cache, _) = assert_decompiled_outcome(
+            resolve_sync(
+                &runtime,
+                &backend,
+                None,
+                src_path.clone(),
+                src,
+                "String input",
+            ),
+            "java.lang.String",
+            "class String",
+        );
+        assert!(str_cache.starts_with(cache_root.join("bytecode")));
+
+        let (req_cache, req_text) = assert_decompiled_outcome(
+            resolve_sync(
+                &runtime,
+                &backend,
+                None,
+                src_path.clone(),
+                src,
+                "requireNonNull(input)",
+            ),
+            "java.util.Objects",
+            "requireNonNull(",
+        );
+        assert_decompiled_outcome(
+            resolve_sync(
+                &runtime,
+                &backend,
+                None,
+                src_path.clone(),
+                src,
+                "Entry<String",
+            ),
+            "java.util.Map$Entry",
+            "interface Entry",
+        );
+        assert_decompiled_outcome(
+            resolve_sync(&runtime, &backend, None, src_path, src, "println(input)"),
+            "java.io.PrintStream",
+            "println(",
+        );
+
+        // Recursive Cmd+Click inside decompiled Objects.java on `Object`.
+        assert_decompiled_outcome(
+            resolve_sync(
+                &runtime,
+                &backend,
+                None,
+                req_cache,
+                &req_text,
+                "Object requireNonNull",
+            ),
+            "java.lang.Object",
+            "class Object",
+        );
+    }
+
+    #[test]
+    fn level15_resolves_gradle_maven_and_project_libs_jars() {
+        let runtime = build_io_runtime().expect("runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("workspace");
+        let fake_home = dir.path().join("home");
+        let cache_root = dir.path().join("cache/decompiled");
+
+        let libs_bytes = build_test_class_bytes(
+            "com/libs/LocalDep",
+            "java/lang/Object",
+            0x0021,
+            &[],
+            &[("execute", "()V", 0x0001)],
+        );
+        let gradle_bytes = build_test_class_bytes(
+            "com/gradle/GradleLib",
+            "java/lang/Object",
+            0x0021,
+            &[],
+            &[("compute", "()I", 0x0009)],
+        );
+        let maven_bytes = build_test_class_bytes(
+            "org/maven/MavenApi",
+            "java/lang/Object",
+            0x0021,
+            &[],
+            &[("ping", "()V", 0x0009)],
+        );
+
+        // Sources jar must be ignored.
+        write_test_zip(
+            &project.join("libs/local-sources.jar"),
+            &[("com/libs/LocalDep.class", b"NOT_A_CLASS".to_vec())],
+        );
+        write_test_zip(
+            &project.join("libs/local.jar"),
+            &[("com/libs/LocalDep.class", libs_bytes)],
+        );
+        write_test_zip(
+            &fake_home
+                .join(".gradle/caches/modules-2/files-2.1/com.gradle/lib/1.0/hash/lib-1.0.jar"),
+            &[("com/gradle/GradleLib.class", gradle_bytes)],
+        );
+        write_test_zip(
+            &fake_home.join(".m2/repository/org/maven/api/1.0/api-1.0.jar"),
+            &[("org/maven/MavenApi.class", maven_bytes)],
+        );
+
+        let backend = LspDefinitionBackend::with_external_config(ExternalDefinitionConfig {
+            jdk_index: Arc::new(JdkOnDemandIndex::empty()),
+            runtime_jdk: None,
+            decompiler: None,
+            base_dependency_config: DependencyArchiveConfig::from_home_and_project(
+                Some(&fake_home),
+                None,
+            ),
+            cache_root,
+            auto_decompile_class: true,
+        });
+
+        let src = "\
+package app;
+import com.libs.LocalDep;
+import com.gradle.GradleLib;
+import org.maven.MavenApi;
+
+public class App {
+    void go(LocalDep d) {
+        d.execute();
+        GradleLib.compute();
+        MavenApi.ping();
+    }
+}
+";
+        let src_path = PathBuf::from("src/App.java");
+
+        for (needle, expected_fqcn, expected_member) in [
+            ("execute()", "com.libs.LocalDep", "execute("),
+            ("compute()", "com.gradle.GradleLib", "compute("),
+            ("ping()", "org.maven.MavenApi", "ping("),
+        ] {
+            let outcome = resolve_sync(
+                &runtime,
+                &backend,
+                Some(project.clone()),
+                src_path.clone(),
+                src,
+                needle,
+            );
+            match outcome {
+                DefinitionOutcome::Found {
+                    target:
+                        DefinitionTargetKind::DecompiledClass {
+                            fqcn,
+                            cache_file,
+                            source_text,
+                        },
+                    line,
+                    ..
+                } => {
+                    assert_eq!(fqcn, expected_fqcn);
+                    assert!(cache_file.is_file());
+                    let line_txt = source_text.lines().nth(line - 1).unwrap();
+                    assert!(line_txt.contains(expected_member), "{line_txt}");
+                }
+                other => panic!("unexpected outcome for {needle}: {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_exec_script(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, contents).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn dummy_test_jdk(home: &Path, java_bin: PathBuf, jmods_dir: PathBuf) -> JdkInstallation {
+        use kova_toolchain::{JavaVersion, JdkSource, JdkVendor};
+        JdkInstallation {
+            home_dir: home.to_path_buf(),
+            java_bin,
+            jmods_dir: Some(jmods_dir),
+            version: JavaVersion::new(21, 0, 0, None),
+            vendor: JdkVendor::Unknown("Test".to_owned()),
+            arch: "aarch64".to_owned(),
+            source: JdkSource::EnvJavaHome,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn level15_prefers_vineflower_when_available_and_falls_back_on_error() {
+        let runtime = build_io_runtime().expect("runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jmods_dir = dir.path().join("jdk/jmods");
+        let cache_root = dir.path().join("cache/decompiled");
+        let vf_jar = dir.path().join("vineflower.jar");
+        std::fs::write(&vf_jar, b"PK\x03\x04").unwrap();
+        build_sample_jdk_jmod(&jmods_dir);
+
+        let ok_java = dir.path().join("mock-java-ok.sh");
+        write_exec_script(
+            &ok_java,
+            "#!/bin/sh\nfor arg in \"$@\"; do out_dir=\"$arg\"; done\nmkdir -p \"$out_dir/java/util\"\ncat <<'EOF' > \"$out_dir/java/util/Objects.java\"\npackage java.util;\npublic final class Objects {\n    public static <T> T requireNonNull(T obj) { return obj; }\n}\nEOF\n",
+        );
+        let ok_jdk = dummy_test_jdk(&dir.path().join("jdk"), ok_java, jmods_dir.clone());
+        let backend_ok = LspDefinitionBackend::with_external_config(ExternalDefinitionConfig {
+            jdk_index: Arc::new(JdkOnDemandIndex::from_jmods_dir(jmods_dir.clone())),
+            runtime_jdk: Some(ok_jdk.clone()),
+            decompiler: Some(VineflowerDecompiler::new(
+                vf_jar.clone(),
+                ok_jdk,
+                cache_root.clone(),
+            )),
+            base_dependency_config: DependencyArchiveConfig::default(),
+            cache_root: cache_root.clone(),
+            auto_decompile_class: true,
+        });
+
+        let src = "import java.util.Objects;\nclass Use { void f(Object o) { Objects.requireNonNull(o); } }\n";
+        let (vf_cache, _) = assert_decompiled_outcome(
+            resolve_sync(
+                &runtime,
+                &backend_ok,
+                None,
+                PathBuf::from("src/Use.java"),
+                src,
+                "requireNonNull(o)",
+            ),
+            "java.util.Objects",
+            "return obj;",
+        );
+        assert!(!vf_cache.starts_with(cache_root.join("bytecode")));
+
+        // 2. Subsequent call hits persistent Vineflower cache without invoking java again.
+        let cached_jdk = dummy_test_jdk(
+            &dir.path().join("jdk"),
+            dir.path().join("nonexistent-java"),
+            jmods_dir.clone(),
+        );
+        let backend_cached = LspDefinitionBackend::with_external_config(ExternalDefinitionConfig {
+            jdk_index: Arc::new(JdkOnDemandIndex::from_jmods_dir(jmods_dir.clone())),
+            runtime_jdk: None,
+            decompiler: Some(VineflowerDecompiler::new(
+                vf_jar.clone(),
+                cached_jdk,
+                cache_root.clone(),
+            )),
+            base_dependency_config: DependencyArchiveConfig::default(),
+            cache_root: cache_root.clone(),
+            auto_decompile_class: true,
+        });
+        let (cached_vf_path, _) = assert_decompiled_outcome(
+            resolve_sync(
+                &runtime,
+                &backend_cached,
+                None,
+                PathBuf::from("src/Use.java"),
+                src,
+                "requireNonNull(o)",
+            ),
+            "java.util.Objects",
+            "return obj;",
+        );
+        assert_eq!(cached_vf_path, vf_cache);
+
+        // 3. Cold cache + failing Vineflower -> falls back to cafebabe bytecode decompiler.
+        let fail_cache_root = dir.path().join("cache/decompiled_fail");
+        let fail_java = dir.path().join("mock-java-fail.sh");
+        write_exec_script(&fail_java, "#!/bin/sh\nexit 1\n");
+        let fail_jdk = dummy_test_jdk(&dir.path().join("jdk"), fail_java, jmods_dir.clone());
+        let backend_fallback =
+            LspDefinitionBackend::with_external_config(ExternalDefinitionConfig {
+                jdk_index: Arc::new(JdkOnDemandIndex::from_jmods_dir(jmods_dir)),
+                runtime_jdk: None,
+                decompiler: Some(VineflowerDecompiler::new(
+                    vf_jar,
+                    fail_jdk,
+                    fail_cache_root.clone(),
+                )),
+                base_dependency_config: DependencyArchiveConfig::default(),
+                cache_root: fail_cache_root.clone(),
+                auto_decompile_class: true,
+            });
+
+        let (fb_cache, fb_src) = assert_decompiled_outcome(
+            resolve_sync(
+                &runtime,
+                &backend_fallback,
+                None,
+                PathBuf::from("src/Use.java"),
+                src,
+                "requireNonNull(o)",
+            ),
+            "java.util.Objects",
+            "requireNonNull(",
+        );
+        assert!(fb_cache.starts_with(fail_cache_root.join("bytecode")));
+        assert!(fb_src.contains("/* compiled code */"));
     }
 }

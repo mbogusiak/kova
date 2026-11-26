@@ -276,6 +276,18 @@ pub struct ResolvedLocation {
     pub symbol_name: String,
 }
 
+/// Ordered external JVM FQN candidates and optional member lookup produced for Level-1.5
+/// bytecode/decompilation navigation (`KOVA-061`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExternalTargetCandidates {
+    /// Ordered candidate binary/canonical FQCNs (e.g. `java.util.Objects`, `java.util.Map$Entry`).
+    pub fqcns: Vec<String>,
+    /// Optional member name on the resolved class (e.g. `requireNonNull` in `Objects.requireNonNull`).
+    pub member_name: Option<String>,
+    /// Optional intermediate field chain on the receiver (e.g. `["out"]` for `System.out.println`).
+    pub field_chain: Vec<String>,
+}
+
 pub(crate) const fn is_ident_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
@@ -825,6 +837,448 @@ pub fn resolve_local_definition(
     }
 
     None
+}
+
+/// Resolves ordered external JVM FQCN candidates (plus optional member/field chain) for a
+/// [`SymbolQuery`] in Java or Kotlin source code (`KOVA-061`).
+///
+/// This is pure headless text logic used by Level-1.5 bytecode/decompilation navigation when
+/// Level-1 workspace resolution finds no local match.
+#[must_use]
+pub fn resolve_external_fqcn_candidates(
+    query: &SymbolQuery,
+    source_text: &str,
+) -> ExternalTargetCandidates {
+    if !matches!(
+        query.language,
+        SourceLanguageKind::Java | SourceLanguageKind::Kotlin
+    ) || query.ident.is_empty()
+    {
+        return ExternalTargetCandidates::default();
+    }
+
+    if query.is_import_or_use {
+        return resolve_import_external_candidates(query);
+    }
+
+    if let Some(qual) = query.qualifier.as_deref() {
+        return resolve_qualified_external_candidates(query, source_text, qual);
+    }
+
+    let mut fqcns = Vec::new();
+    let mut member_name = None;
+    expand_simple_type_to_fqcns(
+        &query.ident,
+        query,
+        &mut fqcns,
+        &mut member_name,
+        Some(&query.ident),
+    );
+    ExternalTargetCandidates {
+        fqcns,
+        member_name,
+        field_chain: Vec::new(),
+    }
+}
+
+fn resolve_import_external_candidates(query: &SymbolQuery) -> ExternalTargetCandidates {
+    let Some(imp_path) = query.import_path.as_deref() else {
+        return ExternalTargetCandidates::default();
+    };
+
+    let mut fqcns = Vec::new();
+    let mut member_name = None;
+
+    let matching_static = query.imports.iter().find(|imp| {
+        imp.is_static
+            && (imp.path == imp_path
+                || imp
+                    .path
+                    .strip_prefix(imp_path)
+                    .is_some_and(|rest| rest.starts_with('.')))
+    });
+
+    if let Some(static_imp) = matching_static
+        && static_imp.path == imp_path
+        && let Some((owner, member)) = imp_path.rsplit_once('.')
+    {
+        if member
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+        {
+            push_fqcn_variants(&mut fqcns, imp_path);
+            push_fqcn_variants(&mut fqcns, owner);
+        } else {
+            push_fqcn_variants(&mut fqcns, owner);
+            push_fqcn_variants(&mut fqcns, imp_path);
+        }
+        member_name = Some(member.to_owned());
+        return ExternalTargetCandidates {
+            fqcns,
+            member_name,
+            field_chain: Vec::new(),
+        };
+    }
+
+    push_fqcn_variants(&mut fqcns, imp_path);
+    if let Some((parent, leaf)) = imp_path.rsplit_once('.')
+        && parent
+            .rsplit('.')
+            .next()
+            .is_some_and(|seg| seg.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+    {
+        push_fqcn_variants(&mut fqcns, parent);
+        member_name = Some(leaf.to_owned());
+    }
+
+    ExternalTargetCandidates {
+        fqcns,
+        member_name,
+        field_chain: Vec::new(),
+    }
+}
+
+fn resolve_qualified_external_candidates(
+    query: &SymbolQuery,
+    source_text: &str,
+    qual: &str,
+) -> ExternalTargetCandidates {
+    let parts: Vec<&str> = qual.split('.').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty()
+        || matches!(
+            parts.last().copied(),
+            Some("this" | "super" | "self" | "Self" | "crate")
+        )
+    {
+        return ExternalTargetCandidates::default();
+    }
+
+    let ident_starts_upper = query
+        .ident
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase());
+
+    if parts.len() == 1 {
+        return resolve_single_segment_qualifier(query, source_text, parts[0], ident_starts_upper);
+    }
+
+    let first_starts_upper = parts[0]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase());
+
+    if !first_starts_upper {
+        return resolve_lowercase_multi_qualifier(
+            query,
+            source_text,
+            qual,
+            &parts,
+            ident_starts_upper,
+        );
+    }
+
+    resolve_uppercase_multi_qualifier(query, &parts, ident_starts_upper)
+}
+
+fn resolve_single_segment_qualifier(
+    query: &SymbolQuery,
+    source_text: &str,
+    single: &str,
+    ident_starts_upper: bool,
+) -> ExternalTargetCandidates {
+    let mut fqcns = Vec::new();
+    if let Some(inferred_ty) =
+        infer_receiver_type(source_text, query.ident_range.start, single, query.language)
+    {
+        let mut member_name = Some(query.ident.clone());
+        expand_simple_type_to_fqcns(&inferred_ty, query, &mut fqcns, &mut member_name, None);
+        return ExternalTargetCandidates {
+            fqcns,
+            member_name,
+            field_chain: Vec::new(),
+        };
+    }
+
+    if single
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+    {
+        let mut owners = Vec::new();
+        let mut unused_member = None;
+        expand_simple_type_to_fqcns(single, query, &mut owners, &mut unused_member, None);
+        if ident_starts_upper {
+            for owner in &owners {
+                push_unique(&mut fqcns, format!("{owner}${}", query.ident));
+                push_unique(&mut fqcns, format!("{owner}.{}", query.ident));
+            }
+        }
+        for owner in owners {
+            push_unique(&mut fqcns, owner);
+        }
+        return ExternalTargetCandidates {
+            fqcns,
+            member_name: Some(query.ident.clone()),
+            field_chain: Vec::new(),
+        };
+    }
+
+    ExternalTargetCandidates::default()
+}
+
+fn resolve_lowercase_multi_qualifier(
+    query: &SymbolQuery,
+    source_text: &str,
+    qual: &str,
+    parts: &[&str],
+    ident_starts_upper: bool,
+) -> ExternalTargetCandidates {
+    let mut fqcns = Vec::new();
+    if let Some(inferred_ty) = infer_receiver_type(
+        source_text,
+        query.ident_range.start,
+        parts[0],
+        query.language,
+    ) {
+        let mut unused_member = None;
+        expand_simple_type_to_fqcns(&inferred_ty, query, &mut fqcns, &mut unused_member, None);
+        return ExternalTargetCandidates {
+            fqcns,
+            member_name: Some(query.ident.clone()),
+            field_chain: parts[1..].iter().map(|s| (*s).to_owned()).collect(),
+        };
+    }
+
+    let first_upper_idx = parts
+        .iter()
+        .position(|seg| seg.chars().next().is_some_and(|c| c.is_ascii_uppercase()));
+    if first_upper_idx.is_none() {
+        push_fqcn_variants(&mut fqcns, &format!("{qual}.{}", query.ident));
+        return ExternalTargetCandidates {
+            fqcns,
+            member_name: None,
+            field_chain: Vec::new(),
+        };
+    }
+
+    let last_upper_idx = parts
+        .iter()
+        .rposition(|seg| seg.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+        .unwrap_or(parts.len() - 1);
+
+    if last_upper_idx == parts.len() - 1 {
+        if ident_starts_upper {
+            push_fqcn_variants(&mut fqcns, &format!("{qual}.{}", query.ident));
+        }
+        push_fqcn_variants(&mut fqcns, qual);
+        return ExternalTargetCandidates {
+            fqcns,
+            member_name: Some(query.ident.clone()),
+            field_chain: Vec::new(),
+        };
+    }
+
+    let owner_qual = parts[..=last_upper_idx].join(".");
+    push_fqcn_variants(&mut fqcns, &owner_qual);
+    ExternalTargetCandidates {
+        fqcns,
+        member_name: Some(query.ident.clone()),
+        field_chain: parts[last_upper_idx + 1..]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
+    }
+}
+
+fn resolve_uppercase_multi_qualifier(
+    query: &SymbolQuery,
+    parts: &[&str],
+    ident_starts_upper: bool,
+) -> ExternalTargetCandidates {
+    let mut fqcns = Vec::new();
+    let mut owners = Vec::new();
+    let mut unused_member = None;
+    expand_simple_type_to_fqcns(parts[0], query, &mut owners, &mut unused_member, None);
+
+    let split_at = parts
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, seg)| !seg.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+        .map_or(parts.len(), |(idx, _)| idx);
+
+    if split_at == parts.len() {
+        let nested_dollar = parts[1..].join("$");
+        let nested_dot = parts[1..].join(".");
+        for owner in &owners {
+            if ident_starts_upper {
+                push_unique(
+                    &mut fqcns,
+                    format!("{owner}${nested_dollar}${}", query.ident),
+                );
+            }
+            push_unique(&mut fqcns, format!("{owner}${nested_dollar}"));
+            push_unique(&mut fqcns, format!("{owner}.{nested_dot}"));
+        }
+        for owner in owners {
+            push_unique(&mut fqcns, owner);
+        }
+        return ExternalTargetCandidates {
+            fqcns,
+            member_name: Some(query.ident.clone()),
+            field_chain: Vec::new(),
+        };
+    }
+
+    for owner in &owners {
+        if split_at > 1 {
+            let nested_dollar = parts[1..split_at].join("$");
+            let nested_dot = parts[1..split_at].join(".");
+            push_unique(&mut fqcns, format!("{owner}${nested_dollar}"));
+            push_unique(&mut fqcns, format!("{owner}.{nested_dot}"));
+        } else {
+            push_unique(&mut fqcns, owner.clone());
+        }
+    }
+
+    ExternalTargetCandidates {
+        fqcns,
+        member_name: Some(query.ident.clone()),
+        field_chain: parts[split_at..].iter().map(|s| (*s).to_owned()).collect(),
+    }
+}
+
+fn expand_simple_type_to_fqcns(
+    type_name: &str,
+    query: &SymbolQuery,
+    out: &mut Vec<String>,
+    member_name: &mut Option<String>,
+    ident_for_static: Option<&str>,
+) {
+    if let Some((head, rest)) = type_name.split_once('.') {
+        let mut matched_import = false;
+        for imp in &query.imports {
+            if !imp.is_wildcard && imp.local_name() == Some(head) {
+                push_fqcn_variants(out, &format!("{}.{rest}", imp.path));
+                matched_import = true;
+            }
+        }
+        if !matched_import {
+            if head.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
+                push_fqcn_variants(out, type_name);
+            } else {
+                if let Some(pkg) = query.package_name.as_deref() {
+                    push_fqcn_variants(out, &format!("{pkg}.{type_name}"));
+                }
+                for imp in &query.imports {
+                    if imp.is_wildcard && !imp.is_static {
+                        let pkg = imp.path.trim_end_matches(".*");
+                        push_fqcn_variants(out, &format!("{pkg}.{type_name}"));
+                    }
+                }
+                push_fqcn_variants(out, &format!("java.lang.{type_name}"));
+                push_fqcn_variants(out, type_name);
+            }
+        }
+        return;
+    }
+
+    for imp in &query.imports {
+        if !imp.is_wildcard && imp.local_name() == Some(type_name) {
+            if imp.is_static {
+                if let Some((owner, member)) = imp.path.rsplit_once('.') {
+                    if member_name.is_none() {
+                        *member_name =
+                            Some(ident_for_static.map_or_else(|| member.to_owned(), str::to_owned));
+                    }
+                    if member
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_uppercase())
+                    {
+                        push_fqcn_variants(out, &imp.path);
+                        push_fqcn_variants(out, owner);
+                    } else {
+                        push_fqcn_variants(out, owner);
+                        push_fqcn_variants(out, &imp.path);
+                    }
+                } else {
+                    push_fqcn_variants(out, &imp.path);
+                }
+            } else {
+                push_fqcn_variants(out, &imp.path);
+            }
+        }
+    }
+
+    if let Some(pkg) = query.package_name.as_deref() {
+        push_unique(out, format!("{pkg}.{type_name}"));
+    }
+
+    for imp in &query.imports {
+        if imp.is_wildcard {
+            let pkg = imp.path.trim_end_matches(".*");
+            if imp.is_static {
+                if member_name.is_none()
+                    && let Some(sym) = ident_for_static
+                {
+                    *member_name = Some(sym.to_owned());
+                }
+                push_unique(out, format!("{pkg}${type_name}"));
+                push_unique(out, pkg.to_owned());
+            } else {
+                push_unique(out, format!("{pkg}.{type_name}"));
+            }
+        }
+    }
+
+    push_unique(out, format!("java.lang.{type_name}"));
+}
+
+fn push_fqcn_variants(out: &mut Vec<String>, raw: &str) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let parts: Vec<&str> = trimmed.split('.').filter(|s| !s.is_empty()).collect();
+    if parts.len() >= 2
+        && let Some(first_upper) = parts
+            .iter()
+            .take(parts.len() - 1)
+            .position(|seg| seg.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+    {
+        let pkg = parts[..first_upper].join(".");
+        let nested = parts[first_upper..].join("$");
+        let dollar_fqcn = if pkg.is_empty() {
+            nested
+        } else {
+            format!("{pkg}.{nested}")
+        };
+        push_unique(out, dollar_fqcn);
+    }
+    push_unique(out, trimmed.to_owned());
+    for split_idx in (1..parts.len()).rev() {
+        if parts[split_idx - 1]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+        {
+            let cand = format!(
+                "{}${}",
+                parts[..split_idx].join("."),
+                parts[split_idx..].join("$")
+            );
+            push_unique(out, cand);
+        }
+    }
+}
+
+fn push_unique(out: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !out.contains(&value) {
+        out.push(value);
+    }
 }
 
 fn classify_target(query: &SymbolQuery, source_text: &str) -> (Option<String>, Option<String>) {
@@ -2270,5 +2724,116 @@ public class App { OrderTarget t; }
             elapsed < Duration::from_millis(15),
             "Level-1 resolution took {elapsed:?} (>= 15 ms budget)"
         );
+    }
+
+    #[test]
+    fn external_fqcn_candidates_cover_java_lang_imports_nested_and_receivers() {
+        let src = "\
+package dev.kova.app;
+
+import java.util.Objects;
+import java.util.Map;
+import java.util.*;
+import static java.util.Objects.requireNonNull;
+
+public class Main {
+    public void run(List<String> list) {
+        String s = \"ok\";
+        Objects.requireNonNull(s);
+        requireNonNull(s);
+        Map.Entry<String, String> entry = null;
+        list.size();
+        SamePkgHelper h = null;
+        java.util.Objects.requireNonNull(s);
+        System.out.println(s);
+    }
+}
+";
+        let path = PathBuf::from("src/Main.java");
+        let snap = Buffer::from_text(src).snapshot();
+        let resolve_at = |needle: &str| {
+            let byte = src.find(needle).unwrap();
+            let q = extract_symbol_query(&snap, &path, byte).unwrap();
+            resolve_external_fqcn_candidates(&q, src)
+        };
+
+        // 1. Implicit java.lang.String
+        let c_str = resolve_at("String s");
+        assert!(c_str.fqcns.contains(&"java.lang.String".to_owned()));
+        assert_eq!(c_str.member_name, None);
+
+        // 2. Explicit import `Objects` on import line & in body
+        let c_imp = resolve_at("Objects;");
+        assert_eq!(c_imp.fqcns, vec!["java.util.Objects".to_owned()]);
+        let c_obj = resolve_at("Objects.requireNonNull(s)");
+        assert_eq!(c_obj.fqcns[0], "java.util.Objects");
+        assert_eq!(c_obj.member_name, None);
+
+        // 3. Qualified static method `Objects.requireNonNull`
+        let c_req = resolve_at("requireNonNull(s);");
+        assert_eq!(c_req.fqcns[0], "java.util.Objects");
+        assert_eq!(c_req.member_name.as_deref(), Some("requireNonNull"));
+
+        // 4. Static import usage & import line
+        let c_static_imp = resolve_at("requireNonNull;\n");
+        assert_eq!(c_static_imp.fqcns[0], "java.util.Objects");
+        assert_eq!(c_static_imp.member_name.as_deref(), Some("requireNonNull"));
+        let c_static_call = resolve_at("requireNonNull(s);\n        Map");
+        assert_eq!(c_static_call.fqcns[0], "java.util.Objects");
+        assert_eq!(c_static_call.member_name.as_deref(), Some("requireNonNull"));
+
+        // 5. Nested class `Map.Entry` -> `java.util.Map$Entry`
+        let c_entry = resolve_at("Entry<String");
+        assert_eq!(c_entry.fqcns[0], "java.util.Map$Entry");
+        assert!(c_entry.fqcns.contains(&"java.util.Map".to_owned()));
+
+        // 6. Receiver inference `list.size()`
+        let c_size = resolve_at("size()");
+        assert!(c_size.fqcns.contains(&"java.util.List".to_owned()));
+        assert_eq!(c_size.member_name.as_deref(), Some("size"));
+
+        // 7. Same package + wildcard candidate ordering
+        let c_pkg = resolve_at("SamePkgHelper");
+        assert_eq!(c_pkg.fqcns[0], "dev.kova.app.SamePkgHelper");
+        assert!(c_pkg.fqcns.contains(&"java.util.SamePkgHelper".to_owned()));
+        assert!(c_pkg.fqcns.contains(&"java.lang.SamePkgHelper".to_owned()));
+
+        // 8. Fully qualified in code `java.util.Objects.requireNonNull`
+        let c_fqn_type = resolve_at("Objects.requireNonNull(s);\n        System");
+        assert_eq!(c_fqn_type.fqcns, vec!["java.util.Objects".to_owned()]);
+        let c_fqn_method = resolve_at("requireNonNull(s);\n        System");
+        assert_eq!(c_fqn_method.fqcns, vec!["java.util.Objects".to_owned()]);
+        assert_eq!(c_fqn_method.member_name.as_deref(), Some("requireNonNull"));
+
+        // 9. Chained field access `System.out.println`
+        let c_println = resolve_at("println(s)");
+        assert!(c_println.fqcns.contains(&"java.lang.System".to_owned()));
+        assert_eq!(c_println.field_chain, vec!["out".to_owned()]);
+        assert_eq!(c_println.member_name.as_deref(), Some("println"));
+    }
+
+    #[test]
+    fn external_fqcn_candidates_support_kotlin_alias_and_import_nested() {
+        let kt_src = "\
+package dev.kova.kt
+
+import java.util.List as JList
+import java.util.Map.Entry
+
+fun demo(items: JList<String>, entry: Entry<String, String>) {}
+";
+        let kt_path = PathBuf::from("src/Demo.kt");
+        let snap = Buffer::from_text(kt_src).snapshot();
+
+        let alias_byte = kt_src.find("JList<").unwrap();
+        let q_alias = extract_symbol_query(&snap, &kt_path, alias_byte).unwrap();
+        let c_alias = resolve_external_fqcn_candidates(&q_alias, kt_src);
+        assert_eq!(c_alias.fqcns[0], "java.util.List");
+
+        let imp_entry_byte = kt_src.find("Entry\n").unwrap();
+        let q_imp = extract_symbol_query(&snap, &kt_path, imp_entry_byte).unwrap();
+        let c_imp = resolve_external_fqcn_candidates(&q_imp, kt_src);
+        assert_eq!(c_imp.fqcns[0], "java.util.Map$Entry");
+        assert!(c_imp.fqcns.contains(&"java.util.Map.Entry".to_owned()));
     }
 }

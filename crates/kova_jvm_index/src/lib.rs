@@ -6,8 +6,10 @@
 pub mod bytecode;
 pub mod cache;
 pub mod classpath;
+pub mod decompile_fallback;
 pub mod discovery;
 pub mod error;
+pub mod external_lookup;
 pub mod indexer;
 pub mod jdk_lookup;
 pub mod model;
@@ -25,12 +27,19 @@ pub use classpath::{
     ClasspathDiscoveryConfig, ClasspathEntry, ClasspathOrigin, DEFAULT_MAX_JAR_COUNT,
     discover_classpath,
 };
+pub use decompile_fallback::{cache_bytecode_decompilation, decompile_class_bytes_to_java};
 pub use discovery::{DiscoveredSourceFile, SourceDiscoveryOptions, collect_project_sources};
 pub use error::JvmIndexError;
+pub use external_lookup::{
+    DEFAULT_MAX_DEPENDENCY_JARS, DependencyArchiveConfig, DependencyArchiveIndex,
+    ExternalClassLocator, is_jdk_package_candidate,
+};
 pub use indexer::{
     IndexCancelToken, IndexStats, IndexerConfig, JvmWorkspaceIndex, WorkspaceIndexer,
 };
-pub use jdk_lookup::{JdkOnDemandIndex, JvmCompletionMember, split_display_signature};
+pub use jdk_lookup::{
+    JdkOnDemandIndex, JvmCompletionMember, LocatedClassBytes, split_display_signature,
+};
 pub use model::{
     JvmMemberEntry, JvmModifiers, JvmSourceOrigin, JvmSymbolKind, JvmTypeEntry, JvmVisibility,
     ParsedClassUnit, internal_name_to_binary, internal_name_to_fqcn,

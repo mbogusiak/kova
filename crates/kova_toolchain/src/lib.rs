@@ -34,7 +34,10 @@ pub use omakase::{
     InstalledJdtlsPaths, InstalledOmakaseState, InstalledToolRecord, OmakaseManager,
     OmakaseManifest, OmakasePackageFormat, OmakaseTool, OmakaseToolkit, PinnedArtifactSpec,
 };
-pub use vineflower::{DecompileResult, DecompileTarget, VineflowerDecompiler};
+pub use vineflower::{
+    DecompileResult, DecompileTarget, VineflowerDecompiler, decompile_with_javap_fallback,
+    discover_vineflower_decompiler,
+};
 
 /// Name of this crate as declared in its `Cargo.toml`.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

@@ -6,15 +6,34 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufReader, Read as _};
+use std::io::{BufReader, Cursor, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
 
 use zip::ZipArchive;
 
-use crate::bytecode::{BytecodeScanOptions, parse_class_bytes};
+use crate::bytecode::{BytecodeScanOptions, DEFAULT_MAX_CLASS_BYTES, parse_class_bytes};
 use crate::model::{JvmSourceOrigin, JvmSymbolKind, JvmVisibility, ParsedClassUnit};
 use crate::snapshot::JvmIndexSnapshot;
+
+/// Header preceding the ZIP stream in JDK `.jmod` files.
+const JMOD_MAGIC: [u8; 4] = [b'J', b'M', 1, 0];
+
+/// Raw bytecode and archive coordinates for a located `.class` entry (`KOVA-061`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedClassBytes {
+    /// Canonical or binary FQCN of the located class (e.g. `java.util.Objects`, `java.util.Map$Entry`).
+    pub fqcn: String,
+    /// Path to the `.jmod` or `.jar` archive on disk.
+    pub archive_path: PathBuf,
+    /// Exact entry name inside `archive_path` (e.g. `classes/java/util/Map$Entry.class`).
+    pub entry_name: String,
+    /// Companion outer-class entry name (e.g. `classes/java/util/Map.class`), or `entry_name`
+    /// when this is a top-level class or no outer entry exists in the archive.
+    pub outer_entry_name: String,
+    /// Raw `.class` bytes.
+    pub bytes: Vec<u8>,
+}
 
 /// Maximum depth when traversing `super_fqcn` and `interfaces` for inherited completion members.
 const MAX_INHERITANCE_DEPTH: usize = 8;
@@ -340,9 +359,30 @@ impl JdkOnDemandIndex {
         None
     }
 
-    fn load_class_uncached(&self, fqcn: &str) -> Option<ParsedClassUnit> {
+    /// Locates and reads raw `.class` bytes for `fqcn` from `.jmod` or `rt.jar` archives without
+    /// parsing the full class model.
+    #[must_use]
+    pub fn locate_class_bytes(&self, fqcn: &str) -> Option<LocatedClassBytes> {
         let entry_candidates = fqcn_entry_candidates(fqcn);
         let jmods = self.ordered_jmods_for(fqcn);
+
+        for jmod_path in jmods {
+            if let Some(located) = locate_in_jmod(&jmod_path, &entry_candidates) {
+                return Some(located);
+            }
+        }
+
+        if let Some(rt_path) = &self.rt_jar
+            && let Some(located) = locate_in_jar_archive(rt_path, &entry_candidates)
+        {
+            return Some(located);
+        }
+
+        None
+    }
+
+    fn load_class_uncached(&self, fqcn: &str) -> Option<ParsedClassUnit> {
+        let located = self.locate_class_bytes(fqcn)?;
         let opts = BytecodeScanOptions {
             include_members: true,
             include_private_members: false,
@@ -350,61 +390,24 @@ impl JdkOnDemandIndex {
             skip_anonymous_and_synthetic: true,
             ..BytecodeScanOptions::default()
         };
-
-        for jmod_path in jmods {
-            let Ok(file) = File::open(&jmod_path) else {
-                continue;
-            };
-            let Ok(mut archive) = ZipArchive::new(BufReader::new(file)) else {
-                continue;
-            };
-            for rel_internal in &entry_candidates {
-                let entry_name = format!("classes/{rel_internal}.class");
-                if let Ok(mut entry) = archive.by_name(&entry_name) {
-                    let mut bytes = Vec::with_capacity(
-                        usize::try_from(entry.size())
-                            .unwrap_or(4096)
-                            .min(1024 * 1024),
-                    );
-                    if entry.read_to_end(&mut bytes).is_ok() {
-                        let origin = JvmSourceOrigin::JmodEntry {
-                            jmod_path: jmod_path.clone(),
-                            entry_name,
-                        };
-                        if let Ok(Some(unit)) = parse_class_bytes(&bytes, origin, &opts) {
-                            return Some(unit);
-                        }
-                    }
-                }
+        let is_jmod = located
+            .archive_path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("jmod"));
+        let origin = if is_jmod {
+            JvmSourceOrigin::JmodEntry {
+                jmod_path: located.archive_path,
+                entry_name: located.entry_name,
             }
-        }
-
-        if let Some(rt_path) = &self.rt_jar
-            && let Ok(file) = File::open(rt_path)
-            && let Ok(mut archive) = ZipArchive::new(BufReader::new(file))
-        {
-            for rel_internal in &entry_candidates {
-                let entry_name = format!("{rel_internal}.class");
-                if let Ok(mut entry) = archive.by_name(&entry_name) {
-                    let mut bytes = Vec::with_capacity(
-                        usize::try_from(entry.size())
-                            .unwrap_or(4096)
-                            .min(1024 * 1024),
-                    );
-                    if entry.read_to_end(&mut bytes).is_ok() {
-                        let origin = JvmSourceOrigin::JarEntry {
-                            jar_path: rt_path.clone(),
-                            entry_name,
-                        };
-                        if let Ok(Some(unit)) = parse_class_bytes(&bytes, origin, &opts) {
-                            return Some(unit);
-                        }
-                    }
-                }
+        } else {
+            JvmSourceOrigin::JarEntry {
+                jar_path: located.archive_path,
+                entry_name: located.entry_name,
             }
-        }
-
-        None
+        };
+        parse_class_bytes(&located.bytes, origin, &opts)
+            .ok()
+            .flatten()
     }
 
     fn ordered_jmods_for(&self, fqcn: &str) -> Vec<PathBuf> {
@@ -496,9 +499,84 @@ fn preferred_jmod_stem(fqcn: &str) -> Option<&'static str> {
     None
 }
 
-fn fqcn_entry_candidates(fqcn: &str) -> Vec<String> {
+fn locate_in_jmod(jmod_path: &Path, entry_candidates: &[String]) -> Option<LocatedClassBytes> {
+    let file = File::open(jmod_path).ok()?;
+    if let Ok(mut archive) = ZipArchive::new(BufReader::new(file)) {
+        return read_from_archive(&mut archive, jmod_path, "classes/", entry_candidates);
+    }
+
+    // Fallback for `.jmod` files whose 4-byte `JM\x01\x00` header causes direct ZIP parsing to fail.
+    let mut raw = Vec::new();
+    File::open(jmod_path).ok()?.read_to_end(&mut raw).ok()?;
+    if raw.starts_with(&JMOD_MAGIC) {
+        let mut archive = ZipArchive::new(Cursor::new(&raw[JMOD_MAGIC.len()..])).ok()?;
+        return read_from_archive(&mut archive, jmod_path, "classes/", entry_candidates);
+    }
+    None
+}
+
+fn locate_in_jar_archive(
+    jar_path: &Path,
+    entry_candidates: &[String],
+) -> Option<LocatedClassBytes> {
+    let file = File::open(jar_path).ok()?;
+    let mut archive = ZipArchive::new(BufReader::new(file)).ok()?;
+    read_from_archive(&mut archive, jar_path, "", entry_candidates)
+}
+
+fn read_from_archive<R: std::io::Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+    archive_path: &Path,
+    prefix: &str,
+    entry_candidates: &[String],
+) -> Option<LocatedClassBytes> {
+    for rel_internal in entry_candidates {
+        let entry_name = format!("{prefix}{rel_internal}.class");
+        let bytes = {
+            let Ok(mut entry) = archive.by_name(&entry_name) else {
+                continue;
+            };
+            read_zip_entry_bounded(&mut entry, DEFAULT_MAX_CLASS_BYTES)?
+        };
+        let outer_entry_name = if let Some((outer_internal, _)) = rel_internal.split_once('$') {
+            let outer_candidate = format!("{prefix}{outer_internal}.class");
+            if archive.by_name(&outer_candidate).is_ok() {
+                outer_candidate
+            } else {
+                entry_name.clone()
+            }
+        } else {
+            entry_name.clone()
+        };
+        return Some(LocatedClassBytes {
+            fqcn: rel_internal.replace('/', "."),
+            archive_path: archive_path.to_path_buf(),
+            entry_name,
+            outer_entry_name,
+            bytes,
+        });
+    }
+    None
+}
+
+pub(crate) fn read_zip_entry_bounded<R: std::io::Read>(
+    entry: &mut R,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(4096);
+    entry.take(limit).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > max_bytes {
+        return None;
+    }
+    Some(bytes)
+}
+
+pub(crate) fn fqcn_entry_candidates(fqcn: &str) -> Vec<String> {
     let slash = fqcn.replace('.', "/");
-    let mut out = vec![slash.clone()];
+    let mut out = vec![slash];
     // Also support nested classes (`java.util.Map.Entry` -> `java/util/Map$Entry`).
     let parts: Vec<&str> = fqcn.split('.').collect();
     for split_idx in (1..parts.len()).rev() {
