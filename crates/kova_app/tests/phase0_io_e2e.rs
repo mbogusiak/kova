@@ -105,7 +105,10 @@ async fn next_theme_or_warning(rx: &mut UnboundedReceiver<ThemeWatchEvent>) -> T
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match rx.recv().await.expect("theme channel open") {
-                ThemeWatchEvent::ConfigReloaded => {}
+                // Settings view snapshots (`KOVA-029`) are covered by their own test.
+                ThemeWatchEvent::ConfigReloaded
+                | ThemeWatchEvent::Settings(_)
+                | ThemeWatchEvent::SettingsInvalid(_) => {}
                 other => return other,
             }
         }
@@ -163,4 +166,62 @@ async fn theme_live_reload_switches_and_survives_invalid_toml() {
     // `--config-dir` maps onto the same directory.
     let resolved = theme_watch::resolve_paths(Some(&config)).expect("resolve");
     assert_eq!(resolved.config_dir(), config.as_path());
+}
+
+async fn next_settings_event(rx: &mut UnboundedReceiver<ThemeWatchEvent>) -> ThemeWatchEvent {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = rx.recv().await.expect("theme channel open");
+            if matches!(
+                event,
+                ThemeWatchEvent::Settings(_) | ThemeWatchEvent::SettingsInvalid(_)
+            ) {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for a settings snapshot")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_snapshots_follow_reloads_for_the_settings_view() {
+    let root = TempDir::new().expect("tempdir");
+    let config = root.path().join("config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let paths = KovaPaths::from_roots(
+        config.clone(),
+        root.path().join("data"),
+        root.path().join("cache"),
+    )
+    .expect("absolute roots");
+    let initial = "# mine\n[editor]\nvim_mode = true # modal\n";
+    std::fs::write(paths.settings_file(), initial).expect("settings");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let watch = theme_watch::start(paths.clone(), tx).expect("start watcher");
+
+    let event = next_settings_event(&mut rx).await;
+    let ThemeWatchEvent::Settings(source) = event else {
+        panic!("expected a settings snapshot, got {event:?}");
+    };
+    assert_eq!(source.contents.as_deref(), Some(initial));
+    assert_eq!(source.settings_path, paths.settings_file());
+    assert_eq!(source.keymap_path, paths.keymap_file());
+    assert!(source.theme_ids.iter().any(|id| id == "kova-light"));
+
+    let edited = "# mine\n[editor]\nvim_mode = false # modal\n";
+    write_settings(&watch, &paths, edited).await;
+    let event = next_settings_event(&mut rx).await;
+    let ThemeWatchEvent::Settings(source) = event else {
+        panic!("expected a settings snapshot, got {event:?}");
+    };
+    assert_eq!(source.contents.as_deref(), Some(edited));
+
+    write_settings(&watch, &paths, "[editor\n").await;
+    let event = next_settings_event(&mut rx).await;
+    let ThemeWatchEvent::SettingsInvalid(message) = event else {
+        panic!("expected an invalid-settings report, got {event:?}");
+    };
+    assert_ne!(message, "");
 }

@@ -3258,9 +3258,11 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "kova_buffer",
+ "kova_config",
  "kova_core",
  "kova_syntax",
  "kova_theme",
+ "sha2 0.10.9",
  "smallvec",
 ]
 

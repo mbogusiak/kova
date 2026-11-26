@@ -455,6 +455,36 @@ impl EditorView {
         self.font_size_px
     }
 
+    /// Returns the editor font family.
+    #[must_use]
+    pub fn font_family(&self) -> &str {
+        self.font_family.as_ref()
+    }
+
+    /// Applies `editor.font_family` / `editor.font_size` from `settings.toml` (`KOVA-029`).
+    ///
+    /// The size is clamped to `6.0..=72.0`; shaped lines are invalidated and the row height
+    /// is re-quantized for the new size.
+    pub fn set_font(&mut self, family: &str, size_px: f32, cx: &mut Context<'_, Self>) {
+        let size = if size_px.is_finite() {
+            size_px.clamp(6.0, 72.0)
+        } else {
+            DEFAULT_EDITOR_FONT_SIZE_PX
+        };
+        let family = family.trim();
+        let family_changed = !family.is_empty() && family != self.font_family.as_ref();
+        if !family_changed && (size - self.font_size_px).abs() < f32::EPSILON {
+            return;
+        }
+        if family_changed {
+            self.font_family = SharedString::from(family.to_owned());
+        }
+        self.font_size_px = size;
+        self.last_viewport.line_height = ViewportMetrics::quantized_line_height(size);
+        self.line_cache = ShapedLineCache::default();
+        cx.notify();
+    }
+
     /// Returns the current scroll offset `(x, y)` in logical pixels.
     #[must_use]
     pub const fn scroll_offset(&self) -> Point<f32> {

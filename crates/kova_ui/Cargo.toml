@@ -11,9 +11,11 @@ publish.workspace      = true
 [dependencies]
 gpui.workspace        = true
 kova_buffer.workspace = true
+kova_config.workspace = true
 kova_core.workspace   = true
 kova_syntax.workspace = true
 kova_theme.workspace  = true
+sha2.workspace        = true
 smallvec.workspace    = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
