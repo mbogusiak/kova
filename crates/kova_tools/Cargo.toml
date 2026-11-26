@@ -14,11 +14,17 @@ kova_config        = { workspace = true }
 kova_theme         = { workspace = true }
 kova_toolchain     = { workspace = true }
 portable-pty       = { workspace = true }
+reqwest            = { workspace = true }
 roxmltree          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
 thiserror          = { workspace = true }
+tokio              = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+kova_buffer = { workspace = true }
+kova_syntax = { workspace = true }
+tempfile    = { workspace = true }
 
 [lints]
 workspace = true

@@ -3316,13 +3316,19 @@ name = "kova_tools"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "kova_buffer",
  "kova_config",
+ "kova_syntax",
  "kova_theme",
  "kova_toolchain",
  "portable-pty",
+ "reqwest",
  "roxmltree",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

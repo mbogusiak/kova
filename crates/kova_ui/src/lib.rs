@@ -8,6 +8,7 @@ pub mod debugger;
 pub mod dock;
 pub mod document;
 pub mod editor;
+pub mod http_runner;
 pub mod keymap;
 pub mod settings;
 pub mod shell;
