@@ -125,8 +125,8 @@ fn rayon_cancellation_and_latest_wins() {
         .parse_sync(SyntaxLanguage::Json, &final_snap, None)
         .expect("reference full parse");
     assert_eq!(
-        final_tree.root_node().to_sexp(),
-        reference.root_node().to_sexp()
+        final_tree.root_node().unwrap().to_sexp(),
+        reference.root_node().unwrap().to_sexp()
     );
     assert!(
         completed_count.load(Ordering::Acquire) >= 1,
@@ -208,7 +208,7 @@ fn incremental_edit_matches_full_reparse_for_insert_and_delete_lines() {
     let tree0: SyntaxTree = engine
         .parse_sync(SyntaxLanguage::Json, &snap0, None)
         .expect("v0 parse");
-    let tree0_sexp = tree0.root_node().to_sexp();
+    let tree0_sexp = tree0.root_node().unwrap().to_sexp();
 
     // Insert two lines in the middle.
     let insert_at = initial.find("  \"beta\"").expect("beta line");
@@ -240,9 +240,12 @@ fn incremental_edit_matches_full_reparse_for_insert_and_delete_lines() {
     let full1 = engine
         .parse_sync(SyntaxLanguage::Json, &snap1, None)
         .expect("full v1");
-    assert_eq!(tree1.root_node().to_sexp(), full1.root_node().to_sexp());
+    assert_eq!(
+        tree1.root_node().unwrap().to_sexp(),
+        full1.root_node().unwrap().to_sexp()
+    );
     // `tree0` remains completely unchanged.
-    assert_eq!(tree0.root_node().to_sexp(), tree0_sexp);
+    assert_eq!(tree0.root_node().unwrap().to_sexp(), tree0_sexp);
 
     // Now delete a line in the middle using a TextEdit delta.
     let text1 = snap1.text();
@@ -267,7 +270,10 @@ fn incremental_edit_matches_full_reparse_for_insert_and_delete_lines() {
     let full2 = engine
         .parse_sync(SyntaxLanguage::Json, &snap2, None)
         .expect("full v2");
-    assert_eq!(tree2.root_node().to_sexp(), full2.root_node().to_sexp());
+    assert_eq!(
+        tree2.root_node().unwrap().to_sexp(),
+        full2.root_node().unwrap().to_sexp()
+    );
 }
 
 #[test]

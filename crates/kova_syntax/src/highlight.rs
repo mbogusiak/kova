@@ -106,14 +106,33 @@ impl Highlighter {
         let Some(entry) = self.registry.get(tree.language()) else {
             return Ok(Vec::new());
         };
+        if let Some(doc) = tree.scanned() {
+            let spans = doc.spans();
+            let start_idx = spans.partition_point(|s| s.range.end <= byte_range.start);
+            let mut out = Vec::new();
+            for span in &spans[start_idx..] {
+                if span.range.start >= byte_range.end {
+                    break;
+                }
+                let start = span.range.start.max(byte_range.start);
+                let end = span.range.end.min(byte_range.end);
+                if start < end {
+                    out.push(HighlightSpan::new(start..end, span.kind));
+                }
+            }
+            return Ok(out);
+        }
         let Some(highlight_query) = entry.highlight_query() else {
+            return Ok(Vec::new());
+        };
+        let Some(root_node) = tree.root_node() else {
             return Ok(Vec::new());
         };
 
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(byte_range.clone());
         let provider = RopeTextProvider::from_snapshot(snapshot);
-        let mut matches = cursor.matches(highlight_query.query(), tree.root_node(), provider);
+        let mut matches = cursor.matches(highlight_query.query(), root_node, provider);
 
         let mut candidates = Vec::new();
         while let Some(mat) = matches.next() {

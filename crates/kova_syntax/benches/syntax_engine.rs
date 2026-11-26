@@ -60,7 +60,7 @@ fn bench_full_parse_10k_lines_json(c: &mut Criterion) {
             let tree = engine
                 .parse_sync(SyntaxLanguage::Json, black_box(&snapshot), None)
                 .expect("full parse succeeds");
-            black_box(tree.root_node().end_byte());
+            black_box(tree.root_node().expect("json root node").end_byte());
         });
     });
 }

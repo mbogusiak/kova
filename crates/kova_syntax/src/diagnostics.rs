@@ -27,7 +27,14 @@ pub fn collect_syntax_diagnostics(tree: &SyntaxTree, max: usize) -> Vec<SyntaxDi
     if !tree.has_error() || max == 0 {
         return diagnostics;
     }
-    let mut stack = vec![tree.root_node()];
+    if let Some(doc) = tree.scanned() {
+        diagnostics.extend(doc.diagnostics().iter().take(max).cloned());
+        return diagnostics;
+    }
+    let Some(root) = tree.root_node() else {
+        return diagnostics;
+    };
+    let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if diagnostics.len() >= max {
             break;

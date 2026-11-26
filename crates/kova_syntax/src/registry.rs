@@ -175,11 +175,11 @@ fn resolve_fold_capture(name: &str) -> Option<FoldKind> {
     }
 }
 
-/// Immutable entry describing a registered Tree-sitter grammar and its optional queries.
+/// Immutable entry describing a registered language backend (Tree-sitter grammar or built-in scanner).
 #[derive(Debug, Clone)]
 pub struct LanguageEntry {
     language: SyntaxLanguage,
-    ts_language: tree_sitter::Language,
+    ts_language: Option<tree_sitter::Language>,
     highlight_query: Option<Arc<HighlightQuery>>,
     fold_query: Option<Arc<FoldQuery>>,
     entry_points_query: Option<Arc<tree_sitter::Query>>,
@@ -192,10 +192,16 @@ impl LanguageEntry {
         self.language
     }
 
-    /// Returns the underlying Tree-sitter [`tree_sitter::Language`].
+    /// Returns the underlying Tree-sitter [`tree_sitter::Language`], or `None` for scanner-backed languages.
     #[must_use]
-    pub const fn ts_language(&self) -> &tree_sitter::Language {
-        &self.ts_language
+    pub const fn ts_language(&self) -> Option<&tree_sitter::Language> {
+        self.ts_language.as_ref()
+    }
+
+    /// Returns `true` when this entry uses a Tree-sitter grammar backend rather than the built-in scanner.
+    #[must_use]
+    pub const fn is_tree_sitter(&self) -> bool {
+        self.ts_language.is_some()
     }
 
     /// Returns the precompiled [`HighlightQuery`] for this language, if registered.
@@ -230,10 +236,11 @@ impl LanguageRegistry {
         Self::default()
     }
 
-    /// Creates a [`LanguageRegistry`] pre-populated with all 5 built-in grammars
-    /// (`Java`, `Kotlin`, `Http`, `Toml`, `Json`), their compiled `highlights.scm` and
-    /// `folds.scm` queries, and entry-point queries (`entry_points.scm`) for `Java`, `Kotlin`,
-    /// and `Http`.
+    /// Creates a [`LanguageRegistry`] pre-populated with all 8 built-in languages
+    /// (`Java`, `Kotlin`, `Http`, `Toml`, `Json`, `Yaml`, `Xml`, `Groovy`), including compiled
+    /// `highlights.scm` and `folds.scm` queries for Tree-sitter grammars, entry-point queries
+    /// (`entry_points.scm`) for `Java`, `Kotlin`, and `Http`, and built-in scanners for
+    /// `Yaml`, `Xml`, and `Groovy`.
     ///
     /// Prefer [`Self::builtin`] on hot paths to reuse the process-wide cached registry.
     ///
@@ -278,10 +285,13 @@ impl LanguageRegistry {
             JSON_FOLDS_SCM,
             None,
         )?;
+        registry.register_scanner(SyntaxLanguage::Yaml);
+        registry.register_scanner(SyntaxLanguage::Xml);
+        registry.register_scanner(SyntaxLanguage::Groovy);
         Ok(registry)
     }
 
-    /// Returns a process-wide cached [`LanguageRegistry`] containing all 5 built-in grammars
+    /// Returns a process-wide cached [`LanguageRegistry`] containing all 8 built-in languages
     /// and compiled highlight, fold, and entry-point queries, compiling them at most once per
     /// process.
     ///
@@ -293,6 +303,20 @@ impl LanguageRegistry {
             .get_or_init(Self::with_defaults)
             .as_ref()
             .map_err(Clone::clone)
+    }
+
+    /// Registers a scanner-backed language (`Yaml`, `Xml`, or `Groovy`) in this registry.
+    pub fn register_scanner(&mut self, language: SyntaxLanguage) {
+        self.entries.insert(
+            language,
+            Arc::new(LanguageEntry {
+                language,
+                ts_language: None,
+                highlight_query: None,
+                fold_query: None,
+                entry_points_query: None,
+            }),
+        );
     }
 
     /// Validates ABI compatibility and registers `ts_language` under `language` without
@@ -404,7 +428,7 @@ impl LanguageRegistry {
             language,
             Arc::new(LanguageEntry {
                 language,
-                ts_language,
+                ts_language: Some(ts_language),
                 highlight_query,
                 fold_query,
                 entry_points_query,
@@ -459,8 +483,9 @@ fn validate_language_abi(
 
 /// Detects the canonical [`SyntaxLanguage`] for a file path using ASCII case-insensitive extension matching.
 ///
-/// Recognizes `.java`, `.kt`, `.kts`, `.http`, `.toml` (including `Cargo.toml`, `settings.toml`,
-/// `kova.toml`), and `.json`.
+/// Recognizes `.java`, `.kt`, `.kts` (including `.gradle.kts`), `.http`, `.toml` (including
+/// `Cargo.toml`, `settings.toml`, `kova.toml`), `.json`, `.yaml`/`.yml`, `.xml`/`.pom`/`.xsd`,
+/// and `.groovy`/`.gradle`.
 #[must_use]
 pub fn detect_language(path: &Path) -> Option<SyntaxLanguage> {
     let ext = path.extension()?.to_str()?;
@@ -474,6 +499,15 @@ pub fn detect_language(path: &Path) -> Option<SyntaxLanguage> {
         Some(SyntaxLanguage::Toml)
     } else if ext.eq_ignore_ascii_case("json") {
         Some(SyntaxLanguage::Json)
+    } else if ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml") {
+        Some(SyntaxLanguage::Yaml)
+    } else if ext.eq_ignore_ascii_case("xml")
+        || ext.eq_ignore_ascii_case("pom")
+        || ext.eq_ignore_ascii_case("xsd")
+    {
+        Some(SyntaxLanguage::Xml)
+    } else if ext.eq_ignore_ascii_case("groovy") || ext.eq_ignore_ascii_case("gradle") {
+        Some(SyntaxLanguage::Groovy)
     } else {
         None
     }
@@ -521,6 +555,34 @@ mod tests {
             detect_language(Path::new("app.config.json")),
             Some(SyntaxLanguage::Json)
         );
+        assert_eq!(
+            detect_language(Path::new("application.yaml")),
+            Some(SyntaxLanguage::Yaml)
+        );
+        assert_eq!(
+            detect_language(Path::new("docker-compose.YML")),
+            Some(SyntaxLanguage::Yaml)
+        );
+        assert_eq!(
+            detect_language(Path::new("pom.xml")),
+            Some(SyntaxLanguage::Xml)
+        );
+        assert_eq!(
+            detect_language(Path::new("artifact.POM")),
+            Some(SyntaxLanguage::Xml)
+        );
+        assert_eq!(
+            detect_language(Path::new("schema.xsd")),
+            Some(SyntaxLanguage::Xml)
+        );
+        assert_eq!(
+            detect_language(Path::new("Script.groovy")),
+            Some(SyntaxLanguage::Groovy)
+        );
+        assert_eq!(
+            detect_language(Path::new("build.GRADLE")),
+            Some(SyntaxLanguage::Groovy)
+        );
         assert_eq!(detect_language(Path::new("README")), None);
         assert_eq!(detect_language(Path::new("script.py")), None);
         assert_eq!(detect_language(Path::new("api.rest")), None);
@@ -564,9 +626,9 @@ mod tests {
     }
 
     #[test]
-    fn builtin_registry_returns_all_five_languages() {
+    fn builtin_registry_returns_all_eight_languages() {
         let registry = LanguageRegistry::builtin().unwrap();
-        assert_eq!(registry.len(), 5);
+        assert_eq!(registry.len(), 8);
         for lang in [
             SyntaxLanguage::Java,
             SyntaxLanguage::Kotlin,
@@ -575,12 +637,25 @@ mod tests {
             SyntaxLanguage::Json,
         ] {
             let entry = registry.get(lang).unwrap();
+            assert!(entry.is_tree_sitter());
+            assert!(entry.ts_language().is_some());
             assert!(entry.highlight_query().is_some());
             let expects_entry_points = matches!(
                 lang,
                 SyntaxLanguage::Java | SyntaxLanguage::Kotlin | SyntaxLanguage::Http
             );
             assert_eq!(entry.entry_points_query().is_some(), expects_entry_points);
+        }
+        for lang in [
+            SyntaxLanguage::Yaml,
+            SyntaxLanguage::Xml,
+            SyntaxLanguage::Groovy,
+        ] {
+            let entry = registry.get(lang).unwrap();
+            assert!(!entry.is_tree_sitter());
+            assert!(entry.ts_language().is_none());
+            assert!(entry.highlight_query().is_none());
+            assert!(entry.entry_points_query().is_none());
         }
     }
 }

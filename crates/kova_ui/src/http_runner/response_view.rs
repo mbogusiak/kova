@@ -100,12 +100,14 @@ pub struct PreparedResponse {
 }
 
 impl PreparedResponse {
-    /// Formats `response` for display; JSON bodies are highlighted through `kova_syntax`.
+    /// Formats `response` for display; JSON and XML bodies are highlighted through `kova_syntax`.
     #[must_use]
     pub fn new(title: String, response: &HttpResponseData) -> Self {
         let preview = body_preview(response);
         let body = if preview.kind == HttpBodyKind::Json && preview.pretty {
-            highlight_json_lines(&preview.text)
+            highlight_body_lines(&preview.text, SyntaxLanguage::Json)
+        } else if preview.kind == HttpBodyKind::Xml && !preview.text.is_empty() {
+            highlight_body_lines(&preview.text, SyntaxLanguage::Xml)
         } else {
             plain_lines(&preview.text)
         };
@@ -137,15 +139,13 @@ fn plain_lines(text: &str) -> Arc<[StyledLine]> {
     text.lines().map(StyledLine::plain).collect()
 }
 
-/// Splits `text` into lines and attaches `kova_syntax` JSON highlight spans to each.
+/// Splits `text` into lines and attaches `kova_syntax` highlight spans for `language` to each.
 #[must_use]
-pub fn highlight_json_lines(text: &str) -> Arc<[StyledLine]> {
+pub fn highlight_body_lines(text: &str, language: SyntaxLanguage) -> Arc<[StyledLine]> {
     let spans = highlight_engine()
         .and_then(|engine| {
             let snapshot = Buffer::from_text(text).snapshot();
-            let tree = engine
-                .parse_sync(SyntaxLanguage::Json, &snapshot, None)
-                .ok()?;
+            let tree = engine.parse_sync(language, &snapshot, None).ok()?;
             let highlighter = Highlighter::from_builtin().ok()?;
             highlighter
                 .highlight_range(&tree, &snapshot, 0..snapshot.len_bytes())
@@ -153,6 +153,12 @@ pub fn highlight_json_lines(text: &str) -> Arc<[StyledLine]> {
         })
         .unwrap_or_default();
     split_styled_lines(text, spans.iter().map(|s| (s.range.clone(), s.kind)))
+}
+
+/// Splits `text` into lines and attaches `kova_syntax` JSON highlight spans to each.
+#[must_use]
+pub fn highlight_json_lines(text: &str) -> Arc<[StyledLine]> {
+    highlight_body_lines(text, SyntaxLanguage::Json)
 }
 
 /// Splits `text` on `\n` and distributes absolute `spans` (sorted, disjoint) onto lines.
@@ -603,6 +609,33 @@ mod tests {
             "content-type: application/json"
         );
         assert_eq!(prepared.raw[0].text.as_ref(), "HTTP/1.1 200 OK");
+    }
+
+    #[test]
+    fn prepared_xml_response_is_highlighted() {
+        let prepared = PreparedResponse::new(
+            "GET http://x/".to_owned(),
+            &response(
+                200,
+                "application/xml",
+                "<order id=\"42\">\n  <status>OK</status>\n</order>",
+            ),
+        );
+        assert_eq!(prepared.body.len(), 3);
+        assert!(
+            prepared.body[0]
+                .spans
+                .iter()
+                .any(|(_, kind)| *kind == SyntaxTokenKind::Keyword),
+            "XML body must carry kova_syntax highlight spans"
+        );
+        assert!(
+            prepared.body[0]
+                .spans
+                .iter()
+                .any(|(_, kind)| *kind == SyntaxTokenKind::Property),
+            "XML attribute must be highlighted"
+        );
     }
 
     #[test]

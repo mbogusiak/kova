@@ -40,7 +40,7 @@ use kova_core::project::{ActiveProject, ProjectScanOptions, scan_project};
 use kova_syntax::{
     Highlighter, LanguageRegistry, SyntaxEngine, SyntaxEngineConfig, detect_language,
 };
-use kova_theme::SyntaxLanguage;
+use kova_theme::{RgbaColor, SyntaxLanguage};
 
 mod completion;
 mod debug;
@@ -289,6 +289,9 @@ struct Palette {
     run_icon: Hsla,
     warning: Hsla,
     error: Hsla,
+    badge_groovy: RgbaColor,
+    badge_xml: RgbaColor,
+    badge_yaml: RgbaColor,
 }
 
 impl Palette {
@@ -309,6 +312,9 @@ impl Palette {
             run_icon: hsla_from_rgba(theme.gutter().run_icon),
             warning: hsla_from_rgba(theme.editor().diagnostic_warning),
             error: hsla_from_rgba(theme.editor().diagnostic_error),
+            badge_groovy: theme.tokens().syntax.string.fg,
+            badge_xml: theme.tokens().syntax.annotation.fg,
+            badge_yaml: theme.tokens().syntax.property.fg,
         }
     }
 }
@@ -2535,7 +2541,9 @@ impl WorkspaceShell {
         let Some(editor) = self.active_editor().cloned() else {
             return;
         };
-        let comment_prefix = line_comment_prefix(self.active_document_key().as_deref());
+        let active_key = self.active_document_key();
+        let comment_prefix = line_comment_prefix(active_key.as_deref());
+        let (block_open, block_close) = block_comment_delimiters(active_key.as_deref());
         let indent_width = usize::from(self.applied_settings.editor.tab_size).max(1);
         editor.update(cx, |editor, cx| match action {
             ShellAction::DuplicateLine => editor.duplicate_lines(window, cx),
@@ -2547,7 +2555,7 @@ impl WorkspaceShell {
             ShellAction::SelectAllOccurrences => editor.select_all_occurrences(window, cx),
             ShellAction::DeleteLine => editor.delete_lines(window, cx),
             ShellAction::ToggleBlockComment => {
-                editor.toggle_block_comment("/*", "*/", window, cx);
+                editor.toggle_block_comment(block_open, block_close, window, cx);
             }
             ShellAction::MoveLine(up) => editor.move_lines(up, window, cx),
             ShellAction::ExtendSelection => editor.extend_selection(window, cx),
@@ -2997,10 +3005,10 @@ impl WorkspaceShell {
                 let match_text = path.to_string_lossy().into_owned();
                 SearchEntry {
                     kind: SearchEntryKind::File,
+                    icon: file_search_icon(&title),
                     title,
                     subtitle,
                     match_text,
-                    icon: SearchEntryKind::File.default_icon(),
                     shortcut_hint: None,
                     target: SearchTarget::File { path, line: None },
                 }
@@ -3362,10 +3370,10 @@ impl WorkspaceShell {
             let match_text = path.to_string_lossy().into_owned();
             entries.push(SearchEntry {
                 kind: SearchEntryKind::File,
+                icon: file_search_icon(&title),
                 title,
                 subtitle: subtitle.clone(),
                 match_text,
-                icon: SearchEntryKind::File.default_icon(),
                 shortcut_hint: None,
                 target: SearchTarget::File {
                     path: path.clone(),
@@ -5260,12 +5268,15 @@ impl WorkspaceShell {
                 .text_size(px(10.0))
                 .child("RO")
         });
+        let tab_hint = tab
+            .path
+            .as_deref()
+            .map_or("·", |path| lang_hint_for(&path.to_string_lossy()));
         el.child(
-            div().text_color(p.tab_indicator).text_size(px(10.0)).child(
-                tab.path
-                    .as_deref()
-                    .map_or("·", |path| lang_hint_for(&path.to_string_lossy())),
-            ),
+            div()
+                .text_color(file_badge_color(tab_hint, p))
+                .text_size(px(10.0))
+                .child(tab_hint),
         )
         .child(tab.display_title(compact))
         .children(ro_badge)
@@ -5792,16 +5803,57 @@ fn is_vim_insert_exit(keystroke: &gpui::Keystroke) -> bool {
 }
 
 /// Line comment prefix for `Cmd+/` by file type (`#` for TOML, YAML, properties, shell and
-/// `.http` files; `//` otherwise).
+/// `.http` files; `//` otherwise, including Java, Kotlin, Groovy and `.gradle`).
 fn line_comment_prefix(path: Option<&Path>) -> &'static str {
     let ext = path
         .and_then(Path::extension)
         .and_then(|ext| ext.to_str())
-        .unwrap_or_default();
-    match ext {
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
         "toml" | "yaml" | "yml" | "properties" | "sh" | "bash" | "zsh" | "http" | "rest" | "py"
         | "gitignore" => "#",
         _ => "//",
+    }
+}
+
+/// Block comment delimiters for `Cmd+Alt+/` (`<!--` / `-->` for XML/POM/XSD, `/*` / `*/` otherwise).
+fn block_comment_delimiters(path: Option<&Path>) -> (&'static str, &'static str) {
+    let ext = path
+        .and_then(Path::extension)
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+    if ext.eq_ignore_ascii_case("xml")
+        || ext.eq_ignore_ascii_case("pom")
+        || ext.eq_ignore_ascii_case("xsd")
+    {
+        ("<!--", "-->")
+    } else {
+        ("/*", "*/")
+    }
+}
+
+/// Returns the semantic theme color for a file type badge (`J`, `K`, `G`, `Y`, `<>`, `T`, `H`, `⚙`).
+fn file_badge_color(hint: &str, p: Palette) -> Hsla {
+    match hint {
+        "J" => p.tab_indicator,
+        "T" => p.run_icon,
+        "K" | "⚙" => p.warning,
+        "H" => p.error,
+        "G" => hsla_from_rgba(p.badge_groovy),
+        "<>" => hsla_from_rgba(p.badge_xml),
+        "Y" => hsla_from_rgba(p.badge_yaml),
+        _ => p.text_secondary,
+    }
+}
+
+/// Returns the icon glyph for a file entry in *Search Everywhere* and *Recent Files*.
+fn file_search_icon(file_name: &str) -> &'static str {
+    let hint = lang_hint_for(file_name);
+    if hint == "·" {
+        SearchEntryKind::File.default_icon()
+    } else {
+        hint
     }
 }
 
@@ -5841,13 +5893,7 @@ fn placeholder(text: &'static str, p: Palette) -> Div {
 fn tree_icon(node: &ProjectNode, p: Palette) -> Div {
     let color = match &node.kind {
         ProjectNodeKind::Directory { .. } => p.text_muted,
-        ProjectNodeKind::File { lang_hint } => match lang_hint.as_str() {
-            "J" => p.tab_indicator,
-            "T" => p.run_icon,
-            "K" | "⚙" => p.warning,
-            "H" => p.error,
-            _ => p.text_secondary,
-        },
+        ProjectNodeKind::File { lang_hint } => file_badge_color(lang_hint.as_str(), p),
     };
     div()
         .w(px(14.0))
@@ -5905,6 +5951,9 @@ fn language_label(path: &Path) -> &'static str {
         Some(SyntaxLanguage::Http) => "HTTP",
         Some(SyntaxLanguage::Toml) => "TOML",
         Some(SyntaxLanguage::Json) => "JSON",
+        Some(SyntaxLanguage::Yaml) => "YAML",
+        Some(SyntaxLanguage::Xml) => "XML",
+        Some(SyntaxLanguage::Groovy) => "Groovy",
         None => "Text",
     }
 }
@@ -6116,8 +6165,36 @@ mod tests {
         );
         assert_eq!(breadcrumb_label(Path::new("http/orders.http")), "http");
         assert_eq!(language_label(Path::new("kova.toml")), "TOML");
+        assert_eq!(language_label(Path::new("application.yml")), "YAML");
+        assert_eq!(language_label(Path::new("pom.xml")), "XML");
+        assert_eq!(language_label(Path::new("schema.xsd")), "XML");
+        assert_eq!(language_label(Path::new("build.gradle")), "Groovy");
+        assert_eq!(language_label(Path::new("build.gradle.kts")), "Kotlin");
+        assert_eq!(language_label(Path::new("Script.groovy")), "Groovy");
         assert_eq!(language_label(Path::new("README.md")), "Text");
         assert_eq!(file_title(Path::new("a/b/C.java")), "C.java");
+
+        assert_eq!(line_comment_prefix(Some(Path::new("app.YML"))), "#");
+        assert_eq!(line_comment_prefix(Some(Path::new("build.gradle"))), "//");
+        assert_eq!(
+            block_comment_delimiters(Some(Path::new("pom.XML"))),
+            ("<!--", "-->")
+        );
+        assert_eq!(
+            block_comment_delimiters(Some(Path::new("schema.xsd"))),
+            ("<!--", "-->")
+        );
+        assert_eq!(
+            block_comment_delimiters(Some(Path::new("Script.groovy"))),
+            ("/*", "*/")
+        );
+        assert_eq!(file_search_icon("application.yml"), "Y");
+        assert_eq!(file_search_icon("pom.xml"), "<>");
+        assert_eq!(file_search_icon("build.gradle"), "G");
+        assert_eq!(
+            file_search_icon("README.md"),
+            SearchEntryKind::File.default_icon()
+        );
     }
 
     #[test]
@@ -6160,5 +6237,43 @@ mod tests {
         let reused = analyze_document(result.engine, SyntaxLanguage::Java, &ok, "Ok.java");
         assert_eq!(reused.problems.len(), 0);
         assert!(reused.structure.items().iter().any(|s| s.name == "run"));
+
+        let yaml_snap = Buffer::from_text("server:\n  port: 8080\n").snapshot();
+        let yaml_res = analyze_document(reused.engine, SyntaxLanguage::Yaml, &yaml_snap, "app.yml");
+        assert_eq!(yaml_res.problems.len(), 0);
+        assert!(
+            yaml_res
+                .structure
+                .items()
+                .iter()
+                .any(|s| s.name == "server")
+        );
+
+        let xml_snap = Buffer::from_text("<project>\n  <name>kova</name>\n</project>\n").snapshot();
+        let xml_res = analyze_document(yaml_res.engine, SyntaxLanguage::Xml, &xml_snap, "pom.xml");
+        assert_eq!(xml_res.problems.len(), 0);
+        assert!(
+            xml_res
+                .structure
+                .items()
+                .iter()
+                .any(|s| s.name == "project")
+        );
+
+        let groovy_snap = Buffer::from_text("plugins {\n    id 'java'\n}\n").snapshot();
+        let groovy_res = analyze_document(
+            xml_res.engine,
+            SyntaxLanguage::Groovy,
+            &groovy_snap,
+            "build.gradle",
+        );
+        assert_eq!(groovy_res.problems.len(), 0);
+        assert!(
+            groovy_res
+                .structure
+                .items()
+                .iter()
+                .any(|s| s.name == "plugins")
+        );
     }
 }

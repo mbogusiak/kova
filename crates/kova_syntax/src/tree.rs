@@ -11,6 +11,7 @@ use kova_buffer::{
 use kova_theme::SyntaxLanguage;
 
 use crate::input::to_ts_point;
+use crate::scanner::ScannedDocument;
 
 /// Byte- and point-based edit descriptor mapping 1:1 to `tree_sitter::InputEdit`
 /// and [`kova_buffer::TreeSitterEdit`].
@@ -132,16 +133,22 @@ impl From<SyntaxEdit> for TreeSitterEdit {
     }
 }
 
-/// Immutable, cheaply cloneable Tree-sitter syntax tree snapshot bound to a [`BufferId`] and [`BufferVersion`].
+#[derive(Debug, Clone)]
+enum SyntaxTreeRepr {
+    TreeSitter(Arc<tree_sitter::Tree>),
+    Scanner(Arc<ScannedDocument>),
+}
+
+/// Immutable, cheaply cloneable syntax tree snapshot bound to a [`BufferId`] and [`BufferVersion`].
 ///
-/// Cloning shares the internal [`Arc<tree_sitter::Tree>`] in $O(1)$ time without locking, allowing
+/// Cloning shares the internal representation in $O(1)$ time without locking, allowing
 /// GPUI renderers to read an earlier version while `rayon` parses newer edits concurrently.
 #[derive(Debug, Clone)]
 pub struct SyntaxTree {
     buffer_id: BufferId,
     version: BufferVersion,
     language: SyntaxLanguage,
-    tree: Arc<tree_sitter::Tree>,
+    repr: SyntaxTreeRepr,
     parse_duration: Duration,
     incremental: bool,
 }
@@ -161,7 +168,27 @@ impl SyntaxTree {
             buffer_id,
             version,
             language,
-            tree: Arc::new(tree),
+            repr: SyntaxTreeRepr::TreeSitter(Arc::new(tree)),
+            parse_duration,
+            incremental,
+        }
+    }
+
+    /// Wraps a scanner-produced [`ScannedDocument`] in an immutable [`SyntaxTree`] snapshot.
+    #[must_use]
+    pub(crate) fn from_scanned(
+        buffer_id: BufferId,
+        version: BufferVersion,
+        language: SyntaxLanguage,
+        doc: ScannedDocument,
+        parse_duration: Duration,
+        incremental: bool,
+    ) -> Self {
+        Self {
+            buffer_id,
+            version,
+            language,
+            repr: SyntaxTreeRepr::Scanner(Arc::new(doc)),
             parse_duration,
             incremental,
         }
@@ -185,43 +212,65 @@ impl SyntaxTree {
         self.language
     }
 
-    /// Grants read-only access to the underlying [`tree_sitter::Tree`].
+    /// Returns the internal [`ScannedDocument`] for scanner-backed languages (`Yaml`, `Xml`, `Groovy`).
     #[must_use]
-    pub fn tree(&self) -> &tree_sitter::Tree {
-        &self.tree
+    pub(crate) fn scanned(&self) -> Option<&ScannedDocument> {
+        match &self.repr {
+            SyntaxTreeRepr::Scanner(doc) => Some(doc.as_ref()),
+            SyntaxTreeRepr::TreeSitter(_) => None,
+        }
     }
 
-    /// Returns the root [`tree_sitter::Node`] of the syntax tree.
+    /// Grants read-only access to the underlying [`tree_sitter::Tree`], or `None` for
+    /// scanner-backed languages.
     #[must_use]
-    pub fn root_node(&self) -> tree_sitter::Node<'_> {
-        self.tree.root_node()
+    pub fn tree(&self) -> Option<&tree_sitter::Tree> {
+        match &self.repr {
+            SyntaxTreeRepr::TreeSitter(tree) => Some(tree.as_ref()),
+            SyntaxTreeRepr::Scanner(_) => None,
+        }
+    }
+
+    /// Returns the root [`tree_sitter::Node`] of the syntax tree, or `None` for
+    /// scanner-backed languages.
+    #[must_use]
+    pub fn root_node(&self) -> Option<tree_sitter::Node<'_>> {
+        self.tree().map(tree_sitter::Tree::root_node)
     }
 
     /// Returns the smallest syntax node byte range that strictly encloses `start..end`,
     /// climbing parent nodes when the innermost node matches `start..end` exactly.
     #[must_use]
     pub fn enclosing_node_range(&self, start: usize, end: usize) -> Option<Range<usize>> {
-        let root = self.tree.root_node();
-        let clamped_start = start.min(root.end_byte());
-        let clamped_end = end.max(clamped_start).min(root.end_byte());
-        let mut node = root.descendant_for_byte_range(clamped_start, clamped_end)?;
-        loop {
-            let n_start = node.start_byte();
-            let n_end = node.end_byte();
-            if n_start <= clamped_start
-                && n_end >= clamped_end
-                && (n_start < clamped_start || n_end > clamped_end)
-            {
-                return Some(n_start..n_end);
+        match &self.repr {
+            SyntaxTreeRepr::TreeSitter(tree) => {
+                let root = tree.root_node();
+                let clamped_start = start.min(root.end_byte());
+                let clamped_end = end.max(clamped_start).min(root.end_byte());
+                let mut node = root.descendant_for_byte_range(clamped_start, clamped_end)?;
+                loop {
+                    let n_start = node.start_byte();
+                    let n_end = node.end_byte();
+                    if n_start <= clamped_start
+                        && n_end >= clamped_end
+                        && (n_start < clamped_start || n_end > clamped_end)
+                    {
+                        return Some(n_start..n_end);
+                    }
+                    node = node.parent()?;
+                }
             }
-            node = node.parent()?;
+            SyntaxTreeRepr::Scanner(doc) => doc.enclosing_node_range(start, end),
         }
     }
 
     /// Returns `true` if the syntax tree contains any syntax or missing-token errors.
     #[must_use]
     pub fn has_error(&self) -> bool {
-        self.tree.root_node().has_error()
+        match &self.repr {
+            SyntaxTreeRepr::TreeSitter(tree) => tree.root_node().has_error(),
+            SyntaxTreeRepr::Scanner(doc) => doc.has_error(),
+        }
     }
 
     /// Returns the wall-clock duration spent parsing this snapshot.
@@ -237,15 +286,16 @@ impl SyntaxTree {
     }
 
     /// Clones the underlying [`tree_sitter::Tree`] (shallow structural copy) and applies `edits`
-    /// sequentially without mutating `self`.
+    /// sequentially without mutating `self`, returning `None` for scanner-backed languages.
     #[must_use]
-    pub fn with_edits(&self, edits: &[SyntaxEdit]) -> tree_sitter::Tree {
-        let mut cloned = self.tree.as_ref().clone();
+    pub fn with_edits(&self, edits: &[SyntaxEdit]) -> Option<tree_sitter::Tree> {
+        let tree = self.tree()?;
+        let mut cloned = tree.clone();
         for edit in edits {
             let ts_edit = tree_sitter::InputEdit::from(edit);
             cloned.edit(&ts_edit);
         }
-        cloned
+        Some(cloned)
     }
 }
 
@@ -290,21 +340,23 @@ mod tests {
             Duration::from_micros(50),
             false,
         );
-        let original_end = tree.root_node().end_byte();
+        let original_end = tree.root_node().unwrap().end_byte();
         assert_eq!(original_end, source.len());
 
-        let edited = tree.with_edits(&[SyntaxEdit {
-            start_byte: 6,
-            old_end_byte: 7,
-            new_end_byte: 10,
-            start_point: Point::new(0, 6),
-            old_end_point: Point::new(0, 7),
-            new_end_point: Point::new(0, 10),
-        }]);
+        let edited = tree
+            .with_edits(&[SyntaxEdit {
+                start_byte: 6,
+                old_end_byte: 7,
+                new_end_byte: 10,
+                start_point: Point::new(0, 6),
+                old_end_point: Point::new(0, 7),
+                new_end_point: Point::new(0, 10),
+            }])
+            .unwrap();
 
         assert_eq!(edited.root_node().end_byte(), 11);
         // Original `SyntaxTree` remains completely immutable.
-        assert_eq!(tree.root_node().end_byte(), source.len());
+        assert_eq!(tree.root_node().unwrap().end_byte(), source.len());
     }
 
     #[test]

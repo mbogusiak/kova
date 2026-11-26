@@ -107,7 +107,8 @@ impl EntryPoint {
 /// Detects all runnable entry points (`main`, `@Test*`, test classes, and `.http` requests)
 /// in `tree` against `snapshot`.
 ///
-/// Returns an empty `Vec` in $O(1)$ time for [`SyntaxLanguage::Toml`] and [`SyntaxLanguage::Json`].
+/// Returns an empty `Vec` in $O(1)$ time for [`SyntaxLanguage::Toml`], [`SyntaxLanguage::Json`],
+/// [`SyntaxLanguage::Yaml`], [`SyntaxLanguage::Xml`], and [`SyntaxLanguage::Groovy`].
 /// Output is sorted ascending by `(line, byte_range.start)` and preserves `start_line <= line <= end_line`
 /// and `byte_range.end <= snapshot.len_bytes()`.
 #[must_use]
@@ -116,7 +117,11 @@ pub fn detect_entry_points(tree: &SyntaxTree, snapshot: &BufferSnapshot) -> Vec<
         SyntaxLanguage::Java => detect_java_entry_points(tree, snapshot),
         SyntaxLanguage::Kotlin => detect_kotlin_entry_points(tree, snapshot),
         SyntaxLanguage::Http => detect_http_entry_points(tree, snapshot),
-        SyntaxLanguage::Toml | SyntaxLanguage::Json => return Vec::new(),
+        SyntaxLanguage::Toml
+        | SyntaxLanguage::Json
+        | SyntaxLanguage::Yaml
+        | SyntaxLanguage::Xml
+        | SyntaxLanguage::Groovy => return Vec::new(),
     };
 
     entry_points.sort_by_key(|ep| (ep.line, ep.byte_range.start));
@@ -398,9 +403,12 @@ fn detect_java_entry_points(tree: &SyntaxTree, snapshot: &BufferSnapshot) -> Vec
     let mut package_name: Option<String> = None;
     let mut matched_methods: Vec<(Node<'_>, Node<'_>, Node<'_>)> = Vec::new();
 
+    let Some(root) = tree.root_node() else {
+        return Vec::new();
+    };
     let mut cursor = QueryCursor::new();
     let provider = RopeTextProvider::from_snapshot(snapshot);
-    let mut matches = cursor.matches(query, tree.root_node(), provider);
+    let mut matches = cursor.matches(query, root, provider);
 
     while let Some(mat) = matches.next() {
         let mut decl_node = None;
@@ -685,46 +693,10 @@ fn detect_kotlin_entry_points(tree: &SyntaxTree, snapshot: &BufferSnapshot) -> V
     let Some(query) = builtin_entry_points_query(SyntaxLanguage::Kotlin) else {
         return Vec::new();
     };
-
-    let idx_package_name = query.capture_index_for_name("package.name");
-    let idx_func_decl = query.capture_index_for_name("function.decl");
-    let idx_func_name = query.capture_index_for_name("function.name");
-    let idx_func_params = query.capture_index_for_name("function.params");
-
-    let mut package_name: Option<String> = None;
-    let mut matched_funcs: Vec<(Node<'_>, Node<'_>, Node<'_>)> = Vec::new();
-
-    let mut cursor = QueryCursor::new();
-    let provider = RopeTextProvider::from_snapshot(snapshot);
-    let mut matches = cursor.matches(query, tree.root_node(), provider);
-
-    while let Some(mat) = matches.next() {
-        let mut decl_node = None;
-        let mut name_node = None;
-        let mut params_node = None;
-
-        for cap in mat.captures {
-            if Some(cap.index) == idx_package_name {
-                if package_name.is_none() {
-                    let pkg = read_node_text(cap.node, snapshot);
-                    let trimmed = pkg.trim();
-                    if !trimmed.is_empty() {
-                        package_name = Some(trimmed.to_owned());
-                    }
-                }
-            } else if Some(cap.index) == idx_func_decl {
-                decl_node = Some(cap.node);
-            } else if Some(cap.index) == idx_func_name {
-                name_node = Some(cap.node);
-            } else if Some(cap.index) == idx_func_params {
-                params_node = Some(cap.node);
-            }
-        }
-
-        if let (Some(decl), Some(name), Some(params)) = (decl_node, name_node, params_node) {
-            matched_funcs.push((decl, name, params));
-        }
-    }
+    let Some(root) = tree.root_node() else {
+        return Vec::new();
+    };
+    let (package_name, matched_funcs) = collect_kotlin_matched_funcs(query, root, snapshot);
 
     let mut out = Vec::new();
     let mut test_classes = TestClassTracker::default();
@@ -797,6 +769,53 @@ fn detect_kotlin_entry_points(tree: &SyntaxTree, snapshot: &BufferSnapshot) -> V
 
     test_classes.emit(pkg_ref, &mut out);
     out
+}
+
+fn collect_kotlin_matched_funcs<'a>(
+    query: &tree_sitter::Query,
+    root: Node<'a>,
+    snapshot: &BufferSnapshot,
+) -> (Option<String>, Vec<(Node<'a>, Node<'a>, Node<'a>)>) {
+    let idx_package_name = query.capture_index_for_name("package.name");
+    let idx_func_decl = query.capture_index_for_name("function.decl");
+    let idx_func_name = query.capture_index_for_name("function.name");
+    let idx_func_params = query.capture_index_for_name("function.params");
+
+    let mut package_name: Option<String> = None;
+    let mut matched_funcs: Vec<(Node<'a>, Node<'a>, Node<'a>)> = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let provider = RopeTextProvider::from_snapshot(snapshot);
+    let mut matches = cursor.matches(query, root, provider);
+
+    while let Some(mat) = matches.next() {
+        let mut decl_node = None;
+        let mut name_node = None;
+        let mut params_node = None;
+
+        for cap in mat.captures {
+            if Some(cap.index) == idx_package_name {
+                if package_name.is_none() {
+                    let pkg = read_node_text(cap.node, snapshot);
+                    let trimmed = pkg.trim();
+                    if !trimmed.is_empty() {
+                        package_name = Some(trimmed.to_owned());
+                    }
+                }
+            } else if Some(cap.index) == idx_func_decl {
+                decl_node = Some(cap.node);
+            } else if Some(cap.index) == idx_func_name {
+                name_node = Some(cap.node);
+            } else if Some(cap.index) == idx_func_params {
+                params_node = Some(cap.node);
+            }
+        }
+
+        if let (Some(decl), Some(name), Some(params)) = (decl_node, name_node, params_node) {
+            matched_funcs.push((decl, name, params));
+        }
+    }
+
+    (package_name, matched_funcs)
 }
 
 fn classify_kotlin_function_scope(func_node: Node<'_>) -> KotlinFuncScope {
@@ -1030,9 +1049,12 @@ fn detect_http_entry_points(tree: &SyntaxTree, snapshot: &BufferSnapshot) -> Vec
     let idx_method = query.capture_index_for_name("http.method");
     let idx_url = query.capture_index_for_name("http.url");
 
+    let Some(root) = tree.root_node() else {
+        return Vec::new();
+    };
     let mut cursor = QueryCursor::new();
     let provider = RopeTextProvider::from_snapshot(snapshot);
-    let mut matches = cursor.matches(query, tree.root_node(), provider);
+    let mut matches = cursor.matches(query, root, provider);
 
     let mut out = Vec::new();
     let mut min_search_row = 0usize;

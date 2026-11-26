@@ -1,9 +1,9 @@
 //! Native GPUI syntax-highlighted code block for plugin declarative UI (`KOVA-045`).
 //!
 //! Uses [`kova_syntax`] (`SyntaxEngine`, `LanguageRegistry`, `Highlighter`) for
-//! Tree-sitter highlighting when the block's language is one of Kova's built-in
-//! grammars (`java`, `kotlin`, `http`, `toml`, `json`), and falls back to plain
-//! theme-styled monospace text otherwise.
+//! syntax highlighting when the block's language is one of Kova's built-in
+//! languages (`java`, `kotlin`, `http`, `toml`, `json`, `yaml`, `xml`, `groovy`), and
+//! falls back to plain theme-styled monospace text otherwise.
 
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
@@ -59,6 +59,15 @@ pub fn parse_code_language(language: Option<&str>) -> Option<SyntaxLanguage> {
         Some(SyntaxLanguage::Toml)
     } else if raw.eq_ignore_ascii_case("json") || raw.eq_ignore_ascii_case("jsonc") {
         Some(SyntaxLanguage::Json)
+    } else if raw.eq_ignore_ascii_case("yaml") || raw.eq_ignore_ascii_case("yml") {
+        Some(SyntaxLanguage::Yaml)
+    } else if raw.eq_ignore_ascii_case("xml")
+        || raw.eq_ignore_ascii_case("pom")
+        || raw.eq_ignore_ascii_case("xsd")
+    {
+        Some(SyntaxLanguage::Xml)
+    } else if raw.eq_ignore_ascii_case("groovy") || raw.eq_ignore_ascii_case("gradle") {
+        Some(SyntaxLanguage::Groovy)
     } else {
         None
     }
@@ -342,6 +351,22 @@ mod tests {
             parse_code_language(Some("JSON")),
             Some(SyntaxLanguage::Json)
         );
+        assert_eq!(
+            parse_code_language(Some("yaml")),
+            Some(SyntaxLanguage::Yaml)
+        );
+        assert_eq!(parse_code_language(Some("yml")), Some(SyntaxLanguage::Yaml));
+        assert_eq!(parse_code_language(Some("XML")), Some(SyntaxLanguage::Xml));
+        assert_eq!(parse_code_language(Some("pom")), Some(SyntaxLanguage::Xml));
+        assert_eq!(parse_code_language(Some("xsd")), Some(SyntaxLanguage::Xml));
+        assert_eq!(
+            parse_code_language(Some("groovy")),
+            Some(SyntaxLanguage::Groovy)
+        );
+        assert_eq!(
+            parse_code_language(Some("gradle")),
+            Some(SyntaxLanguage::Groovy)
+        );
         assert_eq!(parse_code_language(Some("sql")), None);
         assert_eq!(parse_code_language(None), None);
     }
@@ -380,5 +405,44 @@ mod tests {
         assert_eq!(plain.lines.len(), 2);
         assert_eq!(plain.lines[0].text.as_ref(), "SELECT 1;");
         assert_eq!(plain.lines[0].spans, Vec::new());
+
+        let yaml = prepare_code_block("server:\n  port: 8080", Some("yaml"));
+        assert_eq!(yaml.lines.len(), 2);
+        assert!(
+            yaml.lines[0]
+                .spans
+                .iter()
+                .any(|(_, kind)| *kind == SyntaxTokenKind::Property)
+        );
+        assert!(
+            yaml.lines[1]
+                .spans
+                .iter()
+                .any(|(_, kind)| *kind == SyntaxTokenKind::Number)
+        );
+
+        let xml = prepare_code_block("<project id=\"kova\"/>", Some("xml"));
+        assert_eq!(xml.lines.len(), 1);
+        assert!(
+            xml.lines[0]
+                .spans
+                .iter()
+                .any(|(_, kind)| *kind == SyntaxTokenKind::Keyword)
+        );
+        assert!(
+            xml.lines[0]
+                .spans
+                .iter()
+                .any(|(_, kind)| *kind == SyntaxTokenKind::Property)
+        );
+
+        let groovy = prepare_code_block("plugins {\n    id 'java'\n}", Some("gradle"));
+        assert_eq!(groovy.lines.len(), 3);
+        assert!(
+            groovy.lines[0]
+                .spans
+                .iter()
+                .any(|(_, kind)| *kind == SyntaxTokenKind::Function)
+        );
     }
 }

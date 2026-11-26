@@ -146,7 +146,21 @@ impl StructureOutline {
 pub fn extract_structure(tree: &SyntaxTree, snapshot: &BufferSnapshot) -> StructureOutline {
     let language = tree.language();
     let version = snapshot.version();
-    let root = tree.root_node();
+    if let Some(doc) = tree.scanned() {
+        return StructureOutline {
+            language,
+            version,
+            roots: doc.structure().to_vec(),
+        };
+    }
+
+    let Some(root) = tree.root_node() else {
+        return StructureOutline {
+            language,
+            version,
+            roots: Vec::new(),
+        };
+    };
 
     let roots = match language {
         SyntaxLanguage::Java => extract_java_roots(root, snapshot),
@@ -154,6 +168,7 @@ pub fn extract_structure(tree: &SyntaxTree, snapshot: &BufferSnapshot) -> Struct
         SyntaxLanguage::Http => extract_http_roots(root, snapshot),
         SyntaxLanguage::Toml => extract_toml_roots(root, snapshot),
         SyntaxLanguage::Json => extract_json_roots(root, snapshot),
+        SyntaxLanguage::Yaml | SyntaxLanguage::Xml | SyntaxLanguage::Groovy => Vec::new(),
     };
 
     StructureOutline {

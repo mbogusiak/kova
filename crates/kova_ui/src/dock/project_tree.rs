@@ -79,7 +79,7 @@ pub enum TreeActivation {
     OpenFile(PathBuf),
 }
 
-/// Returns the short type badge for a file name (`J`, `T`, `K`, `H`, `⚙`, `{}`, `·`).
+/// Returns the short type badge for a file name (`J`, `T`, `K`, `G`, `Y`, `<>`, `H`, `⚙`, `≡`, `{}`, `·`).
 #[must_use]
 pub fn lang_hint_for(name: &str) -> &'static str {
     let path = Path::new(name);
@@ -95,13 +95,17 @@ pub fn lang_hint_for(name: &str) -> &'static str {
         .to_ascii_lowercase();
     if name.eq_ignore_ascii_case("kova.toml") {
         "⚙"
-    } else if (ext == "java" || ext == "kt") && (stem.ends_with("test") || stem.ends_with("tests"))
+    } else if matches!(ext.as_str(), "java" | "kt" | "groovy")
+        && (stem.ends_with("test") || stem.ends_with("tests"))
     {
         "T"
     } else {
         match ext.as_str() {
             "java" => "J",
-            "kt" | "kts" | "gradle" => "K",
+            "kt" | "kts" => "K",
+            "groovy" | "gradle" => "G",
+            "yaml" | "yml" => "Y",
+            "xml" | "pom" | "xsd" => "<>",
             "http" => "H",
             "toml" => "≡",
             "json" => "{}",
@@ -558,6 +562,15 @@ mod tests {
         assert_eq!(lang_hint_for("OrderApp.java"), "J");
         assert_eq!(lang_hint_for("OrderAppTest.java"), "T");
         assert_eq!(lang_hint_for("build.gradle.kts"), "K");
+        assert_eq!(lang_hint_for("build.gradle"), "G");
+        assert_eq!(lang_hint_for("Script.groovy"), "G");
+        assert_eq!(lang_hint_for("OrderTest.groovy"), "T");
+        assert_eq!(lang_hint_for("OrderTests.groovy"), "T");
+        assert_eq!(lang_hint_for("application.yml"), "Y");
+        assert_eq!(lang_hint_for("values.YAML"), "Y");
+        assert_eq!(lang_hint_for("pom.xml"), "<>");
+        assert_eq!(lang_hint_for("artifact.pom"), "<>");
+        assert_eq!(lang_hint_for("schema.xsd"), "<>");
         assert_eq!(lang_hint_for("orders.http"), "H");
         assert_eq!(lang_hint_for("kova.toml"), "⚙");
     }

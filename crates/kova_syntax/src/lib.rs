@@ -11,6 +11,7 @@ pub mod folding;
 pub mod highlight;
 pub mod input;
 pub mod registry;
+mod scanner;
 pub mod structure;
 pub mod tree;
 
