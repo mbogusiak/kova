@@ -185,6 +185,12 @@ impl KeymapSession {
         self.tap_detector.cancel();
     }
 
+    /// Cancels any in-progress modifier double-tap sequence without clearing
+    /// pending key chord steps.
+    pub const fn cancel_modifier_tap(&mut self) {
+        self.tap_detector.cancel();
+    }
+
     /// Returns the currently buffered chord prefix steps.
     #[must_use]
     pub fn pending_steps(&self) -> &[KeyStep] {

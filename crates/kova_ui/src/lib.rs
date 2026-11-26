@@ -13,6 +13,7 @@ pub mod git;
 pub mod http_runner;
 pub mod keymap;
 pub mod plugin_ui;
+pub mod search;
 pub mod settings;
 pub mod shell;
 pub mod terminal;

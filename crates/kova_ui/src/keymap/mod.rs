@@ -22,7 +22,7 @@ use kova_core::builtin_actions::ids;
 use kova_core::keymap::chord::DEFAULT_CHORD_TIMEOUT;
 use kova_core::{
     ActionId, ContextState, FocusContext, FocusStack, KeyCode, KeyDispatch, KeyStep, KeyStroke,
-    KeymapResolver, KeymapSession, Modifiers, Platform, build_effective_keymap,
+    KeymapResolver, KeymapSession, ModifierTap, Modifiers, Platform, build_effective_keymap,
     jetbrains_keymap_layer,
 };
 
@@ -345,6 +345,8 @@ pub struct KeyDispatchLayer {
     cached_stack: FocusStack,
     state_vim_on: ContextState,
     state_vim_off: ContextState,
+    prev_shift: bool,
+    prev_capslock: bool,
 }
 
 impl KeyDispatchLayer {
@@ -368,6 +370,8 @@ impl KeyDispatchLayer {
             cached_stack: FocusStack::from_leaf(FocusContext::Workspace),
             state_vim_on: ContextState::new().with_flag(VIM_ENABLED_FLAG, true),
             state_vim_off: ContextState::new(),
+            prev_shift: false,
+            prev_capslock: false,
         }
     }
 
@@ -396,6 +400,24 @@ impl KeyDispatchLayer {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
+    /// Cancels any in-progress modifier double-tap sequence (`Shift+Shift`), e.g. when a
+    /// normal key press is handled outside [`Self::dispatch`] (Vim, IME, terminal, modals).
+    pub const fn cancel_modifier_tap(&mut self) {
+        self.session.cancel_modifier_tap();
+    }
+
+    /// Updates tracked modifier flags while cancelling any double-tap candidate (for example
+    /// when a blocking modal ignores modifier-only shortcuts).
+    pub const fn sync_modifiers_and_cancel(
+        &mut self,
+        modifiers: gpui::Modifiers,
+        capslock_on: bool,
+    ) {
+        self.session.cancel_modifier_tap();
+        self.prev_shift = modifiers.shift;
+        self.prev_capslock = capslock_on;
+    }
+
     /// Clears the pending prefix when the timer for `epoch` fires and no newer key arrived.
     /// Returns `true` when a prefix was cleared.
     pub fn expire(&mut self, epoch: u64) -> bool {
@@ -413,10 +435,7 @@ impl KeyDispatchLayer {
         ctx: DispatchContext,
         now: Instant,
     ) -> DispatchOutcome {
-        if self.cached_leaf != ctx.leaf {
-            self.cached_leaf = ctx.leaf;
-            self.cached_stack = FocusStack::from_leaf(ctx.leaf);
-        }
+        self.update_cached_context(ctx.leaf);
         let had_pending = self.has_pending();
         let state = if ctx.vim_enabled {
             &self.state_vim_on
@@ -427,6 +446,70 @@ impl KeyDispatchLayer {
             self.session
                 .on_key_down(&self.resolver, stroke, &self.cached_stack, state, now);
         self.epoch = self.epoch.wrapping_add(1);
+        let cancelled_escape = had_pending && stroke == KeyStroke::unmodified(KeyCode::Escape);
+        self.map_dispatch_result(result, cancelled_escape)
+    }
+
+    /// Feeds a [`gpui::ModifiersChangedEvent`] (macOS `NSFlagsChanged` / X11 modifier edge)
+    /// and resolves modifier double-taps such as `Shift+Shift` → [`ShellAction::OpenSearchEverywhere`].
+    ///
+    /// Any concurrent non-Shift modifier (`control`, `alt`, `platform`, `function`) or a
+    /// `CapsLock` toggle cancels the tap detector and keeps `prev_shift` in sync so releasing
+    /// `Cmd+Shift` in either order never triggers a false double-tap.
+    pub fn dispatch_modifiers_changed(
+        &mut self,
+        modifiers: gpui::Modifiers,
+        capslock_on: bool,
+        ctx: DispatchContext,
+        now: Instant,
+    ) -> DispatchOutcome {
+        let capslock_toggled = capslock_on != self.prev_capslock;
+        self.prev_capslock = capslock_on;
+
+        if modifiers.control
+            || modifiers.alt
+            || modifiers.platform
+            || modifiers.function
+            || capslock_toggled
+        {
+            self.session.cancel_modifier_tap();
+            self.prev_shift = modifiers.shift;
+            return DispatchOutcome::Unhandled;
+        }
+
+        if modifiers.shift == self.prev_shift {
+            return DispatchOutcome::Unhandled;
+        }
+        self.prev_shift = modifiers.shift;
+
+        self.update_cached_context(ctx.leaf);
+        let state = if ctx.vim_enabled {
+            &self.state_vim_on
+        } else {
+            &self.state_vim_off
+        };
+        let result = self.session.on_modifier_edge(
+            &self.resolver,
+            ModifierTap::Shift,
+            modifiers.shift,
+            &self.cached_stack,
+            state,
+            now,
+        );
+        if !matches!(result, KeyDispatch::NotMatched) {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+        self.map_dispatch_result(result, false)
+    }
+
+    fn update_cached_context(&mut self, leaf: FocusContext) {
+        if self.cached_leaf != leaf {
+            self.cached_leaf = leaf;
+            self.cached_stack = FocusStack::from_leaf(leaf);
+        }
+    }
+
+    fn map_dispatch_result(&self, result: KeyDispatch, cancelled_escape: bool) -> DispatchOutcome {
         match result {
             KeyDispatch::Matched { action, .. } => ShellAction::from_action_id(&action)
                 .map_or(DispatchOutcome::Delegated(action), DispatchOutcome::Action),
@@ -434,11 +517,7 @@ impl KeyDispatchLayer {
                 hint: format_hint(&prefix),
                 epoch: self.epoch,
             },
-            KeyDispatch::NotMatched
-                if had_pending && stroke == KeyStroke::unmodified(KeyCode::Escape) =>
-            {
-                DispatchOutcome::Cancelled
-            }
+            KeyDispatch::NotMatched if cancelled_escape => DispatchOutcome::Cancelled,
             KeyDispatch::NotMatched => DispatchOutcome::Unhandled,
         }
     }
@@ -881,6 +960,203 @@ mod tests {
         assert_eq!(
             ShellAction::from_action_id(&ActionId::from_static(ids::EDITOR_COPY)),
             None
+        );
+    }
+
+    #[test]
+    fn double_shift_triggers_via_modifiers_changed_in_editor_vim_terminal_and_tree() {
+        for leaf in [
+            FocusContext::EditorText,
+            FocusContext::EditorVimNormal,
+            FocusContext::Terminal,
+            FocusContext::ProjectTree,
+        ] {
+            let mut layer = KeyDispatchLayer::new(Platform::MacOs);
+            let ctx = ctx(leaf, leaf == FocusContext::EditorVimNormal);
+            let t0 = Instant::now();
+
+            assert_eq!(
+                layer.dispatch_modifiers_changed(gpui::Modifiers::shift(), false, ctx, t0),
+                DispatchOutcome::Unhandled
+            );
+            assert_eq!(
+                layer.dispatch_modifiers_changed(
+                    gpui::Modifiers::none(),
+                    false,
+                    ctx,
+                    t0 + Duration::from_millis(50),
+                ),
+                DispatchOutcome::Unhandled
+            );
+            assert_eq!(
+                layer.dispatch_modifiers_changed(
+                    gpui::Modifiers::shift(),
+                    false,
+                    ctx,
+                    t0 + Duration::from_millis(120),
+                ),
+                DispatchOutcome::Unhandled
+            );
+            assert_eq!(
+                layer.dispatch_modifiers_changed(
+                    gpui::Modifiers::none(),
+                    false,
+                    ctx,
+                    t0 + Duration::from_millis(180),
+                ),
+                DispatchOutcome::Action(ShellAction::OpenSearchEverywhere),
+                "double shift must trigger Search Everywhere in {leaf:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn double_shift_cancelled_by_key_down_in_editor_and_vim() {
+        let t0 = Instant::now();
+        for (leaf, vim) in [
+            (FocusContext::EditorText, false),
+            (FocusContext::EditorVimNormal, true),
+        ] {
+            let mut layer = KeyDispatchLayer::new(Platform::MacOs);
+            let c = ctx(leaf, vim);
+            layer.dispatch_modifiers_changed(gpui::Modifiers::shift(), false, c, t0);
+            layer.cancel_modifier_tap();
+            layer.dispatch_modifiers_changed(
+                gpui::Modifiers::none(),
+                false,
+                c,
+                t0 + Duration::from_millis(20),
+            );
+            layer.dispatch_modifiers_changed(
+                gpui::Modifiers::shift(),
+                false,
+                c,
+                t0 + Duration::from_millis(60),
+            );
+            assert_eq!(
+                layer.dispatch_modifiers_changed(
+                    gpui::Modifiers::none(),
+                    false,
+                    c,
+                    t0 + Duration::from_millis(100),
+                ),
+                DispatchOutcome::Unhandled
+            );
+        }
+    }
+
+    #[test]
+    fn double_shift_cancelled_by_other_modifiers_capslock_and_timeout() {
+        let t0 = Instant::now();
+        let editor_ctx = ctx(FocusContext::EditorText, false);
+
+        // Cmd+Shift released in reverse order (Cmd released first, then Shift)
+        let mut layer = KeyDispatchLayer::new(Platform::MacOs);
+        layer.dispatch_modifiers_changed(gpui::Modifiers::shift(), false, editor_ctx, t0);
+        layer.dispatch_modifiers_changed(
+            gpui::Modifiers::command_shift(),
+            false,
+            editor_ctx,
+            t0 + Duration::from_millis(20),
+        );
+        layer.dispatch_modifiers_changed(
+            gpui::Modifiers::shift(),
+            false,
+            editor_ctx,
+            t0 + Duration::from_millis(40),
+        );
+        layer.dispatch_modifiers_changed(
+            gpui::Modifiers::none(),
+            false,
+            editor_ctx,
+            t0 + Duration::from_millis(60),
+        );
+        layer.dispatch_modifiers_changed(
+            gpui::Modifiers::shift(),
+            false,
+            editor_ctx,
+            t0 + Duration::from_millis(90),
+        );
+        assert_eq!(
+            layer.dispatch_modifiers_changed(
+                gpui::Modifiers::none(),
+                false,
+                editor_ctx,
+                t0 + Duration::from_millis(120),
+            ),
+            DispatchOutcome::Unhandled
+        );
+
+        // Fn+Shift, Alt+Shift, Ctrl+Shift, or CapsLock toggle cancels
+        let fn_shift = gpui::Modifiers {
+            function: true,
+            ..gpui::Modifiers::shift()
+        };
+        let alt_shift = gpui::Modifiers::alt() | gpui::Modifiers::shift();
+        for (other, caps) in [
+            (fn_shift, false),
+            (alt_shift, false),
+            (gpui::Modifiers::control_shift(), false),
+            (gpui::Modifiers::shift(), true),
+        ] {
+            let mut layer = KeyDispatchLayer::new(Platform::MacOs);
+            layer.dispatch_modifiers_changed(gpui::Modifiers::shift(), false, editor_ctx, t0);
+            layer.dispatch_modifiers_changed(
+                other,
+                caps,
+                editor_ctx,
+                t0 + Duration::from_millis(20),
+            );
+            layer.dispatch_modifiers_changed(
+                gpui::Modifiers::none(),
+                caps,
+                editor_ctx,
+                t0 + Duration::from_millis(40),
+            );
+            layer.dispatch_modifiers_changed(
+                gpui::Modifiers::shift(),
+                caps,
+                editor_ctx,
+                t0 + Duration::from_millis(80),
+            );
+            assert_eq!(
+                layer.dispatch_modifiers_changed(
+                    gpui::Modifiers::none(),
+                    caps,
+                    editor_ctx,
+                    t0 + Duration::from_millis(110),
+                ),
+                DispatchOutcome::Unhandled
+            );
+        }
+    }
+
+    #[test]
+    fn double_shift_expires_after_400ms_timeout() {
+        let t0 = Instant::now();
+        let editor_ctx = ctx(FocusContext::EditorText, false);
+        let mut layer = KeyDispatchLayer::new(Platform::MacOs);
+        layer.dispatch_modifiers_changed(gpui::Modifiers::shift(), false, editor_ctx, t0);
+        layer.dispatch_modifiers_changed(
+            gpui::Modifiers::none(),
+            false,
+            editor_ctx,
+            t0 + Duration::from_millis(40),
+        );
+        layer.dispatch_modifiers_changed(
+            gpui::Modifiers::shift(),
+            false,
+            editor_ctx,
+            t0 + Duration::from_millis(460),
+        );
+        assert_eq!(
+            layer.dispatch_modifiers_changed(
+                gpui::Modifiers::none(),
+                false,
+                editor_ctx,
+                t0 + Duration::from_millis(500),
+            ),
+            DispatchOutcome::Unhandled
         );
     }
 }

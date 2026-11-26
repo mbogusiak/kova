@@ -4634,6 +4634,7 @@ dependencies = [
  "kova_syntax",
  "kova_theme",
  "kova_tools",
+ "nucleo-matcher",
  "sha2 0.10.9",
  "smallvec",
 ]

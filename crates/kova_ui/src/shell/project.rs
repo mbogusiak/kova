@@ -128,16 +128,18 @@ impl WorkspaceShell {
 
         self.commit_panel_open = false;
         self.commit_panel = None;
+        self.search_everywhere.close();
         self.git_discover_task = None;
         self.status_bar.git_branch.clear();
         self.set_git_repo(None, None, cx);
     }
 
     /// Whether a modal surface owns the keyboard, so a menu shortcut must fall through to
-    /// the key capture that serves it (settings, commit panel, evaluate, Ex line).
+    /// the key capture that serves it (settings, commit panel, evaluate, Ex line, Search Everywhere).
     fn modal_owns_keys(&self) -> bool {
         self.settings_open
             || self.commit_panel_open
+            || self.search_everywhere.is_open()
             || self.ex_line.is_some()
             || self.debugger.evaluate_modal().is_some()
     }

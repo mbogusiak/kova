@@ -10,7 +10,7 @@
 //! *Structure* outline / syntax problems are extracted by `kova_syntax` on the background
 //! executor whenever the active document changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -20,12 +20,14 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, AppContext as _, ClickEvent, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Render, ScrollStrategy, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled, Subscription, Task, UniformListScrollHandle, Window,
-    div, px, relative, uniform_list,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, ScrollStrategy,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled, Subscription, Task,
+    UniformListScrollHandle, Window, div, px, relative, uniform_list,
 };
 use kova_buffer::{Buffer, BufferSnapshot};
+use kova_core::builtin_actions::builtin_action_registry_ref;
+use kova_core::jetbrains_keymap_layer_ref;
 use kova_core::perf::{
     BudgetKind, budgets, check_duration_budget, check_rss_budget, current_process_rss_bytes,
 };
@@ -41,7 +43,7 @@ mod project;
 
 pub use project::SwitchProjectError;
 
-use crate::app_menu::OpenProject;
+use crate::app_menu::{OpenProject, SearchEverywhere};
 use crate::debugger::{DebugCommandSink, DebuggerModel};
 use crate::dock::bottom_panel::BOTTOM_TAB_BAR_HEIGHT_PX;
 use crate::dock::focus::{
@@ -69,6 +71,11 @@ use crate::keymap::{
     CHORD_TIMEOUT, DispatchContext, DispatchOutcome, ExCommand, ExCommandLine, ExLineEvent,
     KeyDispatchLayer, KeyRoute, RouteFlags, ShellAction, is_text_composition, key_route,
     parse_ex_command, shortcut_stroke, vim_stroke,
+};
+use crate::search::modal::render_search_row;
+use crate::search::{
+    SearchEntry, SearchEntryKind, SearchEverywhereModal, SearchEverywhereState, SearchKeyOutcome,
+    SearchScope, SearchTarget,
 };
 use crate::settings::view::{SettingsClick, SettingsKey};
 use crate::settings::{
@@ -439,6 +446,8 @@ pub struct WorkspaceShell {
     commit_panel: Option<(Entity<CommitPanel>, Subscription)>,
     /// Whether the `Cmd+K` Commit modal overlay is open.
     commit_panel_open: bool,
+    /// *Search Everywhere* (`Shift+Shift`) modal overlay (`KOVA-050`).
+    search_everywhere: SearchEverywhereModal,
 }
 
 impl fmt::Debug for WorkspaceShell {
@@ -564,6 +573,7 @@ impl WorkspaceShell {
             git_discover_task: None,
             commit_panel: None,
             commit_panel_open: false,
+            search_everywhere: SearchEverywhereModal::new(cx.focus_handle()),
         }
     }
 
@@ -1822,6 +1832,88 @@ impl WorkspaceShell {
     // Keyboard and mouse handling
     // ---------------------------------------------------------------------------------------
 
+    /// Returns whether the *Search Everywhere* modal overlay is open.
+    #[must_use]
+    pub const fn is_search_everywhere_open(&self) -> bool {
+        self.search_everywhere.is_open()
+    }
+
+    /// Returns the headless *Search Everywhere* state for inspection and testing.
+    #[must_use]
+    pub const fn search_everywhere_state(&self) -> &SearchEverywhereState {
+        self.search_everywhere.state()
+    }
+
+    /// Computes the active focused editor (when focused) and the corresponding [`DispatchContext`].
+    fn active_editor_and_dispatch_context(
+        &self,
+        window: &Window,
+        cx: &Context<'_, Self>,
+    ) -> (Option<Entity<EditorView>>, DispatchContext) {
+        let editor = self
+            .active_editor()
+            .filter(|editor| editor.read(cx).focus_handle().is_focused(window))
+            .cloned();
+        let vim_status = editor.as_ref().and_then(|e| e.read(cx).vim_status());
+        let leaf = match (&editor, &vim_status) {
+            (Some(_), Some(status)) => status.focus,
+            (Some(_), None) => kova_core::FocusContext::EditorText,
+            (None, _) if self.terminal_focused(window, cx).is_some() => {
+                kova_core::FocusContext::Terminal
+            }
+            (None, _) => match self.dock_layout.focused {
+                FocusedRegion::ProjectDock => kova_core::FocusContext::ProjectTree,
+                FocusedRegion::StructureDock => kova_core::FocusContext::StructureView,
+                FocusedRegion::BottomPanel => kova_core::FocusContext::ToolWindow,
+                FocusedRegion::EditorPane(_) => kova_core::FocusContext::Workspace,
+            },
+        };
+        (
+            editor,
+            DispatchContext {
+                leaf,
+                vim_enabled: self.vim_enabled,
+            },
+        )
+    }
+
+    /// Handles modifier-only events (macOS `NSFlagsChanged` / X11 modifier edges) to detect
+    /// clean `Shift+Shift` double-taps across every island and Vim mode (`KOVA-050`).
+    fn handle_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.settings_open
+            || self.commit_panel_open
+            || self.ex_line.is_some()
+            || self.debugger.evaluate_modal().is_some()
+        {
+            self.keymap
+                .sync_modifiers_and_cancel(event.modifiers, event.capslock.on);
+            return;
+        }
+        let ctx = if self.search_everywhere.is_open() {
+            DispatchContext {
+                leaf: kova_core::FocusContext::SearchEverywhere,
+                vim_enabled: self.vim_enabled,
+            }
+        } else {
+            self.active_editor_and_dispatch_context(window, cx).1
+        };
+        if let DispatchOutcome::Action(action) = self.keymap.dispatch_modifiers_changed(
+            event.modifiers,
+            event.capslock.on,
+            ctx,
+            Instant::now(),
+        ) {
+            self.chord_hint = None;
+            self.run_shell_action(action, window, cx);
+            cx.notify();
+        }
+    }
+
     /// Capture-phase key router (`KOVA-026` FR-3): runs before the editor sees the key, in the
     /// order `Ex line → chord continuation → Vim → IME guard → JetBrains keymap`
     /// ([`key_route`]). Keys nobody claims propagate to the editor and the IME unchanged.
@@ -1831,6 +1923,7 @@ impl WorkspaceShell {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.keymap.cancel_modifier_tap();
         let keystroke = &event.keystroke;
         if self.settings_open {
             self.handle_settings_key(keystroke, window, cx);
@@ -1850,6 +1943,11 @@ impl WorkspaceShell {
             cx.stop_propagation();
             return;
         }
+        if self.search_everywhere.is_open() {
+            self.handle_search_everywhere_key(keystroke, window, cx);
+            cx.stop_propagation();
+            return;
+        }
         // Terminal focused: its own shortcuts first, `Cmd` chords to the IDE keymap, every
         // other key bubbles to the session (`Ctrl+C`, `Ctrl+W`, `Esc`, `j`/`k` …).
         if let Some(dock) = self.terminal_focused(window, cx) {
@@ -1862,10 +1960,7 @@ impl WorkspaceShell {
                 return;
             }
         }
-        let editor = self
-            .active_editor()
-            .filter(|editor| editor.read(cx).focus_handle().is_focused(window))
-            .cloned();
+        let (editor, ctx) = self.active_editor_and_dispatch_context(window, cx);
         let (vim_status, vim_owns_keys) = editor.as_ref().map_or((None, false), |editor| {
             let editor = editor.read(cx);
             (editor.vim_status(), editor.vim_owns_keys())
@@ -1877,20 +1972,6 @@ impl WorkspaceShell {
             vim_owns_keys,
             text_composition: accepts_text
                 && is_text_composition(keystroke, self.keymap.platform()),
-        };
-        let leaf = match (&editor, &vim_status) {
-            (Some(_), Some(status)) => status.focus,
-            (Some(_), None) => kova_core::FocusContext::EditorText,
-            (None, _) => match self.dock_layout.focused {
-                FocusedRegion::ProjectDock => kova_core::FocusContext::ProjectTree,
-                FocusedRegion::StructureDock => kova_core::FocusContext::StructureView,
-                FocusedRegion::BottomPanel => kova_core::FocusContext::ToolWindow,
-                FocusedRegion::EditorPane(_) => kova_core::FocusContext::Workspace,
-            },
-        };
-        let ctx = DispatchContext {
-            leaf,
-            vim_enabled: self.vim_enabled,
         };
 
         match key_route(flags) {
@@ -2037,15 +2118,284 @@ impl WorkspaceShell {
                     editor.update(cx, |editor, cx| editor.add_next_occurrence(window, cx));
                 }
             }
-            ShellAction::OpenSearchEverywhere => self.set_notice(
-                StatusKind::Info,
-                "Search Everywhere arrives with KOVA-028".to_owned(),
-                cx,
-            ),
+            ShellAction::OpenSearchEverywhere => self.open_search_everywhere(window, cx),
             ShellAction::OpenSettings => self.open_settings(window, cx),
             ShellAction::ToggleCommitPanel => self.toggle_commit_panel(window, cx),
             ShellAction::Debug(action) => self.run_debug_action(action, window, cx),
         }
+    }
+
+    /// Opens the *Search Everywhere* modal (or switches to the next scope tab if already open)
+    /// and transfers GPUI focus away from the active editor (`KOVA-050`).
+    pub fn open_search_everywhere(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.search_everywhere.is_open() {
+            self.search_everywhere.next_scope();
+            window.focus(self.search_everywhere.focus_handle());
+            cx.notify();
+            return;
+        }
+        let return_focus = window.focused(cx);
+        self.ex_line = None;
+        self.keymap.reset();
+        self.chord_hint = None;
+        let entries = self.collect_search_entries();
+        self.search_everywhere.open(entries, return_focus);
+        window.focus(self.search_everywhere.focus_handle());
+        cx.notify();
+    }
+
+    /// Closes *Search Everywhere*, optionally restoring the saved [`FocusHandle`].
+    pub(crate) fn close_search_everywhere(
+        &mut self,
+        restore_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.search_everywhere.is_open() {
+            return;
+        }
+        let return_focus = self.search_everywhere.close();
+        if restore_focus {
+            if let Some(handle) = return_focus {
+                window.focus(&handle);
+            } else {
+                self.focus_active_editor(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Switches the active *Search Everywhere* scope tab and keeps modal focus.
+    pub(crate) fn set_search_scope(
+        &mut self,
+        scope: SearchScope,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.search_everywhere.set_scope(scope);
+        window.focus(self.search_everywhere.focus_handle());
+        cx.notify();
+    }
+
+    fn handle_search_everywhere_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match self.search_everywhere.handle_key(keystroke) {
+            SearchKeyOutcome::Close => self.close_search_everywhere(true, window, cx),
+            SearchKeyOutcome::Activate { index, split } => {
+                self.activate_search_hit(index, split, window, cx);
+            }
+            SearchKeyOutcome::Consumed => cx.notify(),
+            SearchKeyOutcome::Ignored => {}
+        }
+    }
+
+    /// Executes the *Search Everywhere* hit at `index` and closes the modal.
+    pub(crate) fn activate_search_hit(
+        &mut self,
+        index: usize,
+        split: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(hit) = self.search_everywhere.hit(index).cloned() else {
+            return;
+        };
+        let return_focus = self.search_everywhere.close();
+        match hit.entry.target {
+            SearchTarget::File { path, line } => {
+                if split {
+                    self.split_active_pane(SplitAxis::Horizontal, window, cx);
+                }
+                self.open_path(&path, line.map(|l| (l, 1)), window, cx);
+            }
+            SearchTarget::Symbol { path, line, col } => {
+                if split {
+                    self.split_active_pane(SplitAxis::Horizontal, window, cx);
+                }
+                if let Some(path) = path {
+                    self.open_path(&path, Some((line, col)), window, cx);
+                } else if let Some(editor) = self.active_editor().cloned() {
+                    editor.update(cx, |editor, cx| editor.set_cursor_position(line, col, cx));
+                    self.focus_active_editor(window, cx);
+                }
+            }
+            SearchTarget::Action(action) => {
+                if let Some(handle) = return_focus {
+                    window.focus(&handle);
+                } else {
+                    self.focus_active_editor(window, cx);
+                }
+                self.run_shell_action(action, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn collect_search_entries(&self) -> Vec<SearchEntry> {
+        let mut entries = Vec::new();
+        let seen_classes = self.collect_structure_search_entries(&mut entries);
+        self.collect_file_search_entries(seen_classes, &mut entries);
+        self.collect_action_search_entries(&mut entries);
+        entries
+    }
+
+    fn collect_structure_search_entries(
+        &self,
+        entries: &mut Vec<SearchEntry>,
+    ) -> HashSet<(String, Option<PathBuf>)> {
+        let active_key = self.active_document_key();
+        let active_name = active_key
+            .as_deref()
+            .map_or_else(|| "Current File".to_owned(), file_title);
+        let mut seen_classes: HashSet<(String, Option<PathBuf>)> = HashSet::new();
+        for item in self.structure.items() {
+            let subtitle = format!("{} · {active_name}:{}", item.kind_label, item.line);
+            let target = SearchTarget::Symbol {
+                path: active_key.clone(),
+                line: item.line,
+                col: item.col,
+            };
+            let is_type = matches!(
+                item.kind_label,
+                "Class" | "Interface" | "Enum" | "Record" | "Object" | "Annotation"
+            );
+            if is_type {
+                seen_classes.insert((item.name.clone(), active_key.clone()));
+                entries.push(SearchEntry {
+                    kind: SearchEntryKind::Class,
+                    title: item.name.clone(),
+                    subtitle: subtitle.clone(),
+                    match_text: item.name.clone(),
+                    icon: kind_icon(item.kind_label),
+                    shortcut_hint: None,
+                    target: target.clone(),
+                });
+            }
+            entries.push(SearchEntry {
+                kind: SearchEntryKind::Symbol,
+                title: item.name.clone(),
+                subtitle,
+                match_text: item.name.clone(),
+                icon: kind_icon(item.kind_label),
+                shortcut_hint: None,
+                target,
+            });
+        }
+        seen_classes
+    }
+
+    fn collect_file_search_entries(
+        &self,
+        mut seen_classes: HashSet<(String, Option<PathBuf>)>,
+        entries: &mut Vec<SearchEntry>,
+    ) {
+        let mut ordered_paths: Vec<PathBuf> = self.documents.keys().cloned().collect();
+        ordered_paths.sort();
+        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+        for path in ordered_paths
+            .into_iter()
+            .chain(self.project_tree.file_paths().map(Path::to_path_buf))
+        {
+            if !seen_paths.insert(path.clone()) {
+                continue;
+            }
+            let title = file_title(&path);
+            let subtitle = path
+                .parent()
+                .map(|parent| parent.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let match_text = path.to_string_lossy().into_owned();
+            entries.push(SearchEntry {
+                kind: SearchEntryKind::File,
+                title,
+                subtitle: subtitle.clone(),
+                match_text,
+                icon: SearchEntryKind::File.default_icon(),
+                shortcut_hint: None,
+                target: SearchTarget::File {
+                    path: path.clone(),
+                    line: None,
+                },
+            });
+
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && matches!(ext, "java" | "kt")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && stem
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_uppercase())
+                && seen_classes.insert((stem.to_owned(), Some(path.clone())))
+            {
+                entries.push(SearchEntry {
+                    kind: SearchEntryKind::Class,
+                    title: stem.to_owned(),
+                    subtitle,
+                    match_text: stem.to_owned(),
+                    icon: SearchEntryKind::Class.default_icon(),
+                    shortcut_hint: None,
+                    target: SearchTarget::File { path, line: None },
+                });
+            }
+        }
+    }
+
+    fn collect_action_search_entries(&self, entries: &mut Vec<SearchEntry>) {
+        let keymap_layer = jetbrains_keymap_layer_ref(self.keymap.platform());
+        for desc in builtin_action_registry_ref().iter() {
+            let Some(action) = ShellAction::from_action_id(&desc.id) else {
+                continue;
+            };
+            if action == ShellAction::OpenSearchEverywhere {
+                continue;
+            }
+            let shortcut_hint = keymap_layer
+                .chord_for_action(desc.id.as_str())
+                .map(ToString::to_string);
+            let title = desc.title.clone().into_owned();
+            let subtitle = desc.id.as_str().to_owned();
+            let match_text = format!("{title} {subtitle}");
+            entries.push(SearchEntry {
+                kind: SearchEntryKind::Action,
+                title,
+                subtitle,
+                match_text,
+                icon: SearchEntryKind::Action.default_icon(),
+                shortcut_hint,
+                target: SearchTarget::Action(action),
+            });
+        }
+    }
+
+    pub(crate) fn render_search_rows(
+        &mut self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Vec<Stateful<Div>> {
+        let theme = cx.global::<KovaTheme>().clone();
+        let selected = self.search_everywhere.state().selected();
+        let hits = self.search_everywhere.state().hits();
+        range
+            .filter_map(|row| {
+                hits.get(row)
+                    .map(|hit| render_search_row(row, hit, row == selected, &theme, cx))
+            })
+            .collect()
+    }
+
+    fn render_search_everywhere_overlay(&self, cx: &Context<'_, Self>) -> Option<Stateful<Div>> {
+        if !self.search_everywhere.is_open() {
+            return None;
+        }
+        Some(
+            self.search_everywhere
+                .render(cx.global::<KovaTheme>(), self.viewport_px, cx),
+        )
     }
 
     /// Installs the host writer that persists `settings.toml` edits made in the Settings view.
@@ -2926,6 +3276,7 @@ impl WorkspaceShell {
             )
             .child(
                 div()
+                    .id("titlebar-search-everywhere")
                     .w(px(320.0))
                     .h(px(24.0))
                     .px(px(12.0))
@@ -2937,6 +3288,11 @@ impl WorkspaceShell {
                     .border_color(p.border_island)
                     .bg(p.input)
                     .text_size(px(12.0))
+                    .cursor_pointer()
+                    .hover(|style| style.border_color(p.text_muted))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(SearchEverywhere), cx);
+                    })
                     .child(div().text_color(p.text_muted).child("⌕  Search Everywhere"))
                     .child(div().text_color(p.text_muted).child("⇧⇧")),
             )
@@ -4293,6 +4649,7 @@ impl Render for WorkspaceShell {
             .track_focus(&self.focus_handle)
             .capture_key_down(cx.listener(Self::handle_key_capture))
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .child(self.render_titlebar(p))
@@ -4302,6 +4659,10 @@ impl Render for WorkspaceShell {
             None => root,
         };
         let root = match self.render_commit_overlay() {
+            Some(overlay) => root.child(overlay),
+            None => root,
+        };
+        let root = match self.render_search_everywhere_overlay(cx) {
             Some(overlay) => root.child(overlay),
             None => root,
         };
