@@ -4432,6 +4432,7 @@ dependencies = [
  "kova_buffer",
  "kova_config",
  "kova_core",
+ "kova_jvm_index",
  "kova_lsp_dap",
  "kova_theme",
  "kova_toolchain",
@@ -4442,6 +4443,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "zip",
 ]
 
 [[package]]

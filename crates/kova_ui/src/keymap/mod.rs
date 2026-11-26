@@ -258,6 +258,8 @@ pub enum ShellAction {
     SelectAllOccurrences,
     /// Editor escape: close inline find bar or clear multi-cursors/selection (`Esc` when Vim is off).
     EditorEscape,
+    /// Trigger basic code completion (`Ctrl+Space`).
+    CompleteBasic,
     /// Collapse foldable region at caret (`Cmd+-` / `Ctrl+-`).
     FoldRegion,
     /// Expand foldable region at caret (`Cmd+=` / `Ctrl+=`).
@@ -354,6 +356,7 @@ impl ShellAction {
             ids::NAVIGATION_FORWARD => Self::NavigateForward,
             ids::EDITOR_SAVE => Self::Save,
             ids::EDITOR_ESCAPE => Self::EditorEscape,
+            ids::EDITOR_COMPLETE_BASIC => Self::CompleteBasic,
             ids::EDITOR_DUPLICATE_LINE => Self::DuplicateLine,
             ids::EDITOR_DELETE_LINE => Self::DeleteLine,
             ids::EDITOR_TOGGLE_LINE_COMMENT => Self::ToggleLineComment,
@@ -1492,11 +1495,42 @@ mod tests {
             "alt-shift-up",
             "alt-shift-down",
             "cmd-alt-l",
+            "ctrl-space",
         ] {
             assert_eq!(
                 mac.dispatch(shortcut_stroke(&ks(shortcut)).unwrap(), ro_ctx, now),
                 DispatchOutcome::Unhandled,
                 "read-only must block {shortcut}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_space_resolves_to_complete_basic_on_macos_and_linux() {
+        let now = Instant::now();
+        for platform in [Platform::MacOs, Platform::Linux] {
+            let mut layer = KeyDispatchLayer::new(platform);
+            assert_eq!(
+                press(
+                    &mut layer,
+                    "ctrl-space",
+                    FocusContext::EditorText,
+                    false,
+                    now
+                ),
+                DispatchOutcome::Action(ShellAction::CompleteBasic),
+                "{platform:?} editable"
+            );
+            assert_eq!(
+                press(
+                    &mut layer,
+                    "ctrl-space",
+                    FocusContext::EditorVimInsert,
+                    true,
+                    now
+                ),
+                DispatchOutcome::Action(ShellAction::CompleteBasic),
+                "{platform:?} vim insert"
             );
         }
     }

@@ -32,8 +32,9 @@ pub use dock::{
     StructureSymbolItem, TabGroupModel, TabId, TabItem, TreeActivation, VimModeBadge,
 };
 pub use document::{
-    DefinitionOutcome, DefinitionRequest, DefinitionSink, DefinitionTargetKind, DocumentState,
-    SaveRequest, SaveSink, SaveStatus, SaveTicket, StatusKind,
+    CompletionOutcome, CompletionRequest, CompletionSink, DefinitionOutcome, DefinitionRequest,
+    DefinitionSink, DefinitionTargetKind, DocumentState, SaveRequest, SaveSink, SaveStatus,
+    SaveTicket, StatusKind,
 };
 pub use editor::shared::SharedBuffer;
 pub use editor::{EditorEvent, EditorView, is_go_to_def_modifiers};

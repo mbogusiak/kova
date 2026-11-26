@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use kova_jvm_index::{
-    BytecodeScanOptions, JvmIndexError, JvmSourceOrigin, JvmSymbolKind, JvmVisibility,
-    parse_class_bytes, scan_jar_archive,
+    BytecodeScanOptions, JdkOnDemandIndex, JvmIndexError, JvmSourceOrigin, JvmSymbolKind,
+    JvmVisibility, parse_class_bytes, scan_jar_archive, split_display_signature,
 };
 use tempfile::TempDir;
 use zip::ZipWriter;
@@ -1002,5 +1002,153 @@ fn scans_two_thousand_synthetic_classes_within_nfr3_budget() {
     assert!(
         elapsed.as_millis() < 1_000,
         "scanning 2 000 classes took unexpectedly long: {elapsed:?}"
+    );
+}
+
+fn build_mock_java_base_jmod(jmods_dir: &std::path::Path) {
+    let mut obj_builder = ClassBuilder::new("java/lang/Object");
+    obj_builder.super_class = None;
+    obj_builder.methods.push(MethodDef {
+        flags: ACC_PUBLIC,
+        name: "toString",
+        descriptor: "()Ljava/lang/String;",
+        signature: None,
+        deprecated: false,
+        synthetic_attr: false,
+        line_number: None,
+    });
+    obj_builder.methods.push(MethodDef {
+        flags: ACC_PUBLIC,
+        name: "hashCode",
+        descriptor: "()I",
+        signature: None,
+        deprecated: false,
+        synthetic_attr: false,
+        line_number: None,
+    });
+    let obj_bytes = obj_builder.build();
+
+    let mut objects_builder = ClassBuilder::new("java/util/Objects");
+    objects_builder.methods.push(MethodDef {
+        flags: ACC_PUBLIC | ACC_STATIC,
+        name: "requireNonNull",
+        descriptor: "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;",
+        signature: Some("<T:Ljava/lang/Object;>(TT;Ljava/lang/String;)TT;"),
+        deprecated: false,
+        synthetic_attr: false,
+        line_number: None,
+    });
+    objects_builder.methods.push(MethodDef {
+        flags: ACC_PUBLIC | ACC_STATIC,
+        name: "isNull",
+        descriptor: "(Ljava/lang/Object;)Z",
+        signature: None,
+        deprecated: false,
+        synthetic_attr: false,
+        line_number: None,
+    });
+    objects_builder.methods.push(MethodDef {
+        flags: ACC_PRIVATE,
+        name: "<init>",
+        descriptor: "()V",
+        signature: None,
+        deprecated: false,
+        synthetic_attr: false,
+        line_number: None,
+    });
+    let objects_bytes = objects_builder.build();
+
+    let mut system_builder = ClassBuilder::new("java/lang/System");
+    system_builder.fields.push(FieldDef {
+        flags: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
+        name: "out",
+        descriptor: "Ljava/io/PrintStream;",
+        signature: None,
+        deprecated: false,
+        synthetic_attr: false,
+    });
+    let system_bytes = system_builder.build();
+
+    let mut string_builder = ClassBuilder::new("java/lang/String");
+    string_builder.methods.push(MethodDef {
+        flags: ACC_PUBLIC,
+        name: "<init>",
+        descriptor: "()V",
+        signature: None,
+        deprecated: false,
+        synthetic_attr: false,
+        line_number: None,
+    });
+    string_builder.methods.push(MethodDef {
+        flags: ACC_PUBLIC,
+        name: "length",
+        descriptor: "()I",
+        signature: None,
+        deprecated: false,
+        synthetic_attr: false,
+        line_number: None,
+    });
+    let string_bytes = string_builder.build();
+
+    write_zip_file(
+        &jmods_dir.join("java.base.jmod"),
+        true,
+        &[
+            ("classes/java/lang/Object.class", &obj_bytes),
+            ("classes/java/util/Objects.class", &objects_bytes),
+            ("classes/java/lang/System.class", &system_bytes),
+            ("classes/java/lang/String.class", &string_bytes),
+        ],
+    );
+}
+
+#[test]
+fn jdk_on_demand_index_reads_jmod_entries_inherits_object_and_caches() {
+    let dir = TempDir::new().unwrap();
+    let jmods_dir = dir.path().join("jmods");
+    std::fs::create_dir_all(&jmods_dir).unwrap();
+    build_mock_java_base_jmod(&jmods_dir);
+
+    let index = JdkOnDemandIndex::from_jdk_home(dir.path());
+    assert!(index.has_archives());
+
+    // 1. Static lookup on java.util.Objects
+    let t0 = Instant::now();
+    let members = index.collect_members("java.util.Objects", true, None);
+    let first_elapsed = t0.elapsed();
+    assert!(
+        first_elapsed.as_millis() < 15,
+        "first jmod lookup took {first_elapsed:?}"
+    );
+    let req = members
+        .iter()
+        .find(|m| m.name == "requireNonNull")
+        .expect("requireNonNull must be present");
+    assert_eq!(req.return_type.as_deref(), Some("T"));
+    assert!(req.params_signature.as_deref().unwrap().contains("String"));
+    assert!(members.iter().any(|m| m.name == "isNull"));
+
+    // 2. Cached hit
+    let t1 = Instant::now();
+    let cached = index.lookup_class("java.util.Objects").expect("cached");
+    assert_eq!(cached.ty.fqcn, "java.util.Objects");
+    assert!(t1.elapsed().as_millis() < 2);
+
+    // 3. Instance lookup on java.lang.String includes Object methods and skips Constructor
+    let str_members = index.collect_members("java.lang.String", false, None);
+    let str_names: Vec<&str> = str_members.iter().map(|m| m.name.as_str()).collect();
+    assert!(str_names.contains(&"length"));
+    assert!(str_names.contains(&"toString"));
+    assert!(str_names.contains(&"hashCode"));
+    assert!(!str_names.contains(&"String"));
+
+    // 4. Field type resolution on java.lang.System.out
+    assert_eq!(
+        index.resolve_field_type("java.lang.System", "out", None),
+        Some("java.io.PrintStream".to_owned())
+    );
+    assert_eq!(
+        split_display_signature(JvmSymbolKind::Method, "(Object): boolean"),
+        (Some("(Object)".to_owned()), Some("boolean".to_owned()))
     );
 }

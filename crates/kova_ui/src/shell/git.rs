@@ -209,6 +209,7 @@ impl WorkspaceShell {
     /// Opens the `Cmd+K` Commit modal overlay and refreshes Git status in the background.
     pub fn open_commit_panel(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let panel = self.ensure_commit_panel(window, cx);
+        self.close_completion_popup(cx);
         self.commit_panel_open = true;
         self.ex_line = None;
         self.keymap.reset();

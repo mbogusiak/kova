@@ -262,7 +262,10 @@ pub fn map_definition_target(
     }
 }
 
-fn utf16_point_at_byte(snapshot: &kova_buffer::BufferSnapshot, byte: usize) -> Utf16Point {
+pub(crate) fn utf16_point_at_byte(
+    snapshot: &kova_buffer::BufferSnapshot,
+    byte: usize,
+) -> Utf16Point {
     let clamped = snapshot.clamp_byte_to_char_boundary(byte.min(snapshot.len_bytes()));
     let Ok(pt) = snapshot.byte_to_point(clamped) else {
         return Utf16Point::new(0, 0);

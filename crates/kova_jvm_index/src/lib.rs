@@ -9,6 +9,7 @@ pub mod classpath;
 pub mod discovery;
 pub mod error;
 pub mod indexer;
+pub mod jdk_lookup;
 pub mod model;
 pub mod search;
 pub mod service;
@@ -29,6 +30,7 @@ pub use error::JvmIndexError;
 pub use indexer::{
     IndexCancelToken, IndexStats, IndexerConfig, JvmWorkspaceIndex, WorkspaceIndexer,
 };
+pub use jdk_lookup::{JdkOnDemandIndex, JvmCompletionMember, split_display_signature};
 pub use model::{
     JvmMemberEntry, JvmModifiers, JvmSourceOrigin, JvmSymbolKind, JvmTypeEntry, JvmVisibility,
     ParsedClassUnit, internal_name_to_binary, internal_name_to_fqcn,

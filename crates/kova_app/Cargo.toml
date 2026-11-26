@@ -21,6 +21,7 @@ gpui.workspace        = true
 kova_buffer.workspace = true
 kova_config.workspace = true
 kova_core.workspace   = true
+kova_jvm_index.workspace = true
 kova_lsp_dap.workspace = true
 kova_theme.workspace  = true
 kova_toolchain.workspace = true
@@ -33,6 +34,7 @@ tokio = { workspace = true, features = ["io-util", "rt-multi-thread"] }
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+zip.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { workspace = true, features = ["wayland", "x11"] }
