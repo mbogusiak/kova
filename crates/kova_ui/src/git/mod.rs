@@ -1,6 +1,8 @@
-//! Git presentation layer (KOVA-043): gutter diff markers, inline blame and the
-//! `Cmd+K` commit panel. All `gix` work runs in `kova_tools` on the background executor.
+//! Git presentation layer (KOVA-043, KOVA-060): gutter diff markers, inline blame, the
+//! `Cmd+K` commit panel, and the Git Branches popup. All `gix` work runs in `kova_tools` on
+//! the background executor.
 
+pub mod branches_popup;
 pub mod commit_panel;
 pub mod gutter;
 
@@ -9,6 +11,10 @@ use kova_core::builtin_actions::ids;
 use kova_core::keymap::presets::jetbrains_keymap_layer_ref;
 use kova_core::{KeyChord, KeyStep, Platform};
 
+pub use branches_popup::{
+    BranchesKeyOutcome, BranchesMode, BranchesPopup, BranchesPopupEvent, BranchesPopupModel,
+    BranchesRow, UnsavedFilesCheck,
+};
 pub use commit_panel::{CheckState, CommitPanel, CommitPanelEvent, CommitPanelModel, StageOp};
 pub use gutter::EditorGitState;
 
@@ -17,6 +23,9 @@ pub const WORKSPACE_KEY_CONTEXT: &str = "KovaWorkspace";
 
 /// Key context set on the commit panel root.
 pub const COMMIT_PANEL_KEY_CONTEXT: &str = "KovaCommitPanel";
+
+/// Key context set on the Git Branches popup card.
+pub const BRANCHES_POPUP_KEY_CONTEXT: &str = "KovaBranchesPopup";
 
 gpui::actions!(
     kova_git,
@@ -27,6 +36,10 @@ gpui::actions!(
         CloseCommitPanel,
         /// Commits the staged changes with the typed message.
         CommitStaged,
+        /// Opens or closes the Git Branches popup (`git.branches`).
+        ToggleBranchesPopup,
+        /// Closes the Git Branches popup.
+        CloseBranchesPopup,
     ]
 );
 
@@ -52,6 +65,19 @@ pub fn commit_panel_keystroke(platform: Platform) -> String {
         })
 }
 
+/// Returns the GPUI keystroke for `git.branches`, taken from the built-in `JetBrains`
+/// preset of `platform` in `kova_core`.
+#[must_use]
+pub fn branches_popup_keystroke(platform: Platform) -> String {
+    jetbrains_keymap_layer_ref(platform)
+        .chord_for_action(ids::GIT_BRANCHES)
+        .and_then(gpui_keystroke)
+        .unwrap_or_else(|| match platform {
+            Platform::MacOs => "ctrl-v".to_owned(),
+            Platform::Linux => "alt-`".to_owned(),
+        })
+}
+
 /// Returns the default Git bindings for the host platform.
 #[must_use]
 pub fn default_key_bindings() -> Vec<KeyBinding> {
@@ -67,8 +93,18 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
             ToggleCommitPanel,
             Some(WORKSPACE_KEY_CONTEXT),
         ),
+        KeyBinding::new(
+            &branches_popup_keystroke(platform),
+            ToggleBranchesPopup,
+            Some(WORKSPACE_KEY_CONTEXT),
+        ),
         KeyBinding::new("escape", CloseCommitPanel, Some(COMMIT_PANEL_KEY_CONTEXT)),
         KeyBinding::new(commit_key, CommitStaged, Some(COMMIT_PANEL_KEY_CONTEXT)),
+        KeyBinding::new(
+            "escape",
+            CloseBranchesPopup,
+            Some(BRANCHES_POPUP_KEY_CONTEXT),
+        ),
     ]
 }
 
@@ -85,6 +121,8 @@ mod tests {
     fn commit_panel_shortcut_mirrors_kova_core_preset() {
         assert_eq!(commit_panel_keystroke(Platform::MacOs), "cmd-k");
         assert_eq!(commit_panel_keystroke(Platform::Linux), "ctrl-k");
+        assert_eq!(branches_popup_keystroke(Platform::MacOs), "ctrl-v");
+        assert_eq!(branches_popup_keystroke(Platform::Linux), "alt-`");
     }
 
     #[test]

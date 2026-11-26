@@ -207,6 +207,8 @@ pub mod ids {
     pub const VIEW_CLOSE_TAB: &str = "view.close_tab";
     /// Open Git commit tool/dialog.
     pub const GIT_COMMIT: &str = "git.commit";
+    /// Open Git branches popup.
+    pub const GIT_BRANCHES: &str = "git.branches";
     /// Push committed changes to remote.
     pub const GIT_PUSH: &str = "git.push";
     /// Update / pull project changes from remote.
@@ -932,6 +934,13 @@ const BUILTIN_SPECS: &[BuiltinActionSpec] = &[
         "Commit...",
         ActionCategory::Git,
         "Open Git commit view",
+        WhenScope::Workspace,
+    ),
+    spec(
+        ids::GIT_BRANCHES,
+        "Branches...",
+        ActionCategory::Git,
+        "Open Git branches popup to switch, create, delete, fetch, or pull branches",
         WhenScope::Workspace,
     ),
     spec(

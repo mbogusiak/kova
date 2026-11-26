@@ -82,6 +82,19 @@ impl SharedBuffer {
         f(buffer, history)
     }
 
+    /// Replaces the entire buffer with `text` and resets the undo [`History`] to a clean
+    /// save point (used when reloading an unmodified file from disk after a branch switch).
+    ///
+    /// # Errors
+    /// Propagates [`BufferError`] if the edit fails.
+    pub fn reset_to_text(&self, text: &str) -> Result<BufferVersion, BufferError> {
+        let mut doc = self.0.borrow_mut();
+        let len = doc.buffer.snapshot().len_bytes();
+        let version = doc.buffer.apply_edit(0..len, text)?;
+        doc.history = History::new(HistoryConfig::default());
+        Ok(version)
+    }
+
     /// Returns `true` when the shared history has a transaction to undo.
     #[must_use]
     pub fn can_undo(&self) -> bool {

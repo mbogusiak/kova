@@ -234,6 +234,8 @@ pub enum ShellAction {
     OpenSettings,
     /// Open or close the Git *Commit* panel (`Cmd+K` / `Ctrl+K`).
     ToggleCommitPanel,
+    /// Open or close the *Git Branches* popup (`Ctrl+V` / `Cmd+Shift+grave` on macOS, `Alt+grave` / `Ctrl+Shift+grave` on Linux).
+    ToggleBranchesPopup,
     /// Jump to symbol declaration at the active caret (`Cmd+B` / `Ctrl+B`).
     GoToDefinition,
     /// Step backward in navigation history (`Cmd+[` / `Ctrl+Alt+Left`).
@@ -385,6 +387,7 @@ impl ShellAction {
             ids::NAVIGATION_SEARCH_EVERYWHERE => Self::OpenSearchEverywhere,
             ids::VIEW_OPEN_SETTINGS => Self::OpenSettings,
             ids::GIT_COMMIT => Self::ToggleCommitPanel,
+            ids::GIT_BRANCHES => Self::ToggleBranchesPopup,
             ids::BUILD_BUILD_PROJECT => Self::BuildProject,
             ids::RUN_RUN_CONTEXT => Self::RunContext,
             ids::RUN_RUN_LAST => Self::RunLast,
@@ -909,6 +912,31 @@ mod tests {
     }
 
     #[test]
+    fn branches_popup_shortcuts_resolve_per_platform() {
+        let now = Instant::now();
+        let editor = FocusContext::EditorText;
+        let mut mac = KeyDispatchLayer::new(Platform::MacOs);
+        assert_eq!(
+            press(&mut mac, "ctrl-v", editor, false, now),
+            DispatchOutcome::Action(ShellAction::ToggleBranchesPopup)
+        );
+        assert_eq!(
+            press(&mut mac, "shift-cmd-`", editor, false, now),
+            DispatchOutcome::Action(ShellAction::ToggleBranchesPopup)
+        );
+
+        let mut linux = KeyDispatchLayer::new(Platform::Linux);
+        assert_eq!(
+            press(&mut linux, "alt-`", editor, false, now),
+            DispatchOutcome::Action(ShellAction::ToggleBranchesPopup)
+        );
+        assert_eq!(
+            press(&mut linux, "shift-ctrl-`", editor, false, now),
+            DispatchOutcome::Action(ShellAction::ToggleBranchesPopup)
+        );
+    }
+
+    #[test]
     fn vim_ctrl_w_chord_navigates_and_times_out() {
         let t0 = Instant::now();
         for platform in [Platform::MacOs, Platform::Linux] {
@@ -1080,6 +1108,7 @@ mod tests {
             ids::VIM_TOGGLE,
             ids::TOOL_WINDOW_HIDE_ALL,
             ids::GIT_COMMIT,
+            ids::GIT_BRANCHES,
             ids::NAVIGATION_GO_TO_DECLARATION,
             ids::NAVIGATION_BACK,
             ids::NAVIGATION_FORWARD,
