@@ -451,17 +451,25 @@ fun kova_plugin_on_ui_event(eventPtr: Int, eventLen: Int): Long =
 
 @OptIn(ExperimentalWasmInterop::class)
 @WasmExport
-fun kova_plugin_on_command(cmdPtr: Int, cmdLen: Int): Int {
-    val json = WitBridge.readString(cmdPtr, cmdLen)
-    return WitBridge.onCommandJson(json)
-}
+fun kova_plugin_on_command(cmdPtr: Int, cmdLen: Int): Int =
+    runCatching {
+        val json = WitBridge.readString(cmdPtr, cmdLen)
+        WitBridge.onCommandJson(json)
+    }.getOrElse {
+        WitBridge.setError(it.message ?: "on_command error")
+        1
+    }
 
 @OptIn(ExperimentalWasmInterop::class)
 @WasmExport
-fun kova_plugin_on_event(eventPtr: Int, eventLen: Int): Int {
-    val json = WitBridge.readString(eventPtr, eventLen)
-    return WitBridge.onEventJson(json)
-}
+fun kova_plugin_on_event(eventPtr: Int, eventLen: Int): Int =
+    runCatching {
+        val json = WitBridge.readString(eventPtr, eventLen)
+        WitBridge.onEventJson(json)
+    }.getOrElse {
+        WitBridge.setError(it.message ?: "on_event error")
+        1
+    }
 
 @OptIn(ExperimentalWasmInterop::class)
 @WasmExport
@@ -664,7 +672,7 @@ object WitCodec {
             is WidgetNode.Split -> {
                 appendField("type"); appendJsonString("split"); append(',')
                 appendField("orientation"); appendJsonString(node.orientation.wireName); append(',')
-                appendField("ratio"); append(node.ratio); append(',')
+                appendField("ratio"); append(if (node.ratio.isFinite()) node.ratio else 0.5f); append(',')
                 appendField("first"); appendWidgetNode(node.first); append(',')
                 appendField("second"); appendWidgetNode(node.second)
             }
@@ -691,7 +699,7 @@ object WitCodec {
                     append('{')
                     appendField("id"); appendJsonString(col.id); append(',')
                     appendField("title"); appendJsonString(col.title); append(',')
-                    appendField("width-weight"); append(col.widthWeight)
+                    appendField("width-weight"); append(if (col.widthWeight.isFinite()) col.widthWeight else 1.0f)
                     append('}')
                 }; append(',')
                 appendField("rows"); appendArray(node.rows) { row ->
