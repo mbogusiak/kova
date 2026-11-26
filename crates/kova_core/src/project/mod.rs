@@ -19,14 +19,14 @@ use serde::{Deserialize, Serialize};
 pub use active::{ActiveProject, ProjectGeneration, ProjectPhase};
 pub use recent::{MAX_RECENT_PROJECTS_IN_MENU, RecentProject, RecentProjectsStore};
 pub use scanner::{
-    DEFAULT_MAX_ENTRIES, ProjectFileEntry, ProjectNode, ProjectNodeId, ProjectNodeKind,
-    ProjectScanOptions, ProjectTree, scan_project,
+    DEFAULT_IGNORED_MAX_DEPTH, DEFAULT_MAX_ENTRIES, ProjectFileEntry, ProjectNode, ProjectNodeId,
+    ProjectNodeKind, ProjectScanOptions, ProjectTree, scan_project,
 };
 pub use session::{
     MAX_RECENT_FILES, MAX_RECENT_WORKSPACES, OpenTabState, RecentWorkspaceEntry, RecentWorkspaces,
-    SESSION_SCHEMA_VERSION, SessionLayoutState, WorkspaceSession, load_recent_workspaces,
-    load_workspace_session, load_workspace_session_or_default, record_recent_workspace,
-    save_recent_workspaces, save_workspace_session,
+    SESSION_SCHEMA_VERSION, SessionLayoutState, WorkspaceSession, is_safe_relative_path,
+    load_recent_workspaces, load_workspace_session, load_workspace_session_or_default,
+    record_recent_workspace, save_recent_workspaces, save_workspace_session,
 };
 
 const GRADLE_MARKERS: [&str; 5] = [

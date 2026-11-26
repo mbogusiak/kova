@@ -592,6 +592,10 @@ impl WorkspaceShell {
 
         self.project_tree = ProjectTreeModel::default();
         self.project_tree.set_filter("");
+        self.new_item_modal.state_mut().close();
+        self.new_item_modal.clear_bounds();
+        self.project_options_open = false;
+        self.project_options_bounds.set(None);
         self.structure = StructureModel::default();
         self.bottom_panel = BottomPanelModel::default();
         self.test_runner.set_project_files(Vec::new());
@@ -884,6 +888,7 @@ impl WorkspaceShell {
         self.settings_open
             || self.commit_panel_open
             || self.open_project_modal.is_some()
+            || self.new_item_modal.is_open()
             || self.search_everywhere.is_open()
             || self.find_in_files.is_open()
             || self.ex_line.is_some()

@@ -26,7 +26,7 @@ pub use debugger::{
     VariableItem,
 };
 pub use dock::{
-    BadgeVariant, BottomPanelModel, BottomTab, DockLayoutState, DockSide, DockToolId,
+    BadgeVariant, BottomPanelModel, BottomTab, DockLayoutState, DockSide, DockToolId, FileIconKind,
     FocusedRegion, PaneId, PaneRect, ProblemEntry, ProblemRow, ProblemSeverity, ProjectNode,
     ProjectNodeKind, ProjectTreeModel, SplitAxis, SplitTree, StatusBarState, StructureModel,
     StructureSymbolItem, TabGroupModel, TabId, TabItem, TreeActivation, VimModeBadge,
@@ -43,10 +43,11 @@ pub use git::{
 };
 pub use plugin_ui::{PluginToolWindow, PluginUiEventSink};
 pub use shell::{
-    OpenProjectButton, OpenProjectDirtyEntry, OpenProjectKeyOutcome, OpenProjectModal,
-    OpenProjectModalMode, OpenProjectRequestOutcome, PendingProjectSwitch, ProjectHostCommand,
-    ProjectHostSink, StartupMetrics, SwitchProjectError, SwitchProjectMode, WorkspaceShell,
-    canonicalize_or_raw, paths_match,
+    NewEntryKind, NewItemKeyOutcome, NewProjectItemState, OpenProjectButton, OpenProjectDirtyEntry,
+    OpenProjectKeyOutcome, OpenProjectModal, OpenProjectModalMode, OpenProjectRequestOutcome,
+    PendingProjectSwitch, ProjectHostCommand, ProjectHostSink, StartupMetrics, SwitchProjectError,
+    SwitchProjectMode, WorkspaceShell, canonicalize_or_raw, create_project_item_on_disk,
+    paths_match,
 };
 pub use terminal::{TerminalDock, TerminalLaunch, TerminalView};
 pub use test_runner::{TestRunRequest, TestRunSink, TestRunnerAction, TestRunnerModel};
