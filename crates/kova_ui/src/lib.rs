@@ -12,6 +12,7 @@ pub mod editor;
 pub mod git;
 pub mod http_runner;
 pub mod keymap;
+pub mod markdown_preview;
 pub mod plugin_ui;
 pub mod search;
 pub mod settings;
@@ -41,6 +42,7 @@ pub use editor::{EditorEvent, EditorView, is_go_to_def_modifiers};
 pub use git::{
     CheckState, CommitPanel, CommitPanelEvent, CommitPanelModel, EditorGitState, StageOp,
 };
+pub use markdown_preview::{MarkdownPreviewEvent, MarkdownPreviewView};
 pub use plugin_ui::{PluginToolWindow, PluginUiEventSink};
 pub use shell::{
     NewEntryKind, NewItemKeyOutcome, NewProjectItemState, OpenProjectButton, OpenProjectDirtyEntry,
