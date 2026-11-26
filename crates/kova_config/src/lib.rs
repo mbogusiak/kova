@@ -19,7 +19,8 @@ pub use model::{
 pub use paths::{KovaPaths, PathsError};
 pub use project::{
     EffectiveConfig, ProjectBuildTool, ProjectConfig, ProjectConfigDocument,
-    ProjectEditorOverrides, ProjectJvmOverrides, RunConfigKind, RunConfiguration,
+    ProjectEditorOverrides, ProjectHttpConfig, ProjectJvmOverrides, RunConfigKind,
+    RunConfiguration,
 };
 pub use watcher::{
     ConfigReloadEvent, ConfigWatcher, ConfigWatcherHandle, ConfigWatcherOptions, LiveConfigState,

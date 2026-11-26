@@ -94,6 +94,32 @@ pub struct ProjectJvmOverrides {
     pub lombok_enabled: Option<bool>,
 }
 
+/// Optional project-scoped `.http` runner variables in `kova.toml` under `[http]` (`KOVA-042`).
+///
+/// ```toml
+/// [http]
+/// environment = "dev"
+///
+/// [http.environments.dev]
+/// baseUrl = "http://localhost:8080"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectHttpConfig {
+    /// Name of the environment selected by default for `.http` requests.
+    pub environment: Option<String>,
+    /// Named variable sets substituted into `{{name}}` placeholders.
+    pub environments: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl ProjectHttpConfig {
+    /// Returns `true` when no `[http]` settings are declared.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.environment.is_none() && self.environments.is_empty()
+    }
+}
+
 /// Optional per-repository configuration loaded from `<project_root>/kova.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -110,6 +136,9 @@ pub struct ProjectConfig {
     pub jvm: ProjectJvmOverrides,
     /// Shared team run configurations (`[[run_configurations]]`).
     pub run_configurations: Vec<RunConfiguration>,
+    /// `.http` runner variables (`[http]`).
+    #[serde(skip_serializing_if = "ProjectHttpConfig::is_empty")]
+    pub http: ProjectHttpConfig,
 }
 
 impl Default for ProjectConfig {
@@ -121,6 +150,7 @@ impl Default for ProjectConfig {
             editor: ProjectEditorOverrides::default(),
             jvm: ProjectJvmOverrides::default(),
             run_configurations: Vec::new(),
+            http: ProjectHttpConfig::default(),
         }
     }
 }
@@ -211,6 +241,14 @@ impl ProjectConfig {
             return Err(ConfigError::Validation {
                 field: "jvm.auto_hibernate_minutes",
                 reason: format!("expected 0..=1440 minutes, got {mins}"),
+            });
+        }
+        if let Some(env) = &self.http.environment
+            && !self.http.environments.contains_key(env)
+        {
+            return Err(ConfigError::Validation {
+                field: "http.environment",
+                reason: format!("environment '{env}' is not declared in [http.environments]"),
             });
         }
         let mut seen = std::collections::BTreeSet::new();

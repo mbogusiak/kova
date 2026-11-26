@@ -10,6 +10,8 @@ pub mod junit;
 
 pub mod terminal;
 
+pub mod http_runner;
+
 /// Name of this crate as declared in its `Cargo.toml`.
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 

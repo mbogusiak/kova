@@ -58,6 +58,7 @@ use crate::editor::actions::{Save, WORKSPACE_KEY_CONTEXT};
 use crate::editor::syntax::{EditorSyntax, RunEntryPointRequested};
 use crate::editor::vim::VimKeyResult;
 use crate::editor::{EditorEvent, EditorView, SharedBuffer};
+use crate::http_runner::HttpResponseView;
 use crate::keymap::{
     CHORD_TIMEOUT, DispatchContext, DispatchOutcome, ExCommand, ExCommandLine, ExLineEvent,
     KeyDispatchLayer, KeyRoute, RouteFlags, ShellAction, is_text_composition, key_route,
@@ -81,6 +82,10 @@ use kova_config::{
     KovaSettings, ProjectConfigDocument, RunConfigKind, RunConfiguration, SettingsDocument,
 };
 use kova_syntax::EntryPointKind;
+use kova_tools::http_runner::{
+    HttpEnvironments, HttpExecutor, HttpExecutorConfig, HttpFile, HttpRequestSpec,
+    discover_project_root, prepare_request_at_line,
+};
 use kova_tools::junit::TestEvent;
 
 /// Canonical Islands UI layout geometry (`KOVA-025` spec §FR-1, `new_ui_dock_mockup.svg`).
@@ -416,6 +421,10 @@ pub struct WorkspaceShell {
     debugger: DebuggerModel,
     /// Host executor of debug sessions (`kova_lsp_dap::dap`).
     debug_sink: Option<DebugCommandSink>,
+    /// `.http` response panel shown right of the editor area once a request ran (`KOVA-042`).
+    http_panel: Option<Entity<HttpResponseView>>,
+    /// Lazily created `.http` request executor (owns its Tokio worker thread).
+    http_executor: Option<HttpExecutor>,
 }
 
 impl fmt::Debug for WorkspaceShell {
@@ -537,6 +546,8 @@ impl WorkspaceShell {
             run_configs_error: None,
             debugger: DebuggerModel::default(),
             debug_sink: None,
+            http_panel: None,
+            http_executor: None,
         }
     }
 
@@ -816,7 +827,12 @@ impl WorkspaceShell {
                     .and_then(|state| state.tabs.tabs().iter().find(|t| t.id == tab))
                     .and_then(|t| t.path.clone());
                 let request = RunEntryPointRequested::from_entry_point(entry, path);
-                self.handle_run_request(&request);
+                if request.kind == EntryPointKind::HttpRequest {
+                    let text = editor.read(cx).shared_buffer().snapshot().text();
+                    self.run_http_request(&request, &text, cx);
+                } else {
+                    self.handle_run_request(&request);
+                }
                 cx.notify();
             }
             EditorEvent::ToggleBreakpoint(row) => {
@@ -855,6 +871,71 @@ impl WorkspaceShell {
         }
         self.bottom_panel.run_logs.push(request.log_line());
         self.dock_layout.bottom_open = Some(DockToolId::Run);
+    }
+
+    /// Sends the `.http` request of `request` (`KOVA-042`) and shows the response in the panel
+    /// right of the editor area.
+    ///
+    /// Parsing and `{{var}}` substitution happen here; the network call runs on the
+    /// `kova_tools` worker thread, so the UI thread never blocks.
+    fn run_http_request(
+        &mut self,
+        request: &RunEntryPointRequested,
+        text: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let file = HttpFile::parse(text);
+        let line = request.line;
+        let title = file
+            .request_at_line(line)
+            .map_or_else(|| format!("line {}", line + 1), HttpRequestSpec::summary);
+        let panel = self
+            .http_panel
+            .get_or_insert_with(|| cx.new(HttpResponseView::new))
+            .clone();
+
+        let environments =
+            http_env_root(self.project_root.as_deref(), request.file_path.as_deref()).map_or_else(
+                || Ok(HttpEnvironments::default()),
+                |root| HttpEnvironments::load_from_dir(&root),
+            );
+        let prepared =
+            environments.and_then(|envs| prepare_request_at_line(&file, line, &envs, None));
+        let (spec, http_request) = match prepared {
+            Ok(ok) => ok,
+            Err(err) => {
+                panel.update(cx, |view, cx| view.show_error(title, &err, cx));
+                return;
+            }
+        };
+        let executor = match self.http_executor.take() {
+            Some(executor) => executor,
+            None => match HttpExecutor::new(HttpExecutorConfig::default()) {
+                Ok(executor) => executor,
+                Err(err) => {
+                    panel.update(cx, |view, cx| view.show_error(title, &err, cx));
+                    return;
+                }
+            },
+        };
+        let handle = executor.spawn(http_request);
+        self.http_executor = Some(executor);
+        panel.update(cx, |view, cx| view.run(spec.summary(), handle, cx));
+    }
+
+    /// Returns the `.http` response panel, once a request has been run.
+    #[must_use]
+    pub const fn http_panel(&self) -> Option<&Entity<HttpResponseView>> {
+        self.http_panel.as_ref()
+    }
+
+    /// Whether the active tab of the active pane is an `.http` document.
+    fn active_tab_is_http(&self) -> bool {
+        self.panes
+            .get(&self.active_pane)
+            .and_then(|pane| pane.tabs.active_tab())
+            .and_then(|tab| tab.path.as_deref())
+            .is_some_and(|path| detect_language(path) == Some(SyntaxLanguage::Http))
     }
 
     /// Shows `request` in the Test Runner dock and hands it to the host sink.
@@ -4017,6 +4098,26 @@ impl WorkspaceShell {
             )
     }
 
+    /// `.http` response island split to the right of the editor area while an `.http` tab
+    /// is active (`KOVA-042`).
+    fn render_http_panel(&self, p: Palette) -> Option<Div> {
+        let panel = self
+            .http_panel
+            .as_ref()
+            .filter(|_| self.active_tab_is_http())?;
+        Some(
+            div()
+                .flex_1()
+                .h_full()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .rounded(px(ISLAND_RADIUS_PX))
+                .border_1()
+                .border_color(p.border_island)
+                .child(panel.clone()),
+        )
+    }
+
     fn render_workspace(&self, p: Palette, cx: &Context<'_, Self>) -> Div {
         let gap = self.focus_tiling.density().island_gap_px();
         let stripes = !self.focus_tiling.hides_stripes();
@@ -4033,7 +4134,9 @@ impl WorkspaceShell {
                     .w_full()
                     .min_h(px(0.0))
                     .flex()
-                    .child(self.render_split(&self.split_tree, p, cx)),
+                    .gap(px(gap))
+                    .child(self.render_split(&self.split_tree, p, cx))
+                    .children(self.render_http_panel(p)),
             );
         if let Some(bottom) = self.render_bottom_panel(p, cx) {
             center = center
@@ -4296,6 +4399,16 @@ fn file_title(path: &Path) -> String {
 }
 
 /// Returns the status bar language label for `path` (`Java`, `Kotlin`, `HTTP`, `TOML`, `JSON`).
+/// Directory whose `kova.toml` / `http-client.env.json` supply `.http` variables: the project
+/// root when one is open, else the nearest marker directory above the (absolute) file.
+fn http_env_root(project_root: Option<&Path>, file_path: Option<&Path>) -> Option<PathBuf> {
+    match (project_root, file_path) {
+        (Some(root), _) => Some(root.to_path_buf()),
+        (None, Some(path)) if path.is_absolute() => Some(discover_project_root(path)),
+        _ => None,
+    }
+}
+
 fn language_label(path: &Path) -> &'static str {
     match detect_language(path) {
         Some(SyntaxLanguage::Java) => "Java",
@@ -4443,6 +4556,17 @@ fn demo_project_nodes() -> Vec<ProjectNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_env_root_prefers_project_root() {
+        let root = Path::new("/work/orders");
+        assert_eq!(
+            http_env_root(Some(root), Some(Path::new("api/users.http"))),
+            Some(root.to_path_buf())
+        );
+        assert_eq!(http_env_root(None, Some(Path::new("api/users.http"))), None);
+        assert_eq!(http_env_root(None, None), None);
+    }
 
     #[test]
     fn startup_metrics_formats_summary_and_evaluates_budgets() {
