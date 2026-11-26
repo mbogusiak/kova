@@ -221,6 +221,8 @@ pub enum ShellAction {
     OpenSearchEverywhere,
     /// Open *Settings* (`Cmd+,`).
     OpenSettings,
+    /// Open or close the Git *Commit* panel (`Cmd+K` / `Ctrl+K`).
+    ToggleCommitPanel,
     /// JVM debugger command (`KOVA-041`).
     Debug(DebugShellAction),
 }
@@ -286,6 +288,7 @@ impl ShellAction {
             ids::EDITOR_ADD_NEXT_OCCURRENCE => Self::AddNextOccurrence,
             ids::NAVIGATION_SEARCH_EVERYWHERE => Self::OpenSearchEverywhere,
             ids::VIEW_OPEN_SETTINGS => Self::OpenSettings,
+            ids::GIT_COMMIT => Self::ToggleCommitPanel,
             ids::DEBUG_TOGGLE_LINE_BREAKPOINT => Self::Debug(DebugShellAction::ToggleBreakpoint),
             ids::DEBUG_STEP_OVER => Self::Debug(DebugShellAction::StepOver),
             ids::DEBUG_STEP_INTO => Self::Debug(DebugShellAction::StepInto),
@@ -640,6 +643,10 @@ mod tests {
             DispatchOutcome::Action(ShellAction::Save)
         );
         assert_eq!(
+            press(&mut mac, "cmd-k", editor, false, now),
+            DispatchOutcome::Action(ShellAction::ToggleCommitPanel)
+        );
+        assert_eq!(
             press(&mut mac, "ctrl-alt-t", editor, false, now),
             DispatchOutcome::Action(ShellAction::ToggleTilingMode)
         );
@@ -685,6 +692,10 @@ mod tests {
         assert_eq!(
             press(&mut linux, "super-alt-down", editor, false, now),
             DispatchOutcome::Action(ShellAction::FocusDirection(Direction::Down))
+        );
+        assert_eq!(
+            press(&mut linux, "ctrl-k", editor, false, now),
+            DispatchOutcome::Action(ShellAction::ToggleCommitPanel)
         );
         assert_eq!(linux.platform(), Platform::Linux);
     }
@@ -860,6 +871,7 @@ mod tests {
             ids::WINDOW_RESIZE_DOWN,
             ids::VIM_TOGGLE,
             ids::TOOL_WINDOW_HIDE_ALL,
+            ids::GIT_COMMIT,
         ] {
             assert!(
                 ShellAction::from_action_id(&ActionId::from_static(id)).is_some(),

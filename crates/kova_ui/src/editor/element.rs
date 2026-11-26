@@ -13,6 +13,7 @@ use gpui::{
 use kova_buffer::BufferSnapshot;
 use kova_syntax::{GutterIconRole, HighlightSpan};
 use kova_theme::{RgbaColor, SyntaxTokens};
+use kova_tools::git::LineChangeKind;
 use smallvec::SmallVec;
 
 use crate::debugger::BreakpointIcon;
@@ -164,6 +165,15 @@ struct FoldPill {
     hitbox: Hitbox,
 }
 
+/// Git gutter diff bar or deletion wedge on one visible row (`KOVA-043`).
+#[derive(Debug, Clone, Copy)]
+struct GitGutterMarker {
+    visual_row: usize,
+    kind: LineChangeKind,
+    /// When `true`, paints a deletion marker at the bottom edge of the row (EOF removal).
+    at_bottom: bool,
+}
+
 /// Per-frame syntax highlighting inputs for [`shape_visible_line`].
 struct HighlightCtx<'a> {
     syntax: Option<&'a EditorSyntax>,
@@ -219,6 +229,10 @@ pub struct EditorPrepaintState {
     breakpoints: Vec<(usize, BreakpointIcon)>,
     /// Visual row of the debugger execution point.
     execution_visual_row: Option<usize>,
+    /// Git gutter diff markers by visible row (`KOVA-043`).
+    git_markers: Vec<GitGutterMarker>,
+    /// Inline Git blame annotation at the end of the active line (`KOVA-043`).
+    inline_blame: Option<(gpui::Point<Pixels>, ShapedLine)>,
     fold_pills: Vec<FoldPill>,
     gutter_hitbox: Hitbox,
     overlays: Overlays,
@@ -465,6 +479,18 @@ impl Element for EditorCanvasElement {
             );
             editor.set_fold_pills(fold_pills.iter().map(|p| (p.bounds, p.row)).collect());
 
+            let git_markers = collect_git_markers(editor, &rows, total_lines);
+            let inline_blame = shape_inline_blame(
+                editor,
+                &visible_shaped_cache,
+                &fold_pills,
+                &editor_font,
+                gutter_font_size,
+                pill_fg,
+                geom,
+                window,
+            );
+
             editor.set_render_cache(bounds, visible_shaped_cache);
 
             let focused = editor.focus_handle().is_focused(window);
@@ -493,6 +519,8 @@ impl Element for EditorCanvasElement {
                 gutter_markers,
                 breakpoints,
                 execution_visual_row,
+                git_markers,
+                inline_blame,
                 fold_pills,
                 gutter_hitbox,
                 overlays,
@@ -592,15 +620,22 @@ impl Element for EditorCanvasElement {
                     paint_gutter_markers(prepaint, &theme, window);
                     // Layer 7e: breakpoints over the line numbers, execution arrow (`KOVA-041`).
                     paint_debug_markers(prepaint, f32::from(digits_right_x), window);
+                    // Layer 7f: Git gutter diff markers (`KOVA-043`).
+                    paint_git_markers(prepaint, &theme, window);
                 },
             );
 
-            // Layer 7d: `... (N lines)` pills after collapsed fold headers.
+            // Layer 7d: `... (N lines)` pills after collapsed fold headers and inline Git blame.
             window.with_content_mask(
                 Some(ContentMask {
                     bounds: content_bounds,
                 }),
-                |window| paint_fold_pills(prepaint, &theme, window, cx),
+                |window| {
+                    paint_fold_pills(prepaint, &theme, window, cx);
+                    if let Some((origin, blame)) = &prepaint.inline_blame {
+                        drop(blame.paint(*origin, line_height, window, cx));
+                    }
+                },
             );
 
             // Conditional 1px gutter separator when horizontally scrolled.
@@ -813,6 +848,130 @@ fn paint_run_triangle(window: &mut Window, x: f32, center_y: f32, side: f32, col
     builder.close();
     if let Ok(path) = builder.build() {
         window.paint_path(path, color);
+    }
+}
+
+fn collect_git_markers(
+    editor: &EditorView,
+    rows: &[(usize, usize)],
+    total_lines: usize,
+) -> Vec<GitGutterMarker> {
+    let git = editor.git();
+    if git.hunks().is_empty() {
+        return Vec::new();
+    }
+    let mut markers = Vec::new();
+    for &(visual_row, row) in rows {
+        if let Some(kind) = git.marker_at(row) {
+            markers.push(GitGutterMarker {
+                visual_row,
+                kind,
+                at_bottom: false,
+            });
+        }
+        if row + 1 == total_lines && git.marker_at(total_lines) == Some(LineChangeKind::Deleted) {
+            markers.push(GitGutterMarker {
+                visual_row,
+                kind: LineChangeKind::Deleted,
+                at_bottom: true,
+            });
+        }
+    }
+    markers
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "inline blame shaping needs font, muted color, fold pills and geometry in one pass"
+)]
+fn shape_inline_blame(
+    editor: &EditorView,
+    visible: &[VisibleShapedLine],
+    fold_pills: &[FoldPill],
+    editor_font: &gpui::Font,
+    font_size: Pixels,
+    muted_fg: Hsla,
+    geom: OverlayGeometry,
+    window: &mut Window,
+) -> Option<(gpui::Point<Pixels>, ShapedLine)> {
+    if !editor.is_active_pane() || !editor.git().inline_blame_enabled() {
+        return None;
+    }
+    let primary_row = editor.caret_row();
+    let line = visible.iter().find(|l| l.row == primary_row)?;
+    let label = editor.git().blame_label(primary_row)?;
+    let x = if let Some(pill) = fold_pills.iter().find(|p| p.row == primary_row) {
+        f32::from(pill.bounds.origin.x + pill.bounds.size.width) + geom.char_advance * 2.0
+    } else {
+        geom.content_origin_x
+            + line.x_offset
+            + f32::from(line.shaped.width)
+            + geom.char_advance * 3.0
+            - geom.scroll_x
+    };
+    let mut color = muted_fg;
+    color.a *= 0.78;
+    let text: SharedString = label.into();
+    let run = TextRun {
+        len: text.len(),
+        font: editor_font.clone(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(text, font_size, &[run], None);
+    Some((point(px(x), px(geom.row_y(line.visual_row))), shaped))
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "visible row index fits cleanly within f32"
+)]
+fn paint_git_markers(prepaint: &EditorPrepaintState, theme: &KovaTheme, window: &mut Window) {
+    if prepaint.git_markers.is_empty() {
+        return;
+    }
+    let git_slot = ViewportMetrics::git_bar_slot_range(prepaint.gutter_width_px);
+    let origin = prepaint.bounds.origin;
+    let lh = prepaint.line_height_px;
+    let added = hsla_from_rgba(theme.gutter().git_added);
+    let modified = hsla_from_rgba(theme.gutter().git_modified);
+    let deleted = hsla_from_rgba(theme.gutter().git_deleted);
+    let bar_x = f32::from(origin.x) + git_slot.start + 1.5;
+    let bar_w = (git_slot.end - git_slot.start - 3.0).max(2.0);
+    let origin_y = f32::from(origin.y);
+
+    for marker in &prepaint.git_markers {
+        let top = origin_y + marker.visual_row as f32 * lh - prepaint.scroll_y;
+        match marker.kind {
+            LineChangeKind::Added => {
+                window.paint_quad(fill(
+                    Bounds::new(point(px(bar_x), px(top)), size(px(bar_w), px(lh))),
+                    added,
+                ));
+            }
+            LineChangeKind::Modified => {
+                window.paint_quad(fill(
+                    Bounds::new(point(px(bar_x), px(top)), size(px(bar_w), px(lh))),
+                    modified,
+                ));
+            }
+            LineChangeKind::Deleted => {
+                let edge_y = if marker.at_bottom { top + lh } else { top };
+                let center_y = edge_y.max(origin_y + 3.5);
+                let mut builder = PathBuilder::fill();
+                builder.move_to(point(px(bar_x), px(center_y - 3.5)));
+                builder.line_to(point(px(bar_x + 5.0), px(center_y)));
+                builder.line_to(point(px(bar_x), px(center_y + 3.5)));
+                builder.close();
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, deleted);
+                }
+            }
+        }
     }
 }
 

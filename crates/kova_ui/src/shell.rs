@@ -36,6 +36,7 @@ use kova_syntax::{
 use kova_theme::SyntaxLanguage;
 
 mod debug;
+mod git;
 
 use crate::debugger::{DebugCommandSink, DebuggerModel};
 use crate::dock::bottom_panel::BOTTOM_TAB_BAR_HEIGHT_PX;
@@ -58,6 +59,7 @@ use crate::editor::actions::{Save, WORKSPACE_KEY_CONTEXT};
 use crate::editor::syntax::{EditorSyntax, RunEntryPointRequested};
 use crate::editor::vim::VimKeyResult;
 use crate::editor::{EditorEvent, EditorView, SharedBuffer};
+use crate::git::CommitPanel;
 use crate::http_runner::HttpResponseView;
 use crate::keymap::{
     CHORD_TIMEOUT, DispatchContext, DispatchOutcome, ExCommand, ExCommandLine, ExLineEvent,
@@ -82,6 +84,7 @@ use kova_config::{
     KovaSettings, ProjectConfigDocument, RunConfigKind, RunConfiguration, SettingsDocument,
 };
 use kova_syntax::EntryPointKind;
+use kova_tools::git::GitRepository;
 use kova_tools::http_runner::{
     HttpEnvironments, HttpExecutor, HttpExecutorConfig, HttpFile, HttpRequestSpec,
     discover_project_root, prepare_request_at_line,
@@ -425,6 +428,14 @@ pub struct WorkspaceShell {
     http_panel: Option<Entity<HttpResponseView>>,
     /// Lazily created `.http` request executor (owns its Tokio worker thread).
     http_executor: Option<HttpExecutor>,
+    /// Discovered Git repository for the workspace (`KOVA-043`).
+    git_repo: Option<Arc<GitRepository>>,
+    /// Background Git discovery task when opening a standalone file.
+    git_discover_task: Option<Task<()>>,
+    /// `Cmd+K` Commit panel entity and subscription (`KOVA-043`).
+    commit_panel: Option<(Entity<CommitPanel>, Subscription)>,
+    /// Whether the `Cmd+K` Commit modal overlay is open.
+    commit_panel_open: bool,
 }
 
 impl fmt::Debug for WorkspaceShell {
@@ -548,6 +559,10 @@ impl WorkspaceShell {
             debug_sink: None,
             http_panel: None,
             http_executor: None,
+            git_repo: None,
+            git_discover_task: None,
+            commit_panel: None,
+            commit_panel_open: false,
         }
     }
 
@@ -664,14 +679,16 @@ impl WorkspaceShell {
         let scan = cx.background_executor().spawn(async move {
             let tree = scan_project(&root, &ProjectScanOptions::default())
                 .map(|tree| ProjectTreeModel::from_project_tree(&tree, 1));
-            let branch = std::fs::read_to_string(root.join(".git").join("HEAD"))
-                .ok()
-                .and_then(|head| parse_git_head(&head));
+            let repo = GitRepository::discover(&root).ok().map(Arc::new);
+            let branch = repo
+                .as_ref()
+                .and_then(|r| r.head().ok())
+                .map(|h| Self::format_head_state(&h));
             let run_configs = load_run_configurations(&root);
-            (tree, branch, run_configs)
+            (tree, repo, branch, run_configs)
         });
         self.project_task = Some(cx.spawn(async move |this, cx| {
-            let (tree, branch, run_configs) = scan.await;
+            let (tree, repo, branch, run_configs) = scan.await;
             this.update(cx, |this, cx| {
                 this.project_loading = false;
                 match tree {
@@ -686,9 +703,7 @@ impl WorkspaceShell {
                         .push(format!("Project scan failed: {err}")),
                 }
                 this.apply_run_configurations(run_configs);
-                if let Some(branch) = branch {
-                    this.status_bar.git_branch = branch;
-                }
+                this.set_git_repo(repo, branch, cx);
                 cx.notify();
             })
             .ok();
@@ -1367,6 +1382,7 @@ impl WorkspaceShell {
             .and_then(|pane| pane.editors.get(&tab))
             .cloned()
         {
+            self.attach_editor_git(rel_path, &editor, cx);
             if let Some((line, col)) = position {
                 editor.update(cx, |editor, cx| editor.set_cursor_position(line, col, cx));
             }
@@ -1503,6 +1519,7 @@ impl WorkspaceShell {
             .as_deref()
             .and_then(|root| path.strip_prefix(root).ok())
             .map_or_else(|| path.clone(), Path::to_path_buf);
+        self.discover_git_for_path(&path, cx);
         let shared = if let Some(existing) = self.documents.get(&key) {
             existing.clone()
         } else {
@@ -1573,6 +1590,9 @@ impl WorkspaceShell {
             self.dispatch_save(&key, cx);
         }
         self.sync_dirty_flag(&key);
+        if saved {
+            self.on_git_file_saved(cx);
+        }
         if saved && key.file_name().is_some_and(|n| n == "kova.toml") {
             self.reload_run_configurations(cx);
         }
@@ -1744,6 +1764,9 @@ impl WorkspaceShell {
         // An explicit tool window request leaves Focus Mode deterministically (FR-1.2).
         self.focus_tiling.exit_for_explicit_tool();
         self.dock_layout.toggle_tool(tool, self.active_pane);
+        if tool == DockToolId::Commit {
+            self.refresh_commit_dock(window, cx);
+        }
         match self.dock_layout.focused {
             FocusedRegion::EditorPane(_) => self.focus_active_editor(window, cx),
             region => self.focus_dock(region, window, cx),
@@ -1809,6 +1832,9 @@ impl WorkspaceShell {
         if self.settings_open {
             self.handle_settings_key(keystroke, window, cx);
             cx.stop_propagation();
+            return;
+        }
+        if self.handle_commit_panel_key(keystroke, window, cx) {
             return;
         }
         // *Evaluate Expression* (`Alt+F8`) owns every key while open (`KOVA-041`).
@@ -2014,6 +2040,7 @@ impl WorkspaceShell {
                 cx,
             ),
             ShellAction::OpenSettings => self.open_settings(window, cx),
+            ShellAction::ToggleCommitPanel => self.toggle_commit_panel(window, cx),
             ShellAction::Debug(action) => self.run_debug_action(action, window, cx),
         }
     }
@@ -3064,17 +3091,7 @@ impl WorkspaceShell {
             );
 
         if tool == DockToolId::Commit {
-            return Some(
-                island
-                    .child(Self::dock_header("Commit", String::new(), p))
-                    .child(
-                        div()
-                            .p(px(12.0))
-                            .text_size(px(12.0))
-                            .text_color(p.text_muted)
-                            .child("Git changes (gix) arrive in Phase 3."),
-                    ),
-            );
+            return Some(self.render_commit_dock(island, p, cx));
         }
 
         let detail = if self.project_loading {
@@ -4254,6 +4271,7 @@ impl Render for WorkspaceShell {
             .text_color(p.text_primary)
             .key_context(WORKSPACE_KEY_CONTEXT)
             .on_action(cx.listener(Self::save_action))
+            .on_action(cx.listener(Self::toggle_commit_panel_action))
             .track_focus(&self.focus_handle)
             .capture_key_down(cx.listener(Self::handle_key_capture))
             .on_key_down(cx.listener(Self::handle_key_down))
@@ -4262,6 +4280,10 @@ impl Render for WorkspaceShell {
             .child(self.render_titlebar(p))
             .child(workspace);
         let root = match self.render_evaluate_overlay(p, cx) {
+            Some(overlay) => root.child(overlay),
+            None => root,
+        };
+        let root = match self.render_commit_overlay() {
             Some(overlay) => root.child(overlay),
             None => root,
         };
@@ -4437,6 +4459,7 @@ fn breadcrumb_label(path: &Path) -> String {
 }
 
 /// Extracts the branch name from the contents of `.git/HEAD`.
+#[cfg(test)]
 fn parse_git_head(head: &str) -> Option<String> {
     let head = head.trim();
     if let Some(reference) = head.strip_prefix("ref: ") {

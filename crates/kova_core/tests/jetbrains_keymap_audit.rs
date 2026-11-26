@@ -1214,3 +1214,23 @@ fn jetbrains_init_and_dispatch_stay_well_under_latency_budget() {
         "average dispatch took {avg_dispatch:?}"
     );
 }
+
+#[test]
+fn git_commit_is_bound_to_primary_k_on_both_platforms() {
+    use kova_core::builtin_actions::ids;
+    use kova_core::keymap::presets::jetbrains_keymap_layer_ref;
+
+    let mac = jetbrains_keymap_layer_ref(Platform::MacOs)
+        .chord_for_action(ids::GIT_COMMIT)
+        .expect("git.commit bound on macOS");
+    assert_eq!(mac.to_string(), "cmd+k");
+    let linux = jetbrains_keymap_layer_ref(Platform::Linux)
+        .chord_for_action(ids::GIT_COMMIT)
+        .expect("git.commit bound on Linux");
+    assert_eq!(linux.to_string(), "ctrl+k");
+    assert!(
+        jetbrains_keymap_layer_ref(Platform::MacOs)
+            .chord_for_action("no.such.action")
+            .is_none()
+    );
+}

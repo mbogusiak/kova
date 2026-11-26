@@ -233,6 +233,13 @@ impl ViewportMetrics {
         )
     }
 
+    /// Returns the gutter-local x range reserved for the Git diff marker bar (`6 px`).
+    #[must_use]
+    pub fn git_bar_slot_range(gutter_width_px: f32) -> Range<f32> {
+        let (_, fold) = Self::gutter_slot_ranges(gutter_width_px);
+        fold.end..fold.end + GUTTER_GIT_BAR_SLOT_PX
+    }
+
     /// Classifies a gutter-local x coordinate into the interactive slot under it.
     #[must_use]
     pub fn gutter_slot_at(local_x: f32, gutter_width_px: f32) -> GutterSlot {
@@ -353,8 +360,11 @@ mod tests {
     fn gutter_slots_follow_the_reserved_anatomy() {
         let width = ViewportMetrics::gutter_width_px(100, 7.2);
         let (run, fold) = ViewportMetrics::gutter_slot_ranges(width);
+        let git = ViewportMetrics::git_bar_slot_range(width);
         assert!((run.end - run.start - GUTTER_RUN_SLOT_PX).abs() < f32::EPSILON);
         assert!((fold.end - fold.start - GUTTER_FOLD_SLOT_PX).abs() < f32::EPSILON);
+        assert!((git.start - fold.end).abs() < f32::EPSILON);
+        assert!((git.end - git.start - GUTTER_GIT_BAR_SLOT_PX).abs() < f32::EPSILON);
         assert!((run.start - (GUTTER_LEFT_PAD_PX + 28.0 + GUTTER_DIGITS_GAP_PX)).abs() < 0.01);
         assert_eq!(
             ViewportMetrics::gutter_slot_at(run.start + 1.0, width),
