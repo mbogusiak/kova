@@ -5,6 +5,8 @@
 //! project root. Ephemeral workspace state is persisted exclusively under
 //! `~/.cache/kova/workspaces/<hash>/`.
 
+pub mod active;
+pub mod recent;
 pub mod scanner;
 pub mod session;
 
@@ -14,6 +16,8 @@ use std::path::{Path, PathBuf};
 use kova_config::{KovaPaths, PathsError};
 use serde::{Deserialize, Serialize};
 
+pub use active::{ActiveProject, ProjectGeneration, ProjectPhase};
+pub use recent::{MAX_RECENT_PROJECTS_IN_MENU, RecentProject, RecentProjectsStore};
 pub use scanner::{
     DEFAULT_MAX_ENTRIES, ProjectFileEntry, ProjectNode, ProjectNodeId, ProjectNodeKind,
     ProjectScanOptions, ProjectTree, scan_project,
@@ -293,7 +297,9 @@ pub(crate) fn ensure_canonical_dir(root: &Path) -> Result<PathBuf, ProjectError>
     Ok(canonical)
 }
 
-pub(crate) fn project_display_name(root: &Path) -> String {
+/// Display name of a project root: its final path component (`kova-project` for `/`).
+#[must_use]
+pub fn project_display_name(root: &Path) -> String {
     root.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())

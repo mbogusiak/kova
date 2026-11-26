@@ -3,6 +3,7 @@
 //! GPU presentation layer (GPUI) — one of the only two crates allowed to depend
 //! on windowing (`kova_ui` and `kova_app`).
 
+pub mod app_menu;
 pub mod controls;
 pub mod debugger;
 pub mod dock;
@@ -36,7 +37,7 @@ pub use git::{
     CheckState, CommitPanel, CommitPanelEvent, CommitPanelModel, EditorGitState, StageOp,
 };
 pub use plugin_ui::{PluginToolWindow, PluginUiEventSink};
-pub use shell::{StartupMetrics, WorkspaceShell};
+pub use shell::{StartupMetrics, SwitchProjectError, WorkspaceShell};
 pub use terminal::{TerminalDock, TerminalLaunch, TerminalView};
 pub use test_runner::{TestRunRequest, TestRunSink, TestRunnerAction, TestRunnerModel};
 pub use theme::{KovaTheme, ThemeState, apply_live_theme, hsla_from_rgba, rgba_to_gpui};

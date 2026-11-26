@@ -11,6 +11,7 @@
 pub mod cli;
 pub mod debug_sessions;
 pub mod io;
+pub mod menus;
 pub mod test_runs;
 pub mod theme_watch;
 
@@ -162,6 +163,8 @@ pub enum AppEvent {
         /// Problems (empty clears the file).
         problems: Vec<kova_ui::ProblemEntry>,
     },
+    /// The `Recent Projects` list changed or finished loading (`KOVA-049`).
+    RecentProjects(Result<Vec<kova_core::RecentProject>, String>),
     /// An update of JVM debug session `session_id` (`KOVA-041`).
     Debug {
         /// Session identifier from the shell's start request.
@@ -247,6 +250,12 @@ pub fn spawn_background_work(
     request: LaunchRequest,
     events: &mpsc::UnboundedSender<AppEvent>,
 ) {
+    let recent = request.project_root.clone().map_or(
+        menus::RecentProjectsUpdate::Load,
+        menus::RecentProjectsUpdate::Record,
+    );
+    menus::spawn_recent_update(runtime, events, recent);
+
     if let Some(target) = request.target {
         let events = events.clone();
         runtime.spawn(async move {
@@ -335,6 +344,12 @@ pub fn handle_app_event(
         AppEvent::Debug { session_id, update } => {
             shell.apply_debug_update(session_id, update, window, cx);
         }
+        AppEvent::RecentProjects(Ok(recent)) => menus::refresh_menus(&recent, cx),
+        AppEvent::RecentProjects(Err(message)) => shell.set_notice(
+            StatusKind::Warning,
+            format!("Recent Projects unavailable: {message}"),
+            cx,
+        ),
     }
 }
 
@@ -445,6 +460,7 @@ pub fn run_cli(
 
         match open_result {
             Ok(window) => {
+                menus::install(window, &runtime_handle, &events_tx, cx);
                 cx.spawn(async move |cx| {
                     pump_app_events(
                         window,

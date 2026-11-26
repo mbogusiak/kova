@@ -91,7 +91,7 @@ impl WorkspaceShell {
         if let Some(path) = self.doc_states.get(key).and_then(|d| d.path.as_ref()) {
             return Some(path.clone());
         }
-        self.project_root.as_ref().map(|root| root.join(key))
+        self.project.root().map(|root| root.join(key))
     }
 
     /// Attaches Git gutter diff & inline blame to `editor` if `key` resides in `self.git_repo`.

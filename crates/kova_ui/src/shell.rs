@@ -29,7 +29,7 @@ use kova_buffer::{Buffer, BufferSnapshot};
 use kova_core::perf::{
     BudgetKind, budgets, check_duration_budget, check_rss_budget, current_process_rss_bytes,
 };
-use kova_core::project::{ProjectScanOptions, scan_project};
+use kova_core::project::{ActiveProject, ProjectScanOptions, scan_project};
 use kova_syntax::{
     Highlighter, LanguageRegistry, SyntaxEngine, SyntaxEngineConfig, detect_language,
 };
@@ -37,7 +37,11 @@ use kova_theme::SyntaxLanguage;
 
 mod debug;
 mod git;
+mod project;
 
+pub use project::SwitchProjectError;
+
+use crate::app_menu::OpenProject;
 use crate::debugger::{DebugCommandSink, DebuggerModel};
 use crate::dock::bottom_panel::BOTTOM_TAB_BAR_HEIGHT_PX;
 use crate::dock::focus::{
@@ -353,9 +357,8 @@ pub struct WorkspaceShell {
     first_frame_scheduled: bool,
     exit_after_first_frame: bool,
     on_first_frame: Option<FirstFrameCallback>,
-    project_root: Option<PathBuf>,
-    project_name: String,
-    project_loading: bool,
+    /// Active project: root, titlebar name and generation-tagged loading phase (`KOVA-049`).
+    project: ActiveProject,
     dock_layout: DockLayoutState,
     project_tree: ProjectTreeModel,
     project_scroll: UniformListScrollHandle,
@@ -445,7 +448,7 @@ impl fmt::Debug for WorkspaceShell {
             .field("first_frame_scheduled", &self.first_frame_scheduled)
             .field("exit_after_first_frame", &self.exit_after_first_frame)
             .field("has_on_first_frame", &self.on_first_frame.is_some())
-            .field("project_root", &self.project_root)
+            .field("project", &self.project)
             .field("dock_layout", &self.dock_layout)
             .field("split_tree", &self.split_tree)
             .field("active_pane", &self.active_pane)
@@ -507,9 +510,7 @@ impl WorkspaceShell {
             first_frame_scheduled: false,
             exit_after_first_frame,
             on_first_frame,
-            project_root: None,
-            project_name: "kova-orders".to_owned(),
-            project_loading: false,
+            project: ActiveProject::unloaded("kova-orders"),
             dock_layout: DockLayoutState::default(),
             project_tree,
             project_scroll: UniformListScrollHandle::new(),
@@ -569,12 +570,14 @@ impl WorkspaceShell {
     /// Sets the project directory whose tree is loaded asynchronously after the first frame.
     #[must_use]
     pub fn with_project_root(mut self, root: impl Into<PathBuf>) -> Self {
-        let root = root.into();
-        if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
-            name.clone_into(&mut self.project_name);
-        }
-        self.project_root = Some(root);
+        self.project.set_root(root);
         self
+    }
+
+    /// The project shown in this window.
+    #[must_use]
+    pub const fn project(&self) -> &ActiveProject {
+        &self.project
     }
 
     /// Returns the [`EditorView`] of the active tab in the active split pane, if any.
@@ -672,10 +675,10 @@ impl WorkspaceShell {
     // ---------------------------------------------------------------------------------------
 
     fn load_project(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(root) = self.project_root.clone() else {
+        let (Some(root), Some(generation)) = (self.project.root_owned(), self.project.begin_load())
+        else {
             return;
         };
-        self.project_loading = true;
         let scan = cx.background_executor().spawn(async move {
             let tree = scan_project(&root, &ProjectScanOptions::default())
                 .map(|tree| ProjectTreeModel::from_project_tree(&tree, 1));
@@ -690,7 +693,11 @@ impl WorkspaceShell {
         self.project_task = Some(cx.spawn(async move |this, cx| {
             let (tree, repo, branch, run_configs) = scan.await;
             this.update(cx, |this, cx| {
-                this.project_loading = false;
+                let outcome = tree.as_ref().map(|_| ()).map_err(ToString::to_string);
+                if !this.project.finish_load(generation, outcome) {
+                    // The user switched project while this scan ran: drop the stale result.
+                    return;
+                }
                 match tree {
                     Ok(tree) => {
                         this.test_runner
@@ -871,14 +878,14 @@ impl WorkspaceShell {
             EntryPointKind::JvmTestMethod | EntryPointKind::JvmTestClass
         ) {
             let label = test_label(&request.symbol_name);
-            let file = match (&self.project_root, &request.file_path) {
+            let file = match (self.project.root(), &request.file_path) {
                 (Some(root), Some(rel)) => Some(root.join(rel)),
                 _ => None,
             };
             let test_request = self.test_runner.new_request(
                 label,
                 vec![request.symbol_name.clone()],
-                self.project_root.clone(),
+                self.project.root_owned(),
                 file,
             );
             self.start_test_run(test_request);
@@ -909,8 +916,8 @@ impl WorkspaceShell {
             .get_or_insert_with(|| cx.new(HttpResponseView::new))
             .clone();
 
-        let environments =
-            http_env_root(self.project_root.as_deref(), request.file_path.as_deref()).map_or_else(
+        let environments = http_env_root(self.project.root(), request.file_path.as_deref())
+            .map_or_else(
                 || Ok(HttpEnvironments::default()),
                 |root| HttpEnvironments::load_from_dir(&root),
             );
@@ -1027,7 +1034,7 @@ impl WorkspaceShell {
 
     /// Re-reads `kova.toml` off the UI thread.
     fn reload_run_configurations(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(root) = self.project_root.clone() else {
+        let Some(root) = self.project.root_owned() else {
             return;
         };
         let load = cx
@@ -1047,7 +1054,7 @@ impl WorkspaceShell {
     /// Writes `config` into `kova.toml` (created on this explicit action only), off the UI
     /// thread, then reloads the list.
     fn save_run_configuration(&mut self, config: RunConfiguration, cx: &mut Context<'_, Self>) {
-        let Some(root) = self.project_root.clone() else {
+        let Some(root) = self.project.root_owned() else {
             self.run_configs_error =
                 Some("Open a project directory to save run configurations".to_owned());
             cx.notify();
@@ -1090,7 +1097,7 @@ impl WorkspaceShell {
             let mut request = self.test_runner.new_request(
                 config.name.clone(),
                 targets,
-                self.project_root.clone(),
+                self.project.root_owned(),
                 None,
             );
             request.vm_options.clone_from(&config.vm_options);
@@ -1206,7 +1213,7 @@ impl WorkspaceShell {
             return dock.clone();
         }
         let launch =
-            TerminalLaunch::from_settings(self.project_root.clone(), &self.applied_settings);
+            TerminalLaunch::from_settings(self.project.root_owned(), &self.applied_settings);
         let dock = cx.new(|cx| TerminalDock::new(launch, cx));
         let subscription =
             cx.subscribe_in(
@@ -1285,7 +1292,7 @@ impl WorkspaceShell {
             return;
         }
         let rel = rel_path.to_path_buf();
-        let Some(root) = self.project_root.clone() else {
+        let Some(root) = self.project.root_owned() else {
             // Demo project: synthesize a small in-memory document for the selected node.
             let text = format!(
                 "// {}\n// Demo project — run `kova <project-dir>` to open a real workspace.\n",
@@ -1514,11 +1521,7 @@ impl WorkspaceShell {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let key = self
-            .project_root
-            .as_deref()
-            .and_then(|root| path.strip_prefix(root).ok())
-            .map_or_else(|| path.clone(), Path::to_path_buf);
+        let key = project::document_key(self.project.root(), &path);
         self.discover_git_for_path(&path, cx);
         let shared = if let Some(existing) = self.documents.get(&key) {
             existing.clone()
@@ -2301,7 +2304,7 @@ impl WorkspaceShell {
             || next.editor.font_family != previous.editor.font_family)
             && let Some((dock, _)) = &self.terminal
         {
-            let launch = TerminalLaunch::from_settings(self.project_root.clone(), next);
+            let launch = TerminalLaunch::from_settings(self.project.root_owned(), next);
             dock.update(cx, |dock, cx| dock.set_launch(launch, cx));
         }
         cx.notify();
@@ -2908,8 +2911,16 @@ impl WorkspaceShell {
                     .items_center()
                     .gap(px(8.0))
                     .child(
-                        pill(self.project_name.clone(), p.island, p.text_primary)
-                            .font_weight(FontWeight::SEMIBOLD),
+                        // Clickable project breadcrumb: `File → Open Project…` (`KOVA-049`).
+                        pill(self.project.name().to_owned(), p.island, p.text_primary)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(div().text_color(p.text_muted).child("▾"))
+                            .id("titlebar-open-project")
+                            .cursor_pointer()
+                            .hover(|style| style.border_color(p.text_muted))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenProject), cx);
+                            }),
                     )
                     .child(pill(branch, p.island, p.text_secondary)),
             )
@@ -3094,7 +3105,7 @@ impl WorkspaceShell {
             return Some(self.render_commit_dock(island, p, cx));
         }
 
-        let detail = if self.project_loading {
+        let detail = if self.project.is_loading() {
             "Loading…".to_owned()
         } else {
             format!("{} items", self.project_tree.visible_len())
@@ -3466,7 +3477,7 @@ impl WorkspaceShell {
             .child(test_runner_panel::render_toolbar(
                 &self.test_runner,
                 colors,
-                self.project_root.is_some(),
+                self.project.root().is_some(),
                 &handler,
             ))
             .child(
@@ -3586,7 +3597,7 @@ impl WorkspaceShell {
 
     /// Opens `kova.toml` in the editor, creating a minimal one first (explicit user action).
     fn edit_kova_toml(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some(root) = self.project_root.clone() else {
+        let Some(root) = self.project.root_owned() else {
             self.run_configs_error = Some("Open a project directory to edit kova.toml".to_owned());
             cx.notify();
             return;
@@ -4272,6 +4283,13 @@ impl Render for WorkspaceShell {
             .key_context(WORKSPACE_KEY_CONTEXT)
             .on_action(cx.listener(Self::save_action))
             .on_action(cx.listener(Self::toggle_commit_panel_action))
+            .on_action(cx.listener(Self::close_tab_action))
+            .on_action(cx.listener(Self::open_settings_action))
+            .on_action(cx.listener(Self::search_everywhere_action))
+            .on_action(cx.listener(Self::toggle_project_tree_action))
+            .on_action(cx.listener(Self::toggle_terminal_action))
+            .on_action(cx.listener(Self::toggle_git_action))
+            .on_action(cx.listener(Self::toggle_focus_mode_action))
             .track_focus(&self.focus_handle)
             .capture_key_down(cx.listener(Self::handle_key_capture))
             .on_key_down(cx.listener(Self::handle_key_down))

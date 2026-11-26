@@ -37,7 +37,7 @@ impl WorkspaceShell {
 
     /// Absolute path of a document key (project-relative when a project is open).
     fn debug_abs_path(&self, key: &Path) -> PathBuf {
-        match &self.project_root {
+        match self.project.root() {
             Some(root) if key.is_relative() => root.join(key),
             _ => key.to_path_buf(),
         }
@@ -45,8 +45,8 @@ impl WorkspaceShell {
 
     /// Document key of an absolute source path reported by the adapter.
     fn debug_doc_key(&self, path: &Path) -> PathBuf {
-        self.project_root
-            .as_ref()
+        self.project
+            .root()
             .and_then(|root| path.strip_prefix(root).ok())
             .map_or_else(|| path.to_path_buf(), Path::to_path_buf)
     }
@@ -184,7 +184,7 @@ impl WorkspaceShell {
         let label = target.rsplit('.').next().unwrap_or(&target).to_owned();
         let command = self
             .debugger
-            .start(label, target, None, self.project_root.clone());
+            .start(label, target, None, self.project.root_owned());
         self.dock_layout.bottom_open = Some(DockToolId::Debug);
         self.send_debug([command]);
         self.refresh_debug_gutters(cx);
