@@ -52,7 +52,7 @@ impl WorkspaceShell {
     }
 
     /// Sends commands to the host; without a host, a start fails visibly.
-    fn send_debug(&mut self, commands: impl IntoIterator<Item = DebugCommand>) {
+    pub(super) fn send_debug(&mut self, commands: impl IntoIterator<Item = DebugCommand>) {
         let session_id = self.debugger.session_id();
         for command in commands {
             if let Some(sink) = &self.debug_sink {
@@ -138,11 +138,7 @@ impl WorkspaceShell {
             }
             DebugShellAction::EvaluateExpression => self.open_evaluate(cx),
             DebugShellAction::DebugContext => self.start_debug_session(window, cx),
-            DebugShellAction::Stop => {
-                if self.debugger.status().is_active() {
-                    self.send_debug([DebugCommand::Stop]);
-                }
-            }
+            DebugShellAction::Stop => self.stop_active_run_action(cx),
         }
         cx.notify();
     }

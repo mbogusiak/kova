@@ -47,6 +47,16 @@ gpui::actions!(
         ToggleGit,
         /// Enters or leaves Focus Mode.
         ToggleFocusMode,
+        /// Compiles the active project (`Cmd+F9` / `Ctrl+F9`).
+        BuildProject,
+        /// Runs the selected or most recent configuration.
+        RunLast,
+        /// Runs the entry point or test at the caret context.
+        RunContext,
+        /// Runs all tests in the active project.
+        RunAllTests,
+        /// Stops the active build, test run, or debug session.
+        StopRun,
         /// Placeholder item of an empty `Recent Projects` submenu (never handled → disabled).
         NoRecentProjects,
     ]
@@ -104,6 +114,20 @@ pub fn app_menus(recent: &[RecentProject]) -> Vec<Menu> {
                 MenuItem::action("Toggle Git", ToggleGit),
                 MenuItem::separator(),
                 MenuItem::action("Focus Mode", ToggleFocusMode),
+            ],
+        },
+        Menu {
+            name: "Build".into(),
+            items: vec![MenuItem::action("Build Project", BuildProject)],
+        },
+        Menu {
+            name: "Run".into(),
+            items: vec![
+                MenuItem::action("Run", RunLast),
+                MenuItem::action("Run Context", RunContext),
+                MenuItem::action("Run All Tests", RunAllTests),
+                MenuItem::separator(),
+                MenuItem::action("Stop", StopRun),
             ],
         },
     ]
@@ -222,6 +246,11 @@ pub fn menu_key_bindings(platform: Platform) -> Vec<KeyBinding> {
             ToggleFocusMode,
             workspace,
         ),
+        KeyBinding::new(
+            &key(ids::BUILD_BUILD_PROJECT, &format!("{primary}-f9")),
+            BuildProject,
+            workspace,
+        ),
     ]);
     bindings
 }
@@ -269,10 +298,13 @@ mod tests {
     }
 
     #[test]
-    fn menu_bar_has_kova_file_edit_view() {
+    fn menu_bar_has_kova_file_edit_view_build_run() {
         let menus = app_menus(&[]);
         let names: Vec<_> = menus.iter().map(|m| m.name.to_string()).collect();
-        assert_eq!(names, [APP_MENU_NAME, "File", "Edit", "View"]);
+        assert_eq!(
+            names,
+            [APP_MENU_NAME, "File", "Edit", "View", "Build", "Run"]
+        );
         assert_eq!(labels(&menus[0].items), ["Settings…", "-", "Quit Kova"]);
         assert_eq!(
             labels(&menus[1].items),
@@ -300,6 +332,11 @@ mod tests {
                 "-",
                 "Focus Mode"
             ]
+        );
+        assert_eq!(labels(&menus[4].items), ["Build Project"]);
+        assert_eq!(
+            labels(&menus[5].items),
+            ["Run", "Run Context", "Run All Tests", "-", "Stop"]
         );
     }
 
@@ -384,9 +421,11 @@ mod tests {
 
         assert_eq!(find(&mac, "kova_menu::ToggleGit"), "cmd-9");
         assert_eq!(find(&mac, "kova_menu::ToggleFocusMode"), "ctrl-alt-z");
+        assert_eq!(find(&mac, "kova_menu::BuildProject"), "cmd-f9");
 
         let linux = keys(Platform::Linux);
         assert_eq!(find(&linux, "kova_menu::CloseTab"), "ctrl-f4");
+        assert_eq!(find(&linux, "kova_menu::BuildProject"), "ctrl-f9");
         assert!(linux.iter().all(|(action, _)| {
             !matches!(
                 action.as_str(),

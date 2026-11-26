@@ -168,8 +168,10 @@ const EXPECTED_REQUIRED_IDS: &[&str] = &[
     ids::REFACTOR_EXTRACT_FIELD,
     ids::REFACTOR_INLINE,
     ids::REFACTOR_CHANGE_SIGNATURE,
+    ids::BUILD_BUILD_PROJECT,
     ids::RUN_RUN_CONTEXT,
     ids::RUN_RUN_LAST,
+    ids::RUN_RUN_ALL_TESTS,
     ids::RUN_DEBUG_CONTEXT,
     ids::RUN_DEBUG_LAST,
     ids::RUN_STOP,
@@ -568,6 +570,7 @@ const MAC_FR2_CASES: &[(&str, FocusContext, &str)] = &[
         FocusContext::EditorText,
         ids::REFACTOR_CHANGE_SIGNATURE,
     ),
+    ("cmd+f9", FocusContext::Workspace, ids::BUILD_BUILD_PROJECT),
     (
         "ctrl+shift+r",
         FocusContext::Workspace,
@@ -864,6 +867,7 @@ const LINUX_FR2_CASES: &[(&str, FocusContext, &str)] = &[
         FocusContext::EditorText,
         ids::REFACTOR_CHANGE_SIGNATURE,
     ),
+    ("ctrl+f9", FocusContext::Workspace, ids::BUILD_BUILD_PROJECT),
     (
         "ctrl+shift+f10",
         FocusContext::Workspace,

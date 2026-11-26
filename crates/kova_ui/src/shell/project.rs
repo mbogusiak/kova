@@ -20,8 +20,8 @@ use super::open_project_modal::{
 };
 use super::{PaneState, WorkspaceShell};
 use crate::app_menu::{
-    CloseTab, OpenSettings, SearchEverywhere, ToggleFocusMode, ToggleGit, ToggleProjectTree,
-    ToggleTerminal,
+    BuildProject, CloseTab, OpenSettings, RunAllTests, RunContext, RunLast, SearchEverywhere,
+    StopRun, ToggleFocusMode, ToggleGit, ToggleProjectTree, ToggleTerminal,
 };
 use crate::dock::{
     BottomPanelModel, DockToolId, FocusModeVariant, FocusedRegion, ProjectTreeModel, SplitTree,
@@ -617,6 +617,10 @@ impl WorkspaceShell {
         self.find_in_files_task = None;
         self.recent_files.clear();
         self.last_run = None;
+        self.active_build_run_id = None;
+        if let Some(cancel) = &self.cancel_run_sink {
+            cancel(super::CancelRunKind::All);
+        }
         self.git_discover_task = None;
         self.status_bar.git_branch.clear();
         self.set_git_repo(None, None, cx);
@@ -979,6 +983,55 @@ impl WorkspaceShell {
     ) {
         self.run_menu_action(
             ShellAction::ToggleFocusMode(FocusModeVariant::Zen),
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn build_project_menu_action(
+        &mut self,
+        _: &BuildProject,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.run_menu_action(ShellAction::BuildProject, window, cx);
+    }
+
+    pub(super) fn run_last_menu_action(
+        &mut self,
+        _: &RunLast,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.run_menu_action(ShellAction::RunLast, window, cx);
+    }
+
+    pub(super) fn run_context_menu_action(
+        &mut self,
+        _: &RunContext,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.run_menu_action(ShellAction::RunContext, window, cx);
+    }
+
+    pub(super) fn run_all_tests_menu_action(
+        &mut self,
+        _: &RunAllTests,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.run_menu_action(ShellAction::RunAllTests, window, cx);
+    }
+
+    pub(super) fn stop_run_menu_action(
+        &mut self,
+        _: &StopRun,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.run_menu_action(
+            ShellAction::Debug(crate::keymap::DebugShellAction::Stop),
             window,
             cx,
         );

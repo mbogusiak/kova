@@ -481,6 +481,7 @@ fn f2_problems_and_actions_palette_include_all_new_shell_actions() {
         ids::EDITOR_FIND_NEXT,
         ids::EDITOR_FIND_PREV,
         ids::EDITOR_FIND_IN_FILES,
+        ids::BUILD_BUILD_PROJECT,
         ids::RUN_RUN_CONTEXT,
         ids::RUN_RUN_LAST,
     ] {
@@ -493,4 +494,10 @@ fn f2_problems_and_actions_palette_include_all_new_shell_actions() {
             "missing macOS preset shortcut for {expected_id}"
         );
     }
+
+    assert!(action_ids.contains(&ids::RUN_RUN_ALL_TESTS));
+    assert_eq!(
+        dispatch(&mut mac, "cmd-f9", FocusContext::Workspace, false),
+        DispatchOutcome::Action(ShellAction::BuildProject)
+    );
 }

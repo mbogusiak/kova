@@ -20,13 +20,15 @@ use crate::paths::KovaPaths;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectBuildTool {
-    /// Detect Gradle or Maven automatically.
+    /// Detect Gradle, Maven, or Cargo automatically.
     #[default]
     Auto,
     /// Force Gradle / BSP integration.
     Gradle,
     /// Force Maven / BSP integration.
     Maven,
+    /// Force Cargo (`cargo build` / `cargo test`) integration.
+    Cargo,
 }
 
 /// Kind of shared team run configuration in `[[run_configurations]]`.
@@ -128,7 +130,7 @@ pub struct ProjectConfig {
     pub schema_version: u32,
     /// Project JDK requirement or identifier (for example `"21"` or `"temurin-21"`).
     pub jdk: Option<String>,
-    /// Build tool selection (`auto`, `gradle`, `maven`).
+    /// Build tool selection (`auto`, `gradle`, `maven`, `cargo`).
     pub build_tool: Option<ProjectBuildTool>,
     /// Project-scoped editor overrides.
     pub editor: ProjectEditorOverrides,

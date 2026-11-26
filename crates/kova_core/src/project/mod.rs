@@ -38,6 +38,7 @@ const GRADLE_MARKERS: [&str; 5] = [
 ];
 
 const MAVEN_MARKER: &str = "pom.xml";
+const CARGO_MARKER: &str = "Cargo.toml";
 
 /// Errors returned while inspecting a project, scanning its tree, or persisting session state.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -99,7 +100,7 @@ pub enum ProjectError {
     },
 }
 
-/// Detected JVM build system at the root of a project workspace.
+/// Detected build system at the root of a project workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildSystemKind {
@@ -107,9 +108,11 @@ pub enum BuildSystemKind {
     Gradle,
     /// Maven build detected (`pom.xml`).
     Maven,
+    /// Cargo build detected (`Cargo.toml`).
+    Cargo,
     /// Both Gradle and Maven build markers exist at the project root.
     Mixed,
-    /// Neither Gradle nor Maven markers were detected at the project root.
+    /// Neither Gradle, Maven, nor Cargo markers were detected at the project root.
     Unknown,
 }
 
@@ -121,12 +124,14 @@ impl BuildSystemKind {
             .iter()
             .any(|marker| root.join(marker).is_file());
         let has_maven = root.join(MAVEN_MARKER).is_file();
+        let has_cargo = root.join(CARGO_MARKER).is_file();
 
-        match (has_gradle, has_maven) {
-            (true, true) => Self::Mixed,
-            (true, false) => Self::Gradle,
-            (false, true) => Self::Maven,
-            (false, false) => Self::Unknown,
+        match (has_gradle, has_maven, has_cargo) {
+            (true, true, _) => Self::Mixed,
+            (true, false, _) => Self::Gradle,
+            (false, true, _) => Self::Maven,
+            (false, false, true) => Self::Cargo,
+            (false, false, false) => Self::Unknown,
         }
     }
 }
@@ -358,6 +363,12 @@ mod tests {
         std::fs::write(mixed_dir.join("gradlew"), "").expect("gradlew");
         std::fs::write(mixed_dir.join("pom.xml"), "<project/>").expect("pom.xml");
         assert_eq!(BuildSystemKind::detect(&mixed_dir), BuildSystemKind::Mixed);
+
+        let cargo_dir = temp.path().join("cargo-app");
+        std::fs::create_dir_all(&cargo_dir).expect("cargo dir");
+        std::fs::write(cargo_dir.join("Cargo.toml"), "[package]\nname = \"app\"\n")
+            .expect("Cargo.toml");
+        assert_eq!(BuildSystemKind::detect(&cargo_dir), BuildSystemKind::Cargo);
     }
 
     #[test]

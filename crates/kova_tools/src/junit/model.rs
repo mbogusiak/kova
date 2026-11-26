@@ -7,7 +7,9 @@
 
 use std::collections::HashMap;
 
-use crate::junit::stacktrace_parser::{StackFrame, TraceLine, parse_stacktrace, stack_frames};
+use crate::junit::stacktrace_parser::{
+    StackFrame, TraceLine, parse_stack_frame, parse_stacktrace, stack_frames,
+};
 
 /// Execution status of a test node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -382,6 +384,7 @@ pub struct TestRun {
     rows_dirty: bool,
     selected: Option<NodeId>,
     console: String,
+    console_lines: Vec<(OutputStream, String)>,
 }
 
 impl TestRun {
@@ -401,6 +404,7 @@ impl TestRun {
             rows_dirty: false,
             selected: None,
             console: String::new(),
+            console_lines: Vec::new(),
         }
     }
 
@@ -446,6 +450,22 @@ impl TestRun {
         &self.console
     }
 
+    /// Run-level console lines preserving `Stdout`/`Stderr` streams and parsed stack frames.
+    #[must_use]
+    pub fn console_output_lines(&self) -> Vec<OutputLine> {
+        self.console_lines
+            .iter()
+            .map(|(stream, text)| OutputLine {
+                text: text.clone(),
+                kind: match stream {
+                    OutputStream::Stdout => OutputKind::Stdout,
+                    OutputStream::Stderr => OutputKind::Stderr,
+                },
+                frame: parse_stack_frame(text),
+            })
+            .collect()
+    }
+
     /// Node by id.
     #[must_use]
     pub fn node(&self, id: NodeId) -> Option<&TestNode> {
@@ -488,21 +508,29 @@ impl TestRun {
                 let node = self.ensure(&id);
                 self.finish(node, outcome);
             }
-            TestEvent::Output { id, stream, text } => match id {
-                Some(id) => {
+            TestEvent::Output { id, stream, text } => {
+                if let Some(id) = id {
                     let node = self.ensure(&id);
                     let target = match stream {
                         OutputStream::Stdout => &mut self.nodes[node.0].stdout,
                         OutputStream::Stderr => &mut self.nodes[node.0].stderr,
                     };
                     push_text(target, &text);
+                } else {
+                    push_text(&mut self.console, &text);
+                    push_console_lines(&mut self.console_lines, stream, &text);
                 }
-                None => push_text(&mut self.console, &text),
-            },
+            }
             TestEvent::RunFinished { success, message } => {
                 self.finish_dangling(success);
                 if let Some(msg) = &message {
                     push_text(&mut self.console, msg);
+                    let stream = if success {
+                        OutputStream::Stdout
+                    } else {
+                        OutputStream::Stderr
+                    };
+                    push_console_lines(&mut self.console_lines, stream, msg);
                 }
                 self.state = RunState::Finished { success, message };
             }
@@ -887,6 +915,15 @@ fn push_text(target: &mut String, text: &str) {
     target.push_str(text);
 }
 
+fn push_console_lines(target: &mut Vec<(OutputStream, String)>, stream: OutputStream, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    for line in text.split('\n') {
+        target.push((stream, line.trim_end_matches('\r').to_owned()));
+    }
+}
+
 fn append_node_output(node: &TestNode, lines: &mut Vec<OutputLine>) {
     let mut trace_has_message = false;
     if let Some(trace) = &node.stacktrace {
@@ -1107,6 +1144,28 @@ mod tests {
         let node = run.find(&TestId::method(CLASS, "a")).unwrap();
         assert_eq!(run.node(node).unwrap().stdout, "hello");
         assert_eq!(run.console(), "> Task :test");
+    }
+
+    #[test]
+    fn console_output_lines_preserve_stderr_stream() {
+        let mut run = TestRun::new("t", Vec::new());
+        run.apply_batch([
+            TestEvent::Output {
+                id: None,
+                stream: OutputStream::Stdout,
+                text: "> Task :compileJava".to_owned(),
+            },
+            TestEvent::Output {
+                id: None,
+                stream: OutputStream::Stderr,
+                text: "error: cannot find symbol".to_owned(),
+            },
+        ]);
+        let lines = run.console_output_lines();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].kind, OutputKind::Stdout);
+        assert_eq!(lines[1].kind, OutputKind::Stderr);
+        assert_eq!(lines[1].text, "error: cannot find symbol");
     }
 
     #[test]

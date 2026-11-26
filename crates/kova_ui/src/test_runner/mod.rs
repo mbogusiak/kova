@@ -14,9 +14,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kova_tools::junit::{
-    OutputKind, OutputLine, StackFrame, TestEvent, TestFilter, TestRun, TestStatus,
-};
+use kova_tools::junit::{OutputLine, StackFrame, TestEvent, TestFilter, TestRun, TestStatus};
 
 pub use test_runner_panel::{TEST_ROW_HEIGHT_PX, TestRunnerColors};
 
@@ -37,6 +35,8 @@ pub struct TestRunRequest {
     pub vm_options: Vec<String>,
     /// Extra environment variables (from a `kova.toml` run configuration).
     pub env: BTreeMap<String, String>,
+    /// Dirty path-backed project files flushed atomically before spawning the runner (`KOVA-058`).
+    pub pending_saves: Vec<(PathBuf, String)>,
 }
 
 /// Host callback executing a [`TestRunRequest`] off the UI thread.
@@ -131,6 +131,7 @@ impl TestRunnerModel {
             file,
             vm_options: Vec::new(),
             env: BTreeMap::new(),
+            pending_saves: Vec::new(),
         }
     }
 
@@ -156,6 +157,9 @@ impl TestRunnerModel {
         let Some(run) = self.run.as_mut() else {
             return false;
         };
+        if !run.is_running() {
+            return false;
+        }
         let finished = events
             .iter()
             .any(|e| matches!(e, TestEvent::RunFinished { .. }));
@@ -271,15 +275,7 @@ impl TestRunnerModel {
             .map(|n| run.output_lines(n))
             .unwrap_or_default();
         if lines.is_empty() {
-            lines = run
-                .console()
-                .lines()
-                .map(|text| OutputLine {
-                    text: text.to_owned(),
-                    kind: OutputKind::Stdout,
-                    frame: None,
-                })
-                .collect();
+            lines = run.console_output_lines();
         }
         self.output_targets = lines
             .iter()
@@ -412,5 +408,34 @@ mod tests {
         );
         assert!(model.output()[index].frame.is_some());
         assert_eq!(model.target_at(index + 1), None);
+    }
+
+    #[test]
+    fn late_events_after_run_finished_are_ignored() {
+        let mut model = TestRunnerModel::default();
+        let request = model.new_request("t", vec![CLASS.to_owned()], None, None);
+        model.start(request.clone());
+        assert!(model.apply(
+            request.run_id,
+            vec![TestEvent::RunFinished {
+                success: false,
+                message: Some("Test run stopped by user.".to_owned()),
+            }]
+        ));
+        assert!(!model.apply(
+            request.run_id,
+            vec![
+                TestEvent::TestFinished {
+                    id: TestId::method(CLASS, "ok"),
+                    outcome: TestOutcome::passed(1),
+                },
+                TestEvent::RunFinished {
+                    success: true,
+                    message: None,
+                },
+            ]
+        ));
+        assert!(!model.run().unwrap().is_running());
+        assert_eq!(model.run().unwrap().counts().total, 0);
     }
 }

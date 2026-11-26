@@ -8,17 +8,19 @@ use std::path::{Path, PathBuf};
 
 use crate::junit::xml_report::report_dirs;
 
-/// JVM build tool driving a test run.
+/// Build tool driving a build or test run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuildTool {
     /// Gradle (`build.gradle`, `build.gradle.kts`, `settings.gradle*`).
     Gradle,
     /// Maven (`pom.xml`).
     Maven,
+    /// Cargo (`Cargo.toml`).
+    Cargo,
 }
 
 impl BuildTool {
-    /// Detects the build tool of `project_root` (Gradle wins when both are present).
+    /// Detects the build tool of `project_root` (`Gradle` > `Maven` > `Cargo`).
     #[must_use]
     pub fn detect(project_root: &Path) -> Option<Self> {
         let gradle = [
@@ -31,6 +33,8 @@ impl BuildTool {
             Some(Self::Gradle)
         } else if project_root.join("pom.xml").is_file() {
             Some(Self::Maven)
+        } else if project_root.join("Cargo.toml").is_file() {
+            Some(Self::Cargo)
         } else {
             None
         }
@@ -42,7 +46,31 @@ impl BuildTool {
         match self {
             Self::Gradle => "Gradle",
             Self::Maven => "Maven",
+            Self::Cargo => "Cargo",
         }
+    }
+}
+
+/// A fully described project compile/build process (`Build Project`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildCommand {
+    /// Build tool.
+    pub tool: BuildTool,
+    /// Executable (`./gradlew`, `gradle`, `./mvnw`, `mvn`, `cargo`).
+    pub program: PathBuf,
+    /// Arguments.
+    pub args: Vec<String>,
+    /// Working directory.
+    pub working_dir: PathBuf,
+    /// Extra environment variables.
+    pub env: BTreeMap<String, String>,
+}
+
+impl BuildCommand {
+    /// Shell-like rendering for the run console.
+    #[must_use]
+    pub fn display(&self) -> String {
+        format_command_display(&self.program, &self.args)
     }
 }
 
@@ -51,7 +79,7 @@ impl BuildTool {
 pub struct TestCommand {
     /// Build tool.
     pub tool: BuildTool,
-    /// Executable (`./gradlew`, `gradle`, `./mvnw`, `mvn`).
+    /// Executable (`./gradlew`, `gradle`, `./mvnw`, `mvn`, `cargo`).
     pub program: PathBuf,
     /// Arguments.
     pub args: Vec<String>,
@@ -67,27 +95,80 @@ impl TestCommand {
     /// Shell-like rendering for the run console.
     #[must_use]
     pub fn display(&self) -> String {
-        let mut out = self.program.display().to_string();
-        for arg in &self.args {
-            out.push(' ');
-            if arg.contains(' ') {
-                out.push('\'');
-                out.push_str(arg);
-                out.push('\'');
-            } else {
-                out.push_str(arg);
-            }
+        format_command_display(&self.program, &self.args)
+    }
+}
+
+fn format_command_display(program: &Path, args: &[String]) -> String {
+    let mut out = program.display().to_string();
+    for arg in args {
+        out.push(' ');
+        if arg.contains(' ') {
+            out.push('\'');
+            out.push_str(arg);
+            out.push('\'');
+        } else {
+            out.push_str(arg);
         }
-        out
+    }
+    out
+}
+
+fn resolve_tool_wrapper(project_root: &Path, unix: &str, windows: &str, global: &str) -> PathBuf {
+    let name = if cfg!(windows) { windows } else { unix };
+    let local = project_root.join(name);
+    if local.is_file() {
+        local
+    } else {
+        PathBuf::from(global)
+    }
+}
+
+/// Builds the compile command (`Build Project`, `Cmd+F9`) for `tool` in `project_root`.
+#[must_use]
+pub fn build_compile_command(
+    tool: BuildTool,
+    project_root: &Path,
+    env: &BTreeMap<String, String>,
+) -> BuildCommand {
+    let (program, args) = match tool {
+        BuildTool::Gradle => (
+            resolve_tool_wrapper(project_root, "gradlew", "gradlew.bat", "gradle"),
+            vec![
+                "classes".to_owned(),
+                "testClasses".to_owned(),
+                "--console=plain".to_owned(),
+            ],
+        ),
+        BuildTool::Maven => (
+            resolve_tool_wrapper(project_root, "mvnw", "mvnw.cmd", "mvn"),
+            vec!["test-compile".to_owned(), "-B".to_owned()],
+        ),
+        BuildTool::Cargo => (
+            PathBuf::from("cargo"),
+            vec![
+                "build".to_owned(),
+                "--all-targets".to_owned(),
+                "--message-format=json".to_owned(),
+            ],
+        ),
+    };
+    BuildCommand {
+        tool,
+        program,
+        args,
+        working_dir: project_root.to_path_buf(),
+        env: env.clone(),
     }
 }
 
 /// Builds the command running `targets` (`Class`, `Class#method`; empty = all tests).
 ///
-/// Gradle uses `test --tests 'Class.method'` (one `--tests` per target); Maven uses
-/// `test -Dtest=Class#method,Other` with `-Dsurefire.failIfNoSpecifiedTests=false` so a filter
-/// that matches nothing in one module does not fail the reactor. The project wrapper
-/// (`gradlew` / `mvnw`) is preferred over a global installation.
+/// Gradle uses `test --tests 'Class.method' --console=plain`; Maven uses
+/// `test -Dtest=Class#method,Other -Dsurefire.failIfNoSpecifiedTests=false -B` so a filter
+/// that matches nothing in one module does not fail the reactor; Cargo uses `cargo test
+/// --no-fail-fast [<filter> ...]`. The project wrapper (`gradlew` / `mvnw`) is preferred over
+/// a global installation.
 #[must_use]
 pub fn build_test_command(
     tool: BuildTool,
@@ -96,17 +177,8 @@ pub fn build_test_command(
     vm_options: &[String],
     env: &BTreeMap<String, String>,
 ) -> TestCommand {
-    let wrapper = |unix: &str, windows: &str, global: &str| -> PathBuf {
-        let name = if cfg!(windows) { windows } else { unix };
-        let local = project_root.join(name);
-        if local.is_file() {
-            local
-        } else {
-            PathBuf::from(global)
-        }
-    };
     let mut args = Vec::new();
-    let program = match tool {
+    let (program, reports) = match tool {
         BuildTool::Gradle => {
             args.push("test".to_owned());
             for target in targets {
@@ -117,7 +189,11 @@ pub fn build_test_command(
                 args.push(format!("-Dorg.gradle.jvmargs={}", vm_options.join(" ")));
             }
             args.push("--continue".to_owned());
-            wrapper("gradlew", "gradlew.bat", "gradle")
+            args.push("--console=plain".to_owned());
+            (
+                resolve_tool_wrapper(project_root, "gradlew", "gradlew.bat", "gradle"),
+                report_dirs(project_root),
+            )
         }
         BuildTool::Maven => {
             args.push("test".to_owned());
@@ -128,7 +204,22 @@ pub fn build_test_command(
             if !vm_options.is_empty() {
                 args.push(format!("-DargLine={}", vm_options.join(" ")));
             }
-            wrapper("mvnw", "mvnw.cmd", "mvn")
+            args.push("-B".to_owned());
+            (
+                resolve_tool_wrapper(project_root, "mvnw", "mvnw.cmd", "mvn"),
+                report_dirs(project_root),
+            )
+        }
+        BuildTool::Cargo => {
+            args.push("test".to_owned());
+            args.push("--no-fail-fast".to_owned());
+            for target in targets {
+                let filter = target.replace(['#', '$'], "::");
+                if !filter.is_empty() {
+                    args.push(filter);
+                }
+            }
+            (PathBuf::from("cargo"), Vec::new())
         }
     };
     TestCommand {
@@ -137,7 +228,7 @@ pub fn build_test_command(
         args,
         working_dir: project_root.to_path_buf(),
         env: env.clone(),
-        report_dirs: report_dirs(project_root),
+        report_dirs: reports,
     }
 }
 
@@ -146,9 +237,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_gradle_before_maven() {
+    fn detects_gradle_maven_and_cargo_in_order() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(BuildTool::detect(tmp.path()), None);
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert_eq!(BuildTool::detect(tmp.path()), Some(BuildTool::Cargo));
         std::fs::write(tmp.path().join("pom.xml"), "<project/>").unwrap();
         assert_eq!(BuildTool::detect(tmp.path()), Some(BuildTool::Maven));
         std::fs::write(tmp.path().join("build.gradle.kts"), "").unwrap();
@@ -178,7 +271,8 @@ mod tests {
                 "com.kova.OrderTest.creates",
                 "--tests",
                 "com.kova.Outer.Inner",
-                "--continue"
+                "--continue",
+                "--console=plain",
             ]
         );
         assert!(
@@ -204,9 +298,47 @@ mod tests {
                 "test",
                 "-Dtest=com.kova.OrderTest#creates",
                 "-Dsurefire.failIfNoSpecifiedTests=false",
-                "-DargLine=-Xmx1G"
+                "-DargLine=-Xmx1G",
+                "-B",
             ]
         );
         assert!(cmd.display().starts_with("mvn test -Dtest="));
+    }
+
+    #[test]
+    fn build_compile_and_cargo_test_commands_match_expected_flags() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("gradlew"), "").unwrap();
+        let gradle = build_compile_command(BuildTool::Gradle, tmp.path(), &BTreeMap::new());
+        assert_eq!(gradle.program, tmp.path().join("gradlew"));
+        assert_eq!(
+            gradle.args,
+            vec!["classes", "testClasses", "--console=plain"]
+        );
+
+        let maven = build_compile_command(BuildTool::Maven, tmp.path(), &BTreeMap::new());
+        assert_eq!(maven.program, PathBuf::from("mvn"));
+        assert_eq!(maven.args, vec!["test-compile", "-B"]);
+
+        let cargo_build = build_compile_command(BuildTool::Cargo, tmp.path(), &BTreeMap::new());
+        assert_eq!(cargo_build.program, PathBuf::from("cargo"));
+        assert_eq!(
+            cargo_build.args,
+            vec!["build", "--all-targets", "--message-format=json"]
+        );
+
+        let cargo_test = build_test_command(
+            BuildTool::Cargo,
+            tmp.path(),
+            &["suite::tests#it_works".to_owned()],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert_eq!(cargo_test.program, PathBuf::from("cargo"));
+        assert_eq!(
+            cargo_test.args,
+            vec!["test", "--no-fail-fast", "suite::tests::it_works"]
+        );
+        assert_eq!(cargo_test.report_dirs, Vec::<PathBuf>::new());
     }
 }

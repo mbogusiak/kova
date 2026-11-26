@@ -337,6 +337,11 @@ action = "refactor.change_signature"
 
 [[bindings]]
 context = "Workspace"
+key = "cmd+f9"
+action = "build.build_project"
+
+[[bindings]]
+context = "Workspace"
 key = "ctrl+shift+r"
 action = "run.run_context"
 

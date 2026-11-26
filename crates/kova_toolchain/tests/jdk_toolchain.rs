@@ -109,6 +109,29 @@ fn discovers_jdks_across_sources_and_deduplicates_symlinks() {
 }
 
 #[test]
+fn discovers_homebrew_openjdk_installations_when_configured() {
+    let tmp = TempDir::new().expect("tempdir");
+    let opt_dir = tmp.path().join("homebrew/opt");
+    create_fake_jdk(
+        &opt_dir.join("openjdk@21/libexec/openjdk.jdk"),
+        "21.0.4",
+        "Homebrew",
+        true,
+    );
+    create_fake_jdk(&opt_dir.join("openjdk@17"), "17.0.11", "Homebrew", false);
+    // Non-openjdk formulas must be ignored.
+    create_fake_jdk(&opt_dir.join("gradle"), "21.0.0", "Homebrew", false);
+
+    let mut roots = JdkDiscoveryRoots::isolated();
+    roots.homebrew_opt_dirs = vec![opt_dir];
+
+    let found = discover_jdks(&roots);
+    assert_eq!(found.len(), 2);
+    assert!(found.iter().any(|j| j.version.major == 21));
+    assert!(found.iter().any(|j| j.version.major == 17));
+}
+
+#[test]
 fn selects_project_and_tool_runtime_jdks() {
     let tmp = TempDir::new().expect("tempdir");
     let omakase_dir = tmp.path().join("omakase");

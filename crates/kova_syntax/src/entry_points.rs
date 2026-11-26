@@ -108,7 +108,7 @@ impl EntryPoint {
 /// in `tree` against `snapshot`.
 ///
 /// Returns an empty `Vec` in $O(1)$ time for [`SyntaxLanguage::Toml`], [`SyntaxLanguage::Json`],
-/// [`SyntaxLanguage::Yaml`], [`SyntaxLanguage::Xml`], and [`SyntaxLanguage::Groovy`].
+/// [`SyntaxLanguage::Yaml`], and [`SyntaxLanguage::Xml`].
 /// Output is sorted ascending by `(line, byte_range.start)` and preserves `start_line <= line <= end_line`
 /// and `byte_range.end <= snapshot.len_bytes()`.
 #[must_use]
@@ -116,12 +116,12 @@ pub fn detect_entry_points(tree: &SyntaxTree, snapshot: &BufferSnapshot) -> Vec<
     let mut entry_points = match tree.language() {
         SyntaxLanguage::Java => detect_java_entry_points(tree, snapshot),
         SyntaxLanguage::Kotlin => detect_kotlin_entry_points(tree, snapshot),
+        SyntaxLanguage::Groovy => detect_groovy_entry_points(snapshot),
         SyntaxLanguage::Http => detect_http_entry_points(tree, snapshot),
         SyntaxLanguage::Toml
         | SyntaxLanguage::Json
         | SyntaxLanguage::Yaml
-        | SyntaxLanguage::Xml
-        | SyntaxLanguage::Groovy => return Vec::new(),
+        | SyntaxLanguage::Xml => return Vec::new(),
     };
 
     entry_points.sort_by_key(|ep| (ep.line, ep.byte_range.start));
@@ -1178,4 +1178,796 @@ fn find_http_request_name(
     }
 
     separator_title
+}
+
+// ---------------------------------------------------------------------------
+// Groovy detection
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GroovyTokKind {
+    Ident(String),
+    StringLit(String),
+    At,
+    Dot,
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    Semi,
+    Eq,
+    Comma,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+struct GroovyTok {
+    kind: GroovyTokKind,
+    line: usize,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GroovyClassScope {
+    id: usize,
+    name: String,
+    line: usize,
+    start_line: usize,
+    start_byte: usize,
+    body_depth: usize,
+    is_nested: bool,
+    has_tests: bool,
+}
+
+#[derive(Debug, Clone)]
+struct GroovyCompletedClass {
+    id: usize,
+    class_chain: String,
+    simple_name: String,
+    line: usize,
+    start_line: usize,
+    end_line: usize,
+    byte_range: Range<usize>,
+    is_nested: bool,
+    parent_id: Option<usize>,
+    has_tests: bool,
+}
+
+struct GroovyScanState {
+    package_name: Option<String>,
+    class_stack: Vec<GroovyClassScope>,
+    completed_classes: Vec<GroovyCompletedClass>,
+    pending_annotations: Vec<(String, usize, usize)>,
+    pending_modifiers: Vec<(String, usize, usize)>,
+    pending_class: Option<(String, usize, usize, usize, bool)>,
+    next_class_id: usize,
+    brace_depth: usize,
+    len_bytes: usize,
+    last_line: usize,
+    out: Vec<EntryPoint>,
+}
+
+impl GroovyScanState {
+    fn new(len_bytes: usize, last_line: usize) -> Self {
+        Self {
+            package_name: None,
+            class_stack: Vec::new(),
+            completed_classes: Vec::new(),
+            pending_annotations: Vec::new(),
+            pending_modifiers: Vec::new(),
+            pending_class: None,
+            next_class_id: 1,
+            brace_depth: 0,
+            len_bytes,
+            last_line,
+            out: Vec::new(),
+        }
+    }
+
+    fn handle_lbrace(&mut self) {
+        if let Some((name, name_line, start_line, start_byte, is_nested)) =
+            self.pending_class.take()
+        {
+            let id = self.next_class_id;
+            self.next_class_id += 1;
+            self.class_stack.push(GroovyClassScope {
+                id,
+                name,
+                line: name_line,
+                start_line,
+                start_byte,
+                body_depth: self.brace_depth + 1,
+                is_nested,
+                has_tests: false,
+            });
+            self.pending_annotations.clear();
+            self.pending_modifiers.clear();
+        }
+        self.brace_depth += 1;
+    }
+
+    fn pop_class(&mut self, end_line: usize, end_byte: usize) {
+        let Some(popped) = self.class_stack.pop() else {
+            return;
+        };
+        let parent_id = self.class_stack.last().map(|c| c.id);
+        let chain_name = if self.class_stack.is_empty() {
+            popped.name.clone()
+        } else {
+            let mut parts: Vec<&str> = self.class_stack.iter().map(|c| c.name.as_str()).collect();
+            parts.push(&popped.name);
+            parts.join("$")
+        };
+        if popped.has_tests
+            && popped.is_nested
+            && let Some(parent) = self.class_stack.last_mut()
+        {
+            parent.has_tests = true;
+        }
+        self.completed_classes.push(GroovyCompletedClass {
+            id: popped.id,
+            class_chain: chain_name,
+            simple_name: popped.name,
+            line: popped.line,
+            start_line: popped.start_line,
+            end_line: end_line.max(popped.line),
+            byte_range: clamp_byte_range(popped.start_byte..end_byte, self.len_bytes),
+            is_nested: popped.is_nested,
+            parent_id,
+            has_tests: popped.has_tests,
+        });
+    }
+
+    fn handle_rbrace(&mut self, tok: &GroovyTok) {
+        self.brace_depth = self.brace_depth.saturating_sub(1);
+        self.pending_annotations.clear();
+        self.pending_modifiers.clear();
+        if let Some(top) = self.class_stack.last()
+            && self.brace_depth < top.body_depth
+        {
+            self.pop_class(tok.line, tok.end_byte);
+        }
+    }
+
+    fn try_parse_package(&mut self, tokens: &[GroovyTok], idx: usize) -> Option<usize> {
+        if self.brace_depth != 0 || self.package_name.is_some() {
+            return None;
+        }
+        if !matches!(&tokens[idx].kind, GroovyTokKind::Ident(s) if s == "package") {
+            return None;
+        }
+        let (parts, next_idx) = collect_dotted_ident(tokens, idx + 1);
+        if !parts.is_empty() {
+            self.package_name = Some(parts.join("."));
+        }
+        self.pending_annotations.clear();
+        self.pending_modifiers.clear();
+        Some(next_idx)
+    }
+
+    fn try_parse_annotation(&mut self, tokens: &[GroovyTok], idx: usize) -> Option<usize> {
+        if tokens[idx].kind != GroovyTokKind::At {
+            return None;
+        }
+        let at_line = tokens[idx].line;
+        let at_byte = tokens[idx].start_byte;
+        let (parts, mut j) = collect_dotted_ident(tokens, idx + 1);
+        if parts.is_empty() {
+            return Some(idx + 1);
+        }
+        self.pending_annotations
+            .push((parts.join("."), at_line, at_byte));
+        if j < tokens.len() && tokens[j].kind == GroovyTokKind::LParen {
+            j = skip_balanced_parens(tokens, j);
+        }
+        Some(j)
+    }
+
+    fn try_parse_class(&mut self, tokens: &[GroovyTok], idx: usize) -> Option<usize> {
+        let prev_is_dot = idx > 0 && tokens[idx - 1].kind == GroovyTokKind::Dot;
+        if prev_is_dot {
+            return None;
+        }
+        let tok = &tokens[idx];
+        if !matches!(&tok.kind, GroovyTokKind::Ident(s) if s == "class") {
+            return None;
+        }
+        let next = tokens.get(idx + 1)?;
+        let GroovyTokKind::Ident(class_name) = &next.kind else {
+            return None;
+        };
+        let start_line =
+            earliest_line(&self.pending_annotations, &self.pending_modifiers, tok.line);
+        let start_byte = earliest_byte(
+            &self.pending_annotations,
+            &self.pending_modifiers,
+            tok.start_byte,
+        );
+        let is_nested = !self.class_stack.is_empty()
+            && self
+                .pending_annotations
+                .iter()
+                .any(|(ann, _, _)| is_nested_annotation_name(ann));
+        self.pending_class = Some((
+            class_name.clone(),
+            next.line,
+            start_line,
+            start_byte,
+            is_nested,
+        ));
+        Some(idx + 2)
+    }
+
+    fn try_parse_method(&mut self, tokens: &[GroovyTok], idx: usize) -> Option<usize> {
+        if self.class_stack.is_empty() {
+            return None;
+        }
+        let tok = &tokens[idx];
+        let method_name = match &tok.kind {
+            GroovyTokKind::Ident(name) => name.clone(),
+            GroovyTokKind::StringLit(name) if !name.is_empty() => name.clone(),
+            _ => return None,
+        };
+        if !tokens
+            .get(idx + 1)
+            .is_some_and(|next| next.kind == GroovyTokKind::LParen)
+        {
+            return None;
+        }
+        let params_start = idx + 1;
+        let after_params = skip_balanced_parens(tokens, params_start);
+        let body_open = find_method_body_open(tokens, after_params)?;
+
+        let is_test = self
+            .pending_annotations
+            .iter()
+            .any(|(ann, _, _)| is_test_annotation_name(ann));
+        let is_main = method_name == "main"
+            && is_groovy_main_method(&self.pending_modifiers, &tokens[params_start..after_params]);
+
+        if is_test || is_main {
+            let body_end_idx = find_matching_brace(tokens, body_open);
+            let end_line = body_end_idx
+                .and_then(|end_i| tokens.get(end_i))
+                .map_or(self.last_line, |t| t.line)
+                .max(tok.line);
+            let end_byte = body_end_idx
+                .and_then(|end_i| tokens.get(end_i))
+                .map_or(self.len_bytes, |t| t.end_byte);
+            let start_line =
+                earliest_line(&self.pending_annotations, &self.pending_modifiers, tok.line);
+            let start_byte = earliest_byte(
+                &self.pending_annotations,
+                &self.pending_modifiers,
+                tok.start_byte,
+            );
+            let class_chain = self
+                .class_stack
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join("$");
+            let pkg_ref = self.package_name.as_deref();
+            let fqcn = build_fqcn(pkg_ref, Some(&class_chain));
+            let id = match (&fqcn, pkg_ref) {
+                (Some(fqcn), _) => format!("{fqcn}#{method_name}"),
+                (None, Some(pkg)) => format!("{pkg}#{method_name}"),
+                (None, None) => method_name.clone(),
+            };
+            let label = format!("Run '{class_chain}.{method_name}()'");
+            let byte_range = clamp_byte_range(start_byte..end_byte, self.len_bytes);
+
+            if is_main {
+                self.out.push(make_groovy_method_entry(
+                    id.clone(),
+                    EntryPointKind::JavaMain,
+                    label.clone(),
+                    tok.line,
+                    start_line,
+                    end_line,
+                    byte_range.clone(),
+                    self.package_name.clone(),
+                    class_chain.clone(),
+                    method_name.clone(),
+                ));
+            }
+            if is_test {
+                if let Some(scope) = self.class_stack.last_mut() {
+                    scope.has_tests = true;
+                }
+                self.out.push(make_groovy_method_entry(
+                    id,
+                    EntryPointKind::JvmTestMethod,
+                    label,
+                    tok.line,
+                    start_line,
+                    end_line,
+                    byte_range,
+                    self.package_name.clone(),
+                    class_chain,
+                    method_name,
+                ));
+            }
+        }
+
+        self.pending_annotations.clear();
+        self.pending_modifiers.clear();
+        Some(body_open)
+    }
+
+    fn finish(mut self) -> Vec<EntryPoint> {
+        while !self.class_stack.is_empty() {
+            self.pop_class(self.last_line, self.len_bytes);
+        }
+
+        loop {
+            let mut changed = false;
+            let parents_to_mark: Vec<usize> = self
+                .completed_classes
+                .iter()
+                .filter(|c| c.has_tests && c.is_nested)
+                .filter_map(|c| c.parent_id)
+                .collect();
+            for pid in parents_to_mark {
+                if let Some(parent) = self.completed_classes.iter_mut().find(|c| c.id == pid)
+                    && !parent.has_tests
+                {
+                    parent.has_tests = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        for cls in self.completed_classes {
+            if !cls.has_tests {
+                continue;
+            }
+            let fqcn = build_fqcn(self.package_name.as_deref(), Some(&cls.class_chain))
+                .unwrap_or_else(|| cls.simple_name.clone());
+            self.out.push(EntryPoint {
+                id: fqcn,
+                kind: EntryPointKind::JvmTestClass,
+                icon_role: GutterIconRole::RunAll,
+                label: format!("Run '{}'", cls.class_chain),
+                line: cls.line,
+                start_line: cls.start_line,
+                end_line: cls.end_line,
+                byte_range: cls.byte_range,
+                package_name: self.package_name.clone(),
+                class_name: Some(cls.class_chain),
+                method_name: None,
+                request_index: None,
+                http_method: None,
+                http_url: None,
+            });
+        }
+
+        self.out
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal constructor helper for Groovy EntryPoint"
+)]
+fn make_groovy_method_entry(
+    id: String,
+    kind: EntryPointKind,
+    label: String,
+    line: usize,
+    start_line: usize,
+    end_line: usize,
+    byte_range: Range<usize>,
+    package_name: Option<String>,
+    class_name: String,
+    method_name: String,
+) -> EntryPoint {
+    EntryPoint {
+        id,
+        kind,
+        icon_role: GutterIconRole::Run,
+        label,
+        line,
+        start_line,
+        end_line,
+        byte_range,
+        package_name,
+        class_name: Some(class_name),
+        method_name: Some(method_name),
+        request_index: None,
+        http_method: None,
+        http_url: None,
+    }
+}
+
+fn collect_dotted_ident(tokens: &[GroovyTok], start: usize) -> (Vec<&str>, usize) {
+    let mut parts = Vec::new();
+    let mut j = start;
+    while j < tokens.len() {
+        if let GroovyTokKind::Ident(part) = &tokens[j].kind {
+            parts.push(part.as_str());
+            j += 1;
+            if j < tokens.len() && tokens[j].kind == GroovyTokKind::Dot {
+                j += 1;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    (parts, j)
+}
+
+fn earliest_line(
+    anns: &[(String, usize, usize)],
+    mods: &[(String, usize, usize)],
+    fallback: usize,
+) -> usize {
+    anns.first()
+        .map(|(_, l, _)| *l)
+        .into_iter()
+        .chain(mods.first().map(|(_, l, _)| *l))
+        .chain(std::iter::once(fallback))
+        .min()
+        .unwrap_or(fallback)
+}
+
+fn earliest_byte(
+    anns: &[(String, usize, usize)],
+    mods: &[(String, usize, usize)],
+    fallback: usize,
+) -> usize {
+    anns.first()
+        .map(|(_, _, b)| *b)
+        .into_iter()
+        .chain(mods.first().map(|(_, _, b)| *b))
+        .chain(std::iter::once(fallback))
+        .min()
+        .unwrap_or(fallback)
+}
+
+fn find_method_body_open(tokens: &[GroovyTok], start: usize) -> Option<usize> {
+    let mut idx = start;
+    while idx < tokens.len() {
+        match tokens[idx].kind {
+            GroovyTokKind::LBrace => return Some(idx),
+            GroovyTokKind::Semi | GroovyTokKind::Eq => return None,
+            _ => idx += 1,
+        }
+    }
+    None
+}
+
+fn detect_groovy_entry_points(snapshot: &BufferSnapshot) -> Vec<EntryPoint> {
+    let source = snapshot.text();
+    let tokens = tokenize_groovy(&source);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut state =
+        GroovyScanState::new(snapshot.len_bytes(), snapshot.len_lines().saturating_sub(1));
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let tok = &tokens[idx];
+        match &tok.kind {
+            GroovyTokKind::LBrace => {
+                state.handle_lbrace();
+                idx += 1;
+                continue;
+            }
+            GroovyTokKind::RBrace => {
+                state.handle_rbrace(tok);
+                idx += 1;
+                continue;
+            }
+            GroovyTokKind::Semi | GroovyTokKind::Eq => {
+                if state.pending_class.is_none() {
+                    state.pending_annotations.clear();
+                    state.pending_modifiers.clear();
+                }
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(next_idx) = state.try_parse_package(&tokens, idx) {
+            idx = next_idx;
+            continue;
+        }
+
+        let at_scope = match state.class_stack.last() {
+            Some(scope) => state.brace_depth == scope.body_depth,
+            None => state.brace_depth == 0,
+        };
+        if !at_scope {
+            idx += 1;
+            continue;
+        }
+
+        if let Some(next_idx) = state.try_parse_annotation(&tokens, idx) {
+            idx = next_idx;
+            continue;
+        }
+        if let Some(next_idx) = state.try_parse_class(&tokens, idx) {
+            idx = next_idx;
+            continue;
+        }
+        if state.pending_class.is_some() {
+            idx += 1;
+            continue;
+        }
+        if let Some(next_idx) = state.try_parse_method(&tokens, idx) {
+            idx = next_idx;
+            continue;
+        }
+
+        if let GroovyTokKind::Ident(ident) = &tok.kind {
+            if matches!(
+                ident.as_str(),
+                "public"
+                    | "protected"
+                    | "private"
+                    | "static"
+                    | "final"
+                    | "abstract"
+                    | "synchronized"
+                    | "void"
+                    | "def"
+            ) {
+                state
+                    .pending_modifiers
+                    .push((ident.clone(), tok.line, tok.start_byte));
+            } else if matches!(ident.as_str(), "import" | "extends" | "implements") {
+                state.pending_annotations.clear();
+                state.pending_modifiers.clear();
+            } else if let Some(prev) = state.pending_modifiers.last()
+                && prev.1 < tok.line
+                && state.pending_annotations.is_empty()
+            {
+                state.pending_modifiers.clear();
+            }
+        }
+        idx += 1;
+    }
+
+    state.finish()
+}
+
+fn is_groovy_main_method(modifiers: &[(String, usize, usize)], param_tokens: &[GroovyTok]) -> bool {
+    let has_static = modifiers.iter().any(|(m, _, _)| m == "static");
+    let has_return = modifiers.iter().any(|(m, _, _)| m == "void" || m == "def");
+    if !has_static || !has_return {
+        return false;
+    }
+
+    // Extract inner tokens between `(` and `)`.
+    let inner = if param_tokens.len() >= 2 {
+        &param_tokens[1..param_tokens.len() - 1]
+    } else {
+        &[]
+    };
+    if inner.is_empty() {
+        return true;
+    }
+    // Reject multiple parameters (comma-separated).
+    if inner.iter().any(|t| t.kind == GroovyTokKind::Comma) {
+        return false;
+    }
+    // Single untyped `args`, or `String[] args` / `String... args` / `String args[]` / `def args`.
+    let idents: Vec<&str> = inner
+        .iter()
+        .filter_map(|t| match &t.kind {
+            GroovyTokKind::Ident(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    match idents.as_slice() {
+        [_single_untyped] => true,
+        [ty, _name] => *ty == "String" || *ty == "def" || *ty == "Object",
+        ["java", "lang", "String", _name] => true,
+        _ => false,
+    }
+}
+
+fn skip_balanced_parens(tokens: &[GroovyTok], open_idx: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = open_idx;
+    while i < tokens.len() {
+        match tokens[i].kind {
+            GroovyTokKind::LParen => depth += 1,
+            GroovyTokKind::RParen => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    tokens.len()
+}
+
+fn find_matching_brace(tokens: &[GroovyTok], open_idx: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, tok) in tokens[open_idx..].iter().enumerate() {
+        match tok.kind {
+            GroovyTokKind::LBrace => depth += 1,
+            GroovyTokKind::RBrace => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open_idx + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn scan_groovy_string(
+    source: &str,
+    bytes: &[u8],
+    i: &mut usize,
+    line: &mut usize,
+) -> Option<GroovyTok> {
+    let quote = bytes[*i];
+    let start_byte = *i;
+    let start_line = *line;
+    let is_triple = *i + 2 < bytes.len() && bytes[*i + 1] == quote && bytes[*i + 2] == quote;
+    if is_triple {
+        *i += 3;
+        let content_start = *i;
+        while *i < bytes.len() {
+            if bytes[*i] == b'\\' {
+                *i = (*i + 2).min(bytes.len());
+                continue;
+            }
+            if bytes[*i] == b'\n' {
+                *line += 1;
+            }
+            if *i + 2 < bytes.len()
+                && bytes[*i] == quote
+                && bytes[*i + 1] == quote
+                && bytes[*i + 2] == quote
+            {
+                let content = source[content_start..*i].to_owned();
+                *i += 3;
+                return Some(GroovyTok {
+                    kind: GroovyTokKind::StringLit(content),
+                    line: start_line,
+                    start_byte,
+                    end_byte: *i,
+                });
+            }
+            *i += 1;
+        }
+        return None;
+    }
+
+    *i += 1;
+    let content_start = *i;
+    while *i < bytes.len() {
+        if bytes[*i] == b'\\' {
+            *i = (*i + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[*i] == b'\n' {
+            return None;
+        }
+        if bytes[*i] == quote {
+            let content = source[content_start..*i].to_owned();
+            *i += 1;
+            return Some(GroovyTok {
+                kind: GroovyTokKind::StringLit(content),
+                line: start_line,
+                start_byte,
+                end_byte: *i,
+            });
+        }
+        *i += 1;
+    }
+    None
+}
+
+fn tokenize_groovy(source: &str) -> Vec<GroovyTok> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    let mut line = 0usize;
+
+    while i < len {
+        let b = bytes[i];
+
+        if b == b'\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if i == 0 && bytes.starts_with(b"#!") {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    line += 1;
+                }
+                i += 1;
+            }
+            i = (i + 2).min(len);
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            if let Some(tok) = scan_groovy_string(source, bytes, &mut i, &mut line) {
+                tokens.push(tok);
+            }
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' || b == b'$' {
+            let start = i;
+            i += 1;
+            while i < len
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+            {
+                i += 1;
+            }
+            tokens.push(GroovyTok {
+                kind: GroovyTokKind::Ident(source[start..i].to_owned()),
+                line,
+                start_byte: start,
+                end_byte: i,
+            });
+            continue;
+        }
+
+        let start = i;
+        let kind = match b {
+            b'@' => GroovyTokKind::At,
+            b'.' => GroovyTokKind::Dot,
+            b'(' => GroovyTokKind::LParen,
+            b')' => GroovyTokKind::RParen,
+            b'{' => GroovyTokKind::LBrace,
+            b'}' => GroovyTokKind::RBrace,
+            b';' => GroovyTokKind::Semi,
+            b'=' => GroovyTokKind::Eq,
+            b',' => GroovyTokKind::Comma,
+            _ => GroovyTokKind::Other,
+        };
+        i += if b.is_ascii() {
+            1
+        } else {
+            source[i..].chars().next().map_or(1, char::len_utf8)
+        };
+        tokens.push(GroovyTok {
+            kind,
+            line,
+            start_byte: start,
+            end_byte: i,
+        });
+    }
+
+    tokens
 }

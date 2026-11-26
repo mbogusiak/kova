@@ -11,7 +11,7 @@
 //! executor whenever the active document changes.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, AppContext as _, Bounds, ClickEvent, Context, Div, Entity, FocusHandle, FontWeight,
     Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollStrategy,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled, Subscription, Task,
-    UniformListScrollHandle, Window, div, px, relative, uniform_list,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle,
+    ScrollStrategy, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Subscription,
+    Task, UniformListScrollHandle, Window, div, px, relative, uniform_list,
 };
 use kova_buffer::{Buffer, BufferSnapshot};
 use kova_core::builtin_actions::builtin_action_registry_ref;
@@ -38,7 +38,7 @@ use kova_core::navigation::{
 use kova_core::perf::{
     BudgetKind, budgets, check_duration_budget, check_rss_budget, current_process_rss_bytes,
 };
-use kova_core::project::{ActiveProject, ProjectScanOptions, scan_project};
+use kova_core::project::{ActiveProject, BuildSystemKind, ProjectScanOptions, scan_project};
 use kova_syntax::{
     Highlighter, LanguageRegistry, SyntaxEngine, SyntaxEngineConfig, detect_language,
 };
@@ -64,8 +64,8 @@ pub use project_panel::{
     NewEntryKind, NewItemKeyOutcome, NewProjectItemState, create_project_item_on_disk,
 };
 
-use crate::app_menu::{OpenProject, SearchEverywhere};
-use crate::debugger::{DebugCommandSink, DebuggerModel};
+use crate::app_menu::{OpenProject, OpenSettings, SearchEverywhere};
+use crate::debugger::{DebugCommand, DebugCommandSink, DebuggerModel};
 use crate::dock::bottom_panel::BOTTOM_TAB_BAR_HEIGHT_PX;
 use crate::dock::focus::{
     LEFT_STRIPE_WIDTH_PX, RIGHT_STRIPE_WIDTH_PX, STATUSBAR_HEIGHT_PX, TITLEBAR_HEIGHT_PX,
@@ -73,11 +73,12 @@ use crate::dock::focus::{
 use crate::dock::project_tree::{PROJECT_INDENT_PX, file_icon_kind_for, lang_hint_for};
 use crate::dock::structure::{STRUCTURE_ROW_HEIGHT_PX, kind_icon};
 use crate::dock::{
-    BadgeVariant, BottomPanelModel, BottomTab, Direction, DockLayoutState, DockToolId,
-    FileIconKind, FocusModeVariant, FocusTilingController, FocusToggle, FocusedRegion,
-    LayoutDensity, PaneId, ProblemEntry, ProblemRow, ProblemSeverity, ProjectNode, ProjectNodeKind,
-    ProjectTreeModel, SplitAxis, SplitTree, StatusBarState, StructureModel, TabGroupModel, TabId,
-    TabItem, TreeActivation, VimModeBadge,
+    BadgeVariant, BottomPanelModel, BottomTab, BuildLogKind, BuildRunStatus, Direction,
+    DockLayoutState, DockToolId, FileIconKind, FocusModeVariant, FocusTilingController,
+    FocusToggle, FocusedRegion, LayoutDensity, PaneId, ProblemEntry, ProblemRow, ProblemSeverity,
+    ProjectNode, ProjectNodeKind, ProjectTreeModel, SplitAxis, SplitTree, StatusBarState,
+    StructureModel, TabGroupModel, TabId, TabItem, TreeActivation, VimModeBadge,
+    render_build_hammer_icon, render_run_play_icon, render_run_tests_icon, render_stop_icon,
 };
 use crate::document::{
     CompletionSink, DefinitionOutcome, DefinitionRequest, DefinitionSink, DefinitionTargetKind,
@@ -126,7 +127,7 @@ use kova_tools::http_runner::{
     HttpEnvironments, HttpExecutor, HttpExecutorConfig, HttpFile, HttpRequestSpec,
     discover_project_root, prepare_request_at_line,
 };
-use kova_tools::junit::TestEvent;
+use kova_tools::junit::{OutputStream, TestEvent, TestRun};
 
 /// Canonical Islands UI layout geometry (`KOVA-025` spec §FR-1, `new_ui_dock_mockup.svg`).
 /// Outer margin, island gap and focus ring width come from [`LayoutDensity`] (`KOVA-026`);
@@ -278,6 +279,66 @@ impl StartupMetrics {
 }
 
 type FirstFrameCallback = Box<dyn FnOnce(&StartupMetrics)>;
+
+/// A request to compile/build the active project (`Build Project`, `Cmd+F9`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildRunRequest {
+    /// Identifier echoed by the host with every [`BuildEvent`] batch.
+    pub run_id: u64,
+    /// Human-readable label shown in the *Run* panel header.
+    pub label: String,
+    /// Bound project root (`None` when no workspace is open).
+    pub project_root: Option<PathBuf>,
+    /// Extra environment variables.
+    pub env: BTreeMap<String, String>,
+    /// Dirty path-backed project files flushed atomically before spawning the build.
+    pub pending_saves: Vec<(PathBuf, String)>,
+}
+
+/// Streaming event emitted by the host build runner back to [`WorkspaceShell`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildEvent {
+    /// Build started on the host.
+    Started {
+        /// Human-readable label.
+        label: String,
+    },
+    /// Streamed output line from the compiler or build tool.
+    Output {
+        /// Output stream (`Stdout` or `Stderr`).
+        stream: OutputStream,
+        /// Line text.
+        text: String,
+        /// Optional clickable source location `(file, 1_based_line, 1_based_col)`.
+        target: Option<(String, usize, usize)>,
+    },
+    /// Build finished.
+    Finished {
+        /// Whether the build exited with status `0`.
+        success: bool,
+        /// Elapsed wall-clock duration in milliseconds.
+        duration_ms: u64,
+        /// Optional error or summary message.
+        message: Option<String>,
+    },
+}
+
+/// Host callback executing a [`BuildRunRequest`] off the UI thread.
+pub type BuildRunSink = Arc<dyn Fn(BuildRunRequest) + Send + Sync>;
+
+/// Which active background runner task to cancel on `Stop` (`Cmd+F2` / `■`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CancelRunKind {
+    /// Cancel only the active `Build Project` process.
+    Build,
+    /// Cancel only the active test runner process.
+    Test,
+    /// Cancel both active build and test processes.
+    All,
+}
+
+/// Host callback cancelling an in-flight build or test run.
+pub type CancelRunSink = Arc<dyn Fn(CancelRunKind) + Send + Sync>;
 
 /// Resolved Hsla colours for one frame (copied into row closures without borrowing the theme).
 #[derive(Debug, Clone, Copy)]
@@ -515,11 +576,19 @@ pub struct WorkspaceShell {
     settings_error: Option<String>,
     /// Integrated PTY terminal, created on the first `Alt+F12` (`KOVA-039`).
     terminal: Option<(Entity<TerminalDock>, Subscription)>,
-    /// `JUnit` *Test Runner* state (`KOVA-040`).
+    /// `JUnit` / `Cargo` *Test Runner* state (`KOVA-040`, `KOVA-058`).
     test_runner: TestRunnerModel,
     tests_scroll: UniformListScrollHandle,
-    /// Host executor of test runs (BSP / Gradle / Maven).
+    /// Host executor of test runs (BSP / Gradle / Maven / Cargo).
     test_sink: Option<TestRunSink>,
+    /// Host executor of `Build Project` runs (`KOVA-058`).
+    build_sink: Option<BuildRunSink>,
+    /// Host callback cancelling active build/test runs (`KOVA-058`).
+    cancel_run_sink: Option<CancelRunSink>,
+    /// Scroll handle for the *Run* output log (`KOVA-058`).
+    run_scroll: ScrollHandle,
+    next_build_run_id: u64,
+    active_build_run_id: Option<u64>,
     /// Shared `[[run_configurations]]` from the project `kova.toml`.
     run_configs: Vec<RunConfiguration>,
     /// Last `kova.toml` load / save error.
@@ -671,6 +740,11 @@ impl WorkspaceShell {
             test_runner: TestRunnerModel::default(),
             tests_scroll: UniformListScrollHandle::new(),
             test_sink: None,
+            build_sink: None,
+            cancel_run_sink: None,
+            run_scroll: ScrollHandle::new(),
+            next_build_run_id: 0,
+            active_build_run_id: None,
             run_configs: Vec::new(),
             run_configs_error: None,
             debugger: DebuggerModel::default(),
@@ -1062,7 +1136,7 @@ impl WorkspaceShell {
                     let text = editor.read(cx).shared_buffer().snapshot().text();
                     self.run_http_request(&request, &text, cx);
                 } else {
-                    self.handle_run_request(&request);
+                    self.handle_run_request(&request, cx);
                 }
                 cx.notify();
             }
@@ -1096,9 +1170,9 @@ impl WorkspaceShell {
         }
     }
 
-    /// Handles a gutter `▶` click: `@Test` methods / classes start a `JUnit` *Test Runner* run
+    /// Handles a gutter `▶` click: `@Test` methods / classes start a *Test Runner* run
     /// (`KOVA-040`); other entry points are logged in the *Run* tab.
-    fn handle_run_request(&mut self, request: &RunEntryPointRequested) {
+    fn handle_run_request(&mut self, request: &RunEntryPointRequested, cx: &mut Context<'_, Self>) {
         if matches!(
             request.kind,
             EntryPointKind::JvmTestMethod | EntryPointKind::JvmTestClass
@@ -1114,11 +1188,12 @@ impl WorkspaceShell {
                 self.project.root_owned(),
                 file,
             );
-            self.start_test_run(test_request);
+            self.start_test_run(test_request, cx);
             return;
         }
         self.last_run = Some(LastRunTarget::EntryPoint(request.clone()));
-        self.bottom_panel.run_logs.push(request.log_line());
+        self.bottom_panel
+            .append_build_log(request.log_line(), BuildLogKind::Info, None);
         self.dock_layout.bottom_open = Some(DockToolId::Run);
     }
 
@@ -1193,8 +1268,42 @@ impl WorkspaceShell {
             .is_some_and(|path| detect_language(path) == Some(SyntaxLanguage::Http))
     }
 
+    /// Flushes modified path-backed documents belonging to the workspace via `save_sink` and
+    /// returns `(abs_path, text)` snapshots so background build/test runners can write them
+    /// atomically before spawning any compiler subprocess.
+    fn save_dirty_project_files(&mut self, cx: &mut Context<'_, Self>) -> Vec<(PathBuf, String)> {
+        let mut keys: Vec<PathBuf> = self
+            .doc_states
+            .iter()
+            .filter(|(key, doc)| {
+                doc.path.is_some()
+                    && !self.read_only_docs.contains(*key)
+                    && self
+                        .documents
+                        .get(*key)
+                        .is_some_and(|buf| doc.is_dirty(buf.version().as_u64()))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort();
+
+        let mut snapshots = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let (Some(disk_path), Some(buffer)) = (
+                self.doc_states.get(&key).and_then(|d| d.path.clone()),
+                self.documents.get(&key),
+            ) {
+                snapshots.push((disk_path, buffer.snapshot().text()));
+            }
+            self.dispatch_save(&key, cx);
+        }
+        snapshots
+    }
+
     /// Shows `request` in the Test Runner dock and hands it to the host sink.
-    fn start_test_run(&mut self, request: TestRunRequest) {
+    fn start_test_run(&mut self, mut request: TestRunRequest, cx: &mut Context<'_, Self>) {
+        request.pending_saves = self.save_dirty_project_files(cx);
+        self.bottom_panel.clear_build_problems();
         self.last_run = Some(LastRunTarget::TestRun {
             label: request.label.clone(),
             targets: request.targets.clone(),
@@ -1212,7 +1321,7 @@ impl WorkspaceShell {
                 vec![TestEvent::RunFinished {
                     success: false,
                     message: Some(
-                        "No build server attached: open a Gradle/Maven project with `kova <dir>`."
+                        "No build server attached: open a Gradle/Maven/Cargo project with `kova <dir>`."
                             .to_owned(),
                     ),
                 }],
@@ -1223,6 +1332,16 @@ impl WorkspaceShell {
     /// Installs the host executor of test runs (`KOVA-040`).
     pub fn set_test_run_sink(&mut self, sink: TestRunSink) {
         self.test_sink = Some(sink);
+    }
+
+    /// Installs the host executor of `Build Project` runs (`KOVA-058`).
+    pub fn set_build_sink(&mut self, sink: BuildRunSink) {
+        self.build_sink = Some(sink);
+    }
+
+    /// Installs the host callback cancelling active build/test runs (`KOVA-058`).
+    pub fn set_cancel_run_sink(&mut self, sink: CancelRunSink) {
+        self.cancel_run_sink = Some(sink);
     }
 
     /// Applies a batch of test events reported by the host for `run_id`.
@@ -1237,6 +1356,83 @@ impl WorkspaceShell {
         }
     }
 
+    /// Applies a batch of streamed build events reported by the host for `run_id`.
+    pub fn apply_build_events(
+        &mut self,
+        run_id: u64,
+        events: Vec<BuildEvent>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.active_build_run_id != Some(run_id) {
+            return;
+        }
+        let mut changed = false;
+        for event in events {
+            changed = true;
+            match event {
+                BuildEvent::Started { label } => {
+                    if !matches!(
+                        self.bottom_panel.build_status(),
+                        BuildRunStatus::Running { .. }
+                    ) {
+                        self.bottom_panel.start_build(label);
+                    }
+                }
+                BuildEvent::Output {
+                    stream,
+                    text,
+                    target,
+                } => {
+                    let kind = match stream {
+                        OutputStream::Stdout => BuildLogKind::Stdout,
+                        OutputStream::Stderr => BuildLogKind::Stderr,
+                    };
+                    self.bottom_panel.append_build_log(text, kind, target);
+                }
+                BuildEvent::Finished {
+                    success,
+                    duration_ms,
+                    message,
+                } => {
+                    if let Some(msg) = message {
+                        let kind = if success {
+                            BuildLogKind::Success
+                        } else {
+                            BuildLogKind::Stderr
+                        };
+                        self.bottom_panel.append_build_log(msg, kind, None);
+                    }
+                    let summary = if success {
+                        format!("Build succeeded in {duration_ms} ms")
+                    } else {
+                        format!("Build failed in {duration_ms} ms")
+                    };
+                    self.bottom_panel.append_build_log(
+                        summary,
+                        if success {
+                            BuildLogKind::Success
+                        } else {
+                            BuildLogKind::Stderr
+                        },
+                        None,
+                    );
+                    self.bottom_panel.finish_build(success, duration_ms);
+                    self.active_build_run_id = None;
+                }
+            }
+        }
+        if changed {
+            self.run_scroll.scroll_to_bottom();
+            cx.notify();
+        }
+    }
+
+    /// Clears previous compiler/build diagnostics while preserving active editor syntax problems.
+    pub fn clear_build_problems(&mut self, cx: &mut Context<'_, Self>) {
+        self.bottom_panel.clear_build_problems();
+        cx.notify();
+    }
+
     /// Replaces the compile diagnostics of `file` reported by the build server.
     pub fn set_build_problems(
         &mut self,
@@ -1246,6 +1442,125 @@ impl WorkspaceShell {
     ) {
         self.bottom_panel.set_build_problems(file, problems);
         cx.notify();
+    }
+
+    /// Starts `Build Project` (`Cmd+F9` / `Ctrl+F9`).
+    pub fn build_project_action(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(root) = self.project.root_owned() else {
+            self.bottom_panel.start_build("Build Project");
+            self.bottom_panel.append_build_log(
+                "Open a Gradle, Maven, or Cargo project to build.",
+                BuildLogKind::Stderr,
+                None,
+            );
+            self.bottom_panel.finish_build(false, 0);
+            self.dock_layout.bottom_open = Some(DockToolId::Run);
+            self.set_notice(
+                StatusKind::Warning,
+                "Open a project folder to build".to_owned(),
+                cx,
+            );
+            return;
+        };
+
+        let pending_saves = self.save_dirty_project_files(cx);
+        self.bottom_panel.clear_build_problems();
+
+        let build_kind = BuildSystemKind::detect(&root);
+        let tool_label = match build_kind {
+            BuildSystemKind::Gradle => "Gradle",
+            BuildSystemKind::Maven => "Maven",
+            BuildSystemKind::Cargo => "Cargo",
+            BuildSystemKind::Mixed => "Gradle / Maven",
+            BuildSystemKind::Unknown => self.project.name(),
+        };
+        let label = format!("Build {tool_label}");
+
+        self.next_build_run_id += 1;
+        let run_id = self.next_build_run_id;
+        self.active_build_run_id = Some(run_id);
+        self.bottom_panel.start_build(label.clone());
+        self.dock_layout.bottom_open = Some(DockToolId::Run);
+
+        let request = BuildRunRequest {
+            run_id,
+            label,
+            project_root: Some(root),
+            env: BTreeMap::new(),
+            pending_saves,
+        };
+        if let Some(sink) = &self.build_sink {
+            sink(request);
+        } else {
+            self.bottom_panel.append_build_log(
+                "No build runner attached: launch Kova via `kova <project-dir>`.",
+                BuildLogKind::Stderr,
+                None,
+            );
+            self.bottom_panel.finish_build(false, 0);
+            self.active_build_run_id = None;
+        }
+        cx.notify();
+    }
+
+    /// Runs all tests in the active project (`Run → Run All Tests`).
+    pub fn run_all_tests_action(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(root) = self.project.root_owned() else {
+            self.set_notice(
+                StatusKind::Warning,
+                "Open a Gradle, Maven, or Cargo project to run tests".to_owned(),
+                cx,
+            );
+            return;
+        };
+        let request = self
+            .test_runner
+            .new_request("All Tests", Vec::new(), Some(root), None);
+        self.start_test_run(request, cx);
+        cx.notify();
+    }
+
+    /// Stops any active build, test run, or debug session (`Cmd+F2` / `Ctrl+F2` / `■`).
+    pub fn stop_active_run_action(&mut self, cx: &mut Context<'_, Self>) {
+        let mut stopped_any = false;
+        if self.debugger.status().is_active() {
+            self.send_debug([DebugCommand::Stop]);
+            stopped_any = true;
+        }
+        if matches!(
+            self.bottom_panel.build_status(),
+            BuildRunStatus::Running { .. }
+        ) {
+            if let Some(cancel) = &self.cancel_run_sink {
+                cancel(CancelRunKind::Build);
+            }
+            self.active_build_run_id = None;
+            self.bottom_panel.append_build_log(
+                "Build stopped by user.",
+                BuildLogKind::Stderr,
+                None,
+            );
+            self.bottom_panel.finish_build(false, 0);
+            stopped_any = true;
+        }
+        if self.test_runner.run().is_some_and(TestRun::is_running) {
+            if let Some(cancel) = &self.cancel_run_sink {
+                cancel(CancelRunKind::Test);
+            }
+            if let Some(run_id) = self.test_runner.request().map(|r| r.run_id) {
+                self.test_runner.apply(
+                    run_id,
+                    vec![TestEvent::RunFinished {
+                        success: false,
+                        message: Some("Test run stopped by user.".to_owned()),
+                    }],
+                );
+            }
+            stopped_any = true;
+        }
+        if stopped_any {
+            cx.notify();
+        }
     }
 
     /// Test Runner state.
@@ -1340,15 +1655,19 @@ impl WorkspaceShell {
             );
             request.vm_options.clone_from(&config.vm_options);
             request.env.clone_from(&config.env);
-            self.start_test_run(request);
+            self.start_test_run(request, cx);
             self.last_run = Some(LastRunTarget::RunConfig(index));
         } else {
             self.last_run = Some(LastRunTarget::RunConfig(index));
-            self.bottom_panel.run_logs.push(format!(
-                "[kova.toml] {} ({}) — only `junit` run configurations execute in this build",
-                config.name,
-                config.summary()
-            ));
+            self.bottom_panel.append_build_log(
+                format!(
+                    "[kova.toml] {} ({}) — only `junit` run configurations execute in this build",
+                    config.name,
+                    config.summary()
+                ),
+                BuildLogKind::Info,
+                None,
+            );
         }
         cx.notify();
     }
@@ -1378,14 +1697,14 @@ impl WorkspaceShell {
             let text = editor.read(cx).shared_buffer().snapshot().text();
             self.run_http_request(&request, &text, cx);
         } else {
-            self.handle_run_request(&request);
+            self.handle_run_request(&request, cx);
         }
         cx.notify();
     }
 
     fn run_last_action(&mut self, cx: &mut Context<'_, Self>) {
         match self.last_run.clone() {
-            Some(LastRunTarget::EntryPoint(req)) => self.handle_run_request(&req),
+            Some(LastRunTarget::EntryPoint(req)) => self.handle_run_request(&req, cx),
             Some(LastRunTarget::HttpRequest { request, file_key }) => {
                 let text = self
                     .documents
@@ -1403,14 +1722,22 @@ impl WorkspaceShell {
                 let req =
                     self.test_runner
                         .new_request(label, targets, self.project.root_owned(), file);
-                self.start_test_run(req);
+                self.start_test_run(req, cx);
             }
             Some(LastRunTarget::RunConfig(idx)) => self.run_configuration(idx, cx),
             None => {
                 if let Some(req) = self.test_runner.rerun_all_request() {
-                    self.start_test_run(req);
+                    self.start_test_run(req, cx);
                 } else if !self.run_configs.is_empty() {
                     self.run_configuration(0, cx);
+                } else if self
+                    .active_editor()
+                    .and_then(|editor| editor.read(cx).debug_entry_point())
+                    .is_some()
+                {
+                    self.run_context_action(cx);
+                } else if self.project.root().is_some() {
+                    self.run_all_tests_action(cx);
                 } else {
                     self.run_context_action(cx);
                 }
@@ -1433,12 +1760,12 @@ impl WorkspaceShell {
         match action {
             TestRunnerAction::RerunAll => {
                 if let Some(request) = self.test_runner.rerun_all_request() {
-                    self.start_test_run(request);
+                    self.start_test_run(request, cx);
                 }
             }
             TestRunnerAction::RerunFailed => {
                 if let Some(request) = self.test_runner.rerun_failed_request() {
-                    self.start_test_run(request);
+                    self.start_test_run(request, cx);
                 }
             }
             TestRunnerAction::OpenFrame(index) => {
@@ -2724,8 +3051,10 @@ impl WorkspaceShell {
             }
             ShellAction::NextProblem => self.jump_adjacent_problem(true, window, cx),
             ShellAction::PrevProblem => self.jump_adjacent_problem(false, window, cx),
+            ShellAction::BuildProject => self.build_project_action(cx),
             ShellAction::RunContext => self.run_context_action(cx),
             ShellAction::RunLast => self.run_last_action(cx),
+            ShellAction::RunAllTests => self.run_all_tests_action(cx),
             ShellAction::OpenSettings => self.open_settings(window, cx),
             ShellAction::ToggleCommitPanel => self.toggle_commit_panel(window, cx),
             ShellAction::GoToDefinition => self.go_to_definition_at(None, window, cx),
@@ -4514,7 +4843,205 @@ impl WorkspaceShell {
     // Rendering
     // ---------------------------------------------------------------------------------------
 
-    fn render_titlebar(&self, p: Palette) -> Div {
+    fn titlebar_run_label(&self) -> String {
+        match &self.last_run {
+            Some(LastRunTarget::TestRun { label, .. }) => label.clone(),
+            Some(LastRunTarget::EntryPoint(req)) => test_label(&req.symbol_name),
+            Some(LastRunTarget::HttpRequest { request, .. }) => request.symbol_name.clone(),
+            Some(LastRunTarget::RunConfig(idx)) => self
+                .run_configs
+                .get(*idx)
+                .map_or_else(|| self.project.name().to_owned(), |c| c.name.clone()),
+            None => {
+                if let Some(first) = self.run_configs.first() {
+                    first.name.clone()
+                } else if let Some(root) = self.project.root() {
+                    match BuildSystemKind::detect(root) {
+                        BuildSystemKind::Gradle => "Gradle".to_owned(),
+                        BuildSystemKind::Maven => "Maven".to_owned(),
+                        BuildSystemKind::Cargo => "Cargo".to_owned(),
+                        BuildSystemKind::Mixed => "Gradle / Maven".to_owned(),
+                        BuildSystemKind::Unknown => self.project.name().to_owned(),
+                    }
+                } else {
+                    "No Project".to_owned()
+                }
+            }
+        }
+    }
+
+    fn is_any_run_active(&self) -> bool {
+        matches!(
+            self.bottom_panel.build_status(),
+            BuildRunStatus::Running { .. }
+        ) || self.test_runner.run().is_some_and(TestRun::is_running)
+            || self.debugger.status().is_active()
+    }
+
+    fn render_titlebar_run_controls(&self, p: Palette, cx: &Context<'_, Self>) -> Div {
+        let building = matches!(
+            self.bottom_panel.build_status(),
+            BuildRunStatus::Running { .. }
+        );
+        let any_running = self.is_any_run_active();
+        let target_label = self.titlebar_run_label();
+
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .id("titlebar-build-project")
+                    .h(px(22.0))
+                    .px(px(7.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(if building {
+                        p.border_focus
+                    } else {
+                        p.border_island
+                    })
+                    .bg(if building { p.active } else { p.island })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(p.hover).border_color(p.text_muted))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.build_project_action(cx);
+                    }))
+                    .child(render_build_hammer_icon(if building {
+                        p.border_focus
+                    } else {
+                        p.text_secondary
+                    })),
+            )
+            .child(
+                div()
+                    .id("titlebar-run-target")
+                    .h(px(22.0))
+                    .px(px(9.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(p.border_island)
+                    .bg(p.island)
+                    .text_size(px(12.0))
+                    .text_color(p.text_primary)
+                    .child(target_label),
+            )
+            .child(
+                div()
+                    .id("titlebar-run")
+                    .h(px(22.0))
+                    .px(px(7.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(p.border_island)
+                    .bg(p.island)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(p.hover).border_color(p.text_muted))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.run_last_action(cx);
+                    }))
+                    .child(render_run_play_icon(p.run_icon)),
+            )
+            .child(Self::render_titlebar_tests_and_stop(p, any_running, cx))
+    }
+
+    fn render_titlebar_tests_and_stop(
+        p: Palette,
+        any_running: bool,
+        cx: &Context<'_, Self>,
+    ) -> Div {
+        let pill = |text: String, bg: Hsla, fg: Hsla| {
+            div()
+                .h(px(22.0))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(p.border_island)
+                .bg(bg)
+                .text_size(px(12.0))
+                .text_color(fg)
+                .child(text)
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .id("titlebar-run-all-tests")
+                    .h(px(22.0))
+                    .px(px(7.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(p.border_island)
+                    .bg(p.island)
+                    .text_size(px(11.5))
+                    .text_color(p.text_secondary)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(p.hover).border_color(p.text_muted))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.run_all_tests_action(cx);
+                    }))
+                    .child(render_run_tests_icon(p.run_icon))
+                    .child("Tests"),
+            )
+            .child(
+                div()
+                    .id("titlebar-stop")
+                    .h(px(22.0))
+                    .px(px(7.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(if any_running {
+                        p.error
+                    } else {
+                        p.border_island
+                    })
+                    .bg(p.island)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(p.hover))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.stop_active_run_action(cx);
+                    }))
+                    .child(render_stop_icon(if any_running {
+                        p.error
+                    } else {
+                        p.text_muted
+                    })),
+            )
+            .child(pill("Islands".to_owned(), p.island, p.text_secondary))
+            .child(
+                pill("⚙  ⌘,".to_owned(), p.island, p.text_muted)
+                    .id("titlebar-settings")
+                    .cursor_pointer()
+                    .hover(|style| style.border_color(p.text_muted))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(OpenSettings), cx);
+                    }),
+            )
+    }
+
+    fn render_titlebar(&self, p: Palette, cx: &Context<'_, Self>) -> Div {
         let pill = |text: String, bg: Hsla, fg: Hsla| {
             div()
                 .h(px(22.0))
@@ -4581,19 +5108,7 @@ impl WorkspaceShell {
                     .child(div().text_color(p.text_muted).child("⌕  Search Everywhere"))
                     .child(div().text_color(p.text_muted).child("⇧⇧")),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        pill(String::new(), p.island, p.text_primary)
-                            .child(div().text_color(p.run_icon).child("▶"))
-                            .child("OrderApp"),
-                    )
-                    .child(pill("Islands".to_owned(), p.island, p.text_secondary))
-                    .child(pill("⚙  ⌘,".to_owned(), p.island, p.text_muted)),
-            )
+            .child(self.render_titlebar_run_controls(p, cx))
     }
 
     fn render_stripe(
@@ -5054,86 +5569,264 @@ impl WorkspaceShell {
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "declarative GPUI layout for build status, run configs, and streaming log view"
+    )]
     fn render_run_body(&self, p: Palette, cx: &Context<'_, Self>) -> Div {
-        let header = div()
-            .h(px(24.0))
+        let (status_label, status_color) = match self.bottom_panel.build_status() {
+            BuildRunStatus::Idle => ("Idle".to_owned(), p.text_muted),
+            BuildRunStatus::Running { label } => (format!("{label}…"), p.border_focus),
+            BuildRunStatus::Finished {
+                success: true,
+                duration_ms,
+            } => (format!("Build succeeded ({duration_ms} ms)"), p.run_icon),
+            BuildRunStatus::Finished {
+                success: false,
+                duration_ms,
+            } => (format!("Build failed ({duration_ms} ms)"), p.error),
+        };
+        let is_building = matches!(
+            self.bottom_panel.build_status(),
+            BuildRunStatus::Running { .. }
+        );
+        let problem_count = self.bottom_panel.problems().len();
+
+        let mut status_bar = div()
+            .h(px(26.0))
             .flex_none()
+            .px(px(10.0))
             .flex()
             .items_center()
-            .gap(px(8.0))
+            .justify_between()
+            .border_b_1()
+            .border_color(p.border_subtle)
             .text_size(px(12.0))
             .child(
                 div()
-                    .text_color(p.text_primary)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Run Configurations (kova.toml)"),
-            )
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(4.0))
+                            .bg(p.input)
+                            .text_color(status_color)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(status_label),
+                    )
+                    .child(
+                        div()
+                            .id("run-build-btn")
+                            .px(px(7.0))
+                            .py(px(2.0))
+                            .rounded(px(4.0))
+                            .text_color(p.text_secondary)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(p.hover))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.build_project_action(cx);
+                            }))
+                            .child("Build (⌘F9)"),
+                    ),
+            );
+
+        let mut right_actions = div().flex().items_center().gap(px(6.0));
+        if problem_count > 0 {
+            right_actions = right_actions.child(
+                div()
+                    .id("run-problems-link")
+                    .px(px(7.0))
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .text_color(if self.bottom_panel.error_count() > 0 {
+                        p.error
+                    } else {
+                        p.warning
+                    })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(p.hover))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.dock_layout.bottom_open = Some(DockToolId::Problems);
+                        this.dock_layout.focus(FocusedRegion::BottomPanel);
+                        cx.notify();
+                    }))
+                    .child(format!("Problems ({problem_count})")),
+            );
+        }
+        if is_building {
+            right_actions = right_actions.child(
+                div()
+                    .id("run-stop-btn")
+                    .px(px(7.0))
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .text_color(p.error)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(p.hover))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.stop_active_run_action(cx);
+                    }))
+                    .child("■ Stop"),
+            );
+        }
+        right_actions = right_actions.child(
+            div()
+                .id("run-clear-logs")
+                .px(px(7.0))
+                .py(px(2.0))
+                .rounded(px(4.0))
+                .text_color(p.text_muted)
+                .cursor_pointer()
+                .hover(|s| s.bg(p.hover))
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.bottom_panel.clear_build_logs();
+                    cx.notify();
+                }))
+                .child("Clear"),
+        );
+        status_bar = status_bar.child(right_actions);
+
+        let configs_strip = div()
+            .flex_none()
+            .px(px(10.0))
+            .py(px(4.0))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.0))
+            .border_b_1()
+            .border_color(p.border_subtle)
+            .text_size(px(11.5))
+            .child(div().text_color(p.text_muted).child("Run Configs:"))
+            .children(self.run_configs.iter().enumerate().map(|(index, config)| {
+                div()
+                    .id(("run-config", index))
+                    .h(px(20.0))
+                    .px(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .rounded(px(4.0))
+                    .bg(p.input)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(p.hover))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.run_configuration(index, cx);
+                    }))
+                    .child(div().text_color(p.run_icon).child("▶"))
+                    .child(div().text_color(p.text_primary).child(config.name.clone()))
+            }))
             .child(
                 div()
                     .id("run-config-edit")
                     .px(px(6.0))
+                    .py(px(1.0))
                     .rounded(px(4.0))
                     .text_color(p.border_focus)
+                    .cursor_pointer()
                     .hover(|s| s.bg(p.hover))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.edit_kova_toml(window, cx);
                     }))
                     .child("Edit kova.toml"),
             );
-        let configs = self.run_configs.iter().enumerate().map(|(index, config)| {
-            div()
-                .id(("run-config", index))
-                .h(px(22.0))
-                .px(px(6.0))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .rounded(px(4.0))
-                .text_size(px(12.0))
-                .hover(|s| s.bg(p.hover))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                    this.run_configuration(index, cx);
-                }))
-                .child(div().text_color(p.run_icon).child("▶"))
-                .child(div().text_color(p.text_primary).child(config.name.clone()))
-                .child(div().text_color(p.text_muted).child(config.summary()))
-        });
+
+        let log_lines: Vec<AnyElement> =
+            if self.bottom_panel.build_logs().is_empty() && self.bottom_panel.run_logs.is_empty() {
+                vec![
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(p.text_muted)
+                        .child("Press Cmd+F9 (or click the hammer icon) to build the project.")
+                        .into_any_element(),
+                ]
+            } else if !self.bottom_panel.build_logs().is_empty() {
+                self.bottom_panel
+                    .build_logs()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, line)| {
+                        let color = match line.kind {
+                            BuildLogKind::Stderr => p.error,
+                            BuildLogKind::Success => p.run_icon,
+                            BuildLogKind::Info => p.text_muted,
+                            BuildLogKind::Stdout => p.text_secondary,
+                        };
+                        let row = div()
+                            .id(("run-log-line", idx))
+                            .w_full()
+                            .text_size(px(12.0))
+                            .font_family("monospace")
+                            .text_color(color);
+                        if let Some((file, line_num, col_num)) = line.target.clone() {
+                            row.cursor_pointer()
+                                .hover(|s| s.bg(p.hover))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.open_path(
+                                        Path::new(&file),
+                                        Some((line_num, col_num)),
+                                        window,
+                                        cx,
+                                    );
+                                }))
+                                .child(line.text.clone())
+                                .into_any_element()
+                        } else {
+                            row.child(line.text.clone()).into_any_element()
+                        }
+                    })
+                    .collect()
+            } else {
+                self.bottom_panel
+                    .run_logs
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, line)| {
+                        div()
+                            .id(("run-legacy-line", idx))
+                            .w_full()
+                            .text_size(px(12.0))
+                            .font_family("monospace")
+                            .text_color(p.text_secondary)
+                            .child(line.clone())
+                            .into_any_element()
+                    })
+                    .collect()
+            };
+
         let mut body = div()
             .flex_1()
-            .p(px(10.0))
+            .min_h(px(0.0))
             .flex()
             .flex_col()
-            .gap(px(2.0))
-            .child(header);
+            .child(status_bar)
+            .child(configs_strip);
         if let Some(err) = &self.run_configs_error {
             body = body.child(
                 div()
+                    .px(px(10.0))
+                    .py(px(2.0))
                     .text_size(px(12.0))
                     .text_color(p.error)
                     .child(err.clone()),
             );
-        } else if self.run_configs.is_empty() {
-            body = body.child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(p.text_muted)
-                    .child("No shared run configurations. Use “＋ kova.toml” in the Tests tab or edit kova.toml."),
-            );
         }
-        body.children(configs).child(
+        body.child(
             div()
-                .mt(px(6.0))
+                .id("run-output")
+                .flex_1()
+                .min_h(px(0.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .overflow_y_scroll()
+                .track_scroll(&self.run_scroll)
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
-                .text_size(px(12.0))
-                .text_color(p.text_secondary)
-                .children(
-                    self.bottom_panel
-                        .run_logs
-                        .iter()
-                        .map(|line| div().child(line.clone())),
-                ),
+                .children(log_lines),
         )
     }
 
@@ -5957,6 +6650,11 @@ impl Render for WorkspaceShell {
             .on_action(cx.listener(Self::toggle_terminal_action))
             .on_action(cx.listener(Self::toggle_git_action))
             .on_action(cx.listener(Self::toggle_focus_mode_action))
+            .on_action(cx.listener(Self::build_project_menu_action))
+            .on_action(cx.listener(Self::run_last_menu_action))
+            .on_action(cx.listener(Self::run_context_menu_action))
+            .on_action(cx.listener(Self::run_all_tests_menu_action))
+            .on_action(cx.listener(Self::stop_run_menu_action))
             .track_focus(&self.focus_handle)
             .capture_key_down(cx.listener(Self::handle_key_capture))
             .on_key_down(cx.listener(Self::handle_key_down))
@@ -5967,8 +6665,20 @@ impl Render for WorkspaceShell {
                 this.handle_completion_outside_click(event, window, cx);
                 this.handle_project_overlay_outside_click(event, window, cx);
             }))
-            .child(self.render_titlebar(p))
+            .child(self.render_titlebar(p, cx))
             .child(workspace);
+        self.attach_overlays(root, p, settings_overlay, cx)
+    }
+}
+
+impl WorkspaceShell {
+    fn attach_overlays(
+        &self,
+        root: Div,
+        p: Palette,
+        settings_overlay: Option<Stateful<Div>>,
+        cx: &Context<'_, Self>,
+    ) -> Div {
         let root = match self.render_completion_overlay(cx) {
             Some(overlay) => root.child(overlay),
             None => root,

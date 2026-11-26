@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use kova_toolchain::{ToolchainEnvOptions, resolve_executable, resolve_toolchain_env};
 use kova_tools::junit::TestId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -273,12 +274,18 @@ impl BspClient {
         project_root: &Path,
     ) -> Result<Self, LspDapError> {
         let program = details.argv.first().cloned().unwrap_or_default();
+        let toolchain_env = resolve_toolchain_env(&ToolchainEnvOptions {
+            project_root: Some(project_root.to_path_buf()),
+            ..ToolchainEnvOptions::default()
+        });
+        let resolved_program = resolve_executable(Path::new(&program), &toolchain_env.path);
         let spawn_failed = |reason: String| LspDapError::SpawnFailed {
             program: program.clone(),
             reason,
         };
-        let mut child = Command::new(&program)
+        let mut child = Command::new(&resolved_program)
             .args(details.argv.iter().skip(1))
+            .envs(&toolchain_env.vars)
             .current_dir(project_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

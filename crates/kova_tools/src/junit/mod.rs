@@ -1,12 +1,19 @@
 //! `JUnit` test runner model (`KOVA-040`): the *Suite → Class → Method* result tree, the JVM
 //! stack trace parser, the `TEST-*.xml` fallback parser and build-tool command lines.
 
+pub mod cargo_test_parser;
+pub mod compiler_parser;
 pub mod launch;
 pub mod model;
 pub mod stacktrace_parser;
 pub mod xml_report;
 
-pub use launch::{BuildTool, TestCommand, build_test_command};
+pub use cargo_test_parser::CargoTestOutputParser;
+pub use compiler_parser::{
+    CargoStdoutLine, CompilerOutputParser, DiagnosticLevel, ParsedCompilerDiagnostic,
+    parse_cargo_json_line,
+};
+pub use launch::{BuildCommand, BuildTool, TestCommand, build_compile_command, build_test_command};
 pub use model::{
     NodeId, NodeKind, OutputKind, OutputLine, OutputStream, RunState, TestCounts, TestEvent,
     TestFilter, TestId, TestNode, TestOutcome, TestRun, TestStatus, VisibleRow,

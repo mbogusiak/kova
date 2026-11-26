@@ -617,6 +617,87 @@ class OrderService extends BaseService {
 }
 
 #[test]
+fn groovy_entry_points_detect_junit_tests_and_ignore_gradle_scripts() {
+    let (engine, _) = setup();
+
+    // Gradle DSL scripts must emit zero entry points.
+    let gradle_src = "\
+plugins {
+    id 'java'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+";
+    let (gradle_snap, gradle_tree) = parse(&engine, SyntaxLanguage::Groovy, gradle_src);
+    assert_eq!(detect_entry_points(&gradle_tree, &gradle_snap).len(), 0);
+
+    // Groovy JUnit 5 test class with @Test, @ParameterizedTest, @Nested, and comments.
+    let test_src = "\
+package com.kova.orders
+
+import org.junit.jupiter.api.Nested
+import org.junit.jupiter.api.Test
+
+class OrderServiceTest {
+    // @Test void commentedOut() {}
+
+    @Test
+    void shouldCreateOrder() {
+        assert true
+    }
+
+    @org.junit.jupiter.api.ParameterizedTest
+    def \"should reject negative amount\"(int amount) {
+        assert amount < 0
+    }
+
+    static void main(String[] args) {
+        println 'main'
+    }
+
+    @Nested
+    class NestedTests {
+        @Test
+        void innerCheck() {
+            assert 1 == 1
+        }
+    }
+}
+";
+    let (test_snap, test_tree) = parse(&engine, SyntaxLanguage::Groovy, test_src);
+    let eps = detect_entry_points(&test_tree, &test_snap);
+    let targets: Vec<(&str, kova_syntax::EntryPointKind)> =
+        eps.iter().map(|ep| (ep.id.as_str(), ep.kind)).collect();
+    assert!(targets.contains(&(
+        "com.kova.orders.OrderServiceTest",
+        kova_syntax::EntryPointKind::JvmTestClass
+    )));
+    assert!(targets.contains(&(
+        "com.kova.orders.OrderServiceTest#shouldCreateOrder",
+        kova_syntax::EntryPointKind::JvmTestMethod
+    )));
+    assert!(targets.contains(&(
+        "com.kova.orders.OrderServiceTest#should reject negative amount",
+        kova_syntax::EntryPointKind::JvmTestMethod
+    )));
+    assert!(targets.contains(&(
+        "com.kova.orders.OrderServiceTest#main",
+        kova_syntax::EntryPointKind::JavaMain
+    )));
+    assert!(targets.contains(&(
+        "com.kova.orders.OrderServiceTest$NestedTests",
+        kova_syntax::EntryPointKind::JvmTestClass
+    )));
+    assert!(targets.contains(&(
+        "com.kova.orders.OrderServiceTest$NestedTests#innerCheck",
+        kova_syntax::EntryPointKind::JvmTestMethod
+    )));
+    assert_eq!(eps.len(), 6);
+}
+
+#[test]
 fn deep_nesting_respects_max_structure_depth() {
     let (engine, _) = setup();
     let mut xml = String::new();

@@ -47,6 +47,8 @@ pub struct JdkDiscoveryRoots {
     pub sdkman_candidates_dir: Option<PathBuf>,
     /// System-wide JVM directories (`/Library/Java/JavaVirtualMachines`, `/usr/lib/jvm`, etc.).
     pub system_dirs: Vec<SystemJvmRoot>,
+    /// Homebrew `opt` roots (`/opt/homebrew/opt`, `/usr/local/opt`) scanned for `openjdk*`.
+    pub homebrew_opt_dirs: Vec<PathBuf>,
     /// `PATH` entries for fallback `java` binary discovery.
     pub path_entries: Vec<PathBuf>,
 }
@@ -78,11 +80,12 @@ impl JdkDiscoveryRoots {
         let sdkman_candidates_dir = home
             .as_ref()
             .map(|h| h.join(".sdkman").join("candidates").join("java"));
-        let path_entries = env_lookup("PATH")
+        let mut path_entries: Vec<PathBuf> = env_lookup("PATH")
             .map(|p| std::env::split_paths(&p).collect())
             .unwrap_or_default();
 
         let mut system_dirs = Vec::new();
+        let mut homebrew_opt_dirs = Vec::new();
         if cfg!(target_os = "macos") {
             system_dirs.push(SystemJvmRoot {
                 dir: PathBuf::from("/Library/Java/JavaVirtualMachines"),
@@ -93,6 +96,14 @@ impl JdkDiscoveryRoots {
                     dir: h.join("Library/Java/JavaVirtualMachines"),
                     source: JdkSource::SystemMacOs,
                 });
+            }
+            homebrew_opt_dirs.push(PathBuf::from("/opt/homebrew/opt"));
+            homebrew_opt_dirs.push(PathBuf::from("/usr/local/opt"));
+            for extra in ["/opt/homebrew/bin", "/usr/local/bin"] {
+                let extra_path = PathBuf::from(extra);
+                if !path_entries.contains(&extra_path) {
+                    path_entries.push(extra_path);
+                }
             }
         } else if cfg!(target_os = "linux") {
             system_dirs.push(SystemJvmRoot {
@@ -111,6 +122,7 @@ impl JdkDiscoveryRoots {
             env_java_home,
             sdkman_candidates_dir,
             system_dirs,
+            homebrew_opt_dirs,
             path_entries,
         }
     }
@@ -171,6 +183,10 @@ pub fn discover_jdks(roots: &JdkDiscoveryRoots) -> Vec<JdkInstallation> {
             &mut seen_homes,
             &mut results,
         );
+    }
+
+    for homebrew_opt in &roots.homebrew_opt_dirs {
+        scan_homebrew_openjdk_dirs(homebrew_opt, &mut seen_homes, &mut results);
     }
 
     for bin_dir in &roots.path_entries {
@@ -320,6 +336,32 @@ fn scan_child_dirs(
             continue;
         }
         try_add_candidate(&child, source, seen_homes, results);
+    }
+}
+
+fn scan_homebrew_openjdk_dirs(
+    opt_root: &Path,
+    seen_homes: &mut HashSet<PathBuf>,
+    results: &mut Vec<JdkInstallation>,
+) {
+    let Ok(entries) = fs::read_dir(opt_root) else {
+        return;
+    };
+    let mut children: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("openjdk"))
+        })
+        .collect();
+    children.sort();
+
+    for child in children {
+        let libexec_bundle = child.join("libexec").join("openjdk.jdk");
+        try_add_candidate(&libexec_bundle, JdkSource::SystemMacOs, seen_homes, results);
+        try_add_candidate(&child, JdkSource::SystemMacOs, seen_homes, results);
     }
 }
 

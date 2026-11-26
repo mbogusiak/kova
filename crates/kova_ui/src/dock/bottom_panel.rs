@@ -110,6 +110,50 @@ pub enum ProblemRow<'a> {
     Entry(usize, &'a ProblemEntry),
 }
 
+/// Overall build execution state shown in the *Run* tool window (`KOVA-058`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BuildRunStatus {
+    /// No build has run yet or state was cleared.
+    #[default]
+    Idle,
+    /// A build is currently executing.
+    Running {
+        /// Human-readable label (e.g. `"Build Project (Gradle)"`).
+        label: String,
+    },
+    /// The build finished.
+    Finished {
+        /// Whether the build succeeded.
+        success: bool,
+        /// Wall-clock duration in milliseconds.
+        duration_ms: u64,
+    },
+}
+
+/// Visual classification of a line in the *Run* output log (`KOVA-058`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuildLogKind {
+    /// Informational / status header line.
+    Info,
+    /// Standard output line.
+    Stdout,
+    /// Standard error or failure message.
+    Stderr,
+    /// Success summary line.
+    Success,
+}
+
+/// One streamed log line inside the *Run* tool window (`KOVA-058`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildLogLine {
+    /// Line text.
+    pub text: String,
+    /// Visual stream / severity classification.
+    pub kind: BuildLogKind,
+    /// Optional clickable source location `(project_relative_or_abs_file, 1_based_line, 1_based_col)`.
+    pub target: Option<(String, usize, usize)>,
+}
+
 /// Headless state for the bottom panel (`Problems`, `Run`, `Terminal`).
 #[derive(Debug, Clone, Default)]
 pub struct BottomPanelModel {
@@ -119,8 +163,12 @@ pub struct BottomPanelModel {
     analysis_problems: Vec<ProblemEntry>,
     /// Compile diagnostics reported by the build server, keyed by file (`KOVA-040`).
     build_problems: std::collections::BTreeMap<String, Vec<ProblemEntry>>,
-    /// Log lines for `Run`.
+    /// Plain log lines for `Run` (legacy/simple callers).
     pub run_logs: Vec<String>,
+    /// Structured streaming build/run log lines (`KOVA-058`).
+    build_logs: Vec<BuildLogLine>,
+    /// Current build status (`KOVA-058`).
+    build_status: BuildRunStatus,
     selected_problem: usize,
 }
 
@@ -153,6 +201,66 @@ impl BottomPanelModel {
         }
         self.rebuild_problems();
         self.select_problem(self.selected_problem);
+    }
+
+    /// Clears all build/compiler diagnostics while keeping editor analysis problems intact.
+    pub fn clear_build_problems(&mut self) {
+        if self.build_problems.is_empty() {
+            return;
+        }
+        self.build_problems.clear();
+        self.rebuild_problems();
+        self.select_problem(self.selected_problem);
+    }
+
+    /// Current build status shown in the *Run* panel.
+    #[must_use]
+    pub const fn build_status(&self) -> &BuildRunStatus {
+        &self.build_status
+    }
+
+    /// Streamed build/run log lines shown in the *Run* panel.
+    #[must_use]
+    pub fn build_logs(&self) -> &[BuildLogLine] {
+        &self.build_logs
+    }
+
+    /// Starts a new build in the *Run* panel, clearing previous build logs.
+    pub fn start_build(&mut self, label: impl Into<String>) {
+        self.build_logs.clear();
+        self.run_logs.clear();
+        self.build_status = BuildRunStatus::Running {
+            label: label.into(),
+        };
+    }
+
+    /// Appends a streamed log line to the *Run* panel.
+    pub fn append_build_log(
+        &mut self,
+        text: impl Into<String>,
+        kind: BuildLogKind,
+        target: Option<(String, usize, usize)>,
+    ) {
+        let text = text.into();
+        self.run_logs.push(text.clone());
+        self.build_logs.push(BuildLogLine { text, kind, target });
+    }
+
+    /// Marks the active build finished with `success` and `duration_ms`.
+    pub fn finish_build(&mut self, success: bool, duration_ms: u64) {
+        self.build_status = BuildRunStatus::Finished {
+            success,
+            duration_ms,
+        };
+    }
+
+    /// Clears build and run logs and resets the build status to [`BuildRunStatus::Idle`].
+    pub fn clear_build_logs(&mut self) {
+        self.build_logs.clear();
+        self.run_logs.clear();
+        if !matches!(self.build_status, BuildRunStatus::Running { .. }) {
+            self.build_status = BuildRunStatus::Idle;
+        }
     }
 
     fn rebuild_problems(&mut self) {
@@ -340,6 +448,41 @@ mod tests {
         assert_eq!(model.error_count(), 1);
         model.set_build_problems("B.java", Vec::new());
         assert_eq!(model.problems().len(), 1);
+    }
+
+    #[test]
+    fn clear_build_problems_preserves_analysis_and_build_logs_track_stream() {
+        let mut model = BottomPanelModel::default();
+        model.set_problems(vec![entry("A.java", 1, ProblemSeverity::Warning)]);
+        model.set_build_problems("B.java", vec![entry("B.java", 4, ProblemSeverity::Error)]);
+        assert_eq!(model.problems().len(), 2);
+
+        model.clear_build_problems();
+        assert_eq!(model.problems().len(), 1);
+        assert_eq!(model.problems()[0].file, "A.java");
+
+        model.start_build("Build Project");
+        assert!(matches!(
+            model.build_status(),
+            BuildRunStatus::Running { label } if label == "Build Project"
+        ));
+        model.append_build_log(
+            "src/Main.rs:3:5: error",
+            BuildLogKind::Stderr,
+            Some(("src/Main.rs".to_owned(), 3, 5)),
+        );
+        assert_eq!(model.build_logs().len(), 1);
+        model.finish_build(false, 420);
+        assert_eq!(
+            model.build_status(),
+            &BuildRunStatus::Finished {
+                success: false,
+                duration_ms: 420
+            }
+        );
+        model.clear_build_logs();
+        assert_eq!(model.build_logs(), []);
+        assert_eq!(model.build_status(), &BuildRunStatus::Idle);
     }
 
     #[test]
