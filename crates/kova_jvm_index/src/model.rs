@@ -95,9 +95,9 @@ pub enum JvmSourceOrigin {
     ProjectSource {
         /// Path relative to `project_root`.
         rel_path: PathBuf,
-        /// 1-based line number of the declaration.
+        /// 0-based line (row) of the declaration, as reported by the source scanner.
         line: u32,
-        /// 1-based column number of the declaration.
+        /// 0-based column of the declaration, as reported by the source scanner.
         column: u32,
     },
     /// Compiled `.class` entry inside a `.jar` or `.zip` library archive.
