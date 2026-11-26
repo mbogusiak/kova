@@ -11,7 +11,19 @@ use std::process::Command;
 
 const UI_CRATES: [&str; 2] = ["kova_app", "kova_ui"];
 
-const EXPECTED_MEMBERS: [&str; 13] = [
+/// Optional reference plugins (KOVA-048): WASM components outside the core.
+const PLUGIN_CRATES: [&str; 4] = [
+    "kova-ai",
+    "kova-database",
+    "kova-kotlin-lsp",
+    "kova-scala-metals",
+];
+
+const EXPECTED_MEMBERS: [&str; 17] = [
+    "kova-ai",
+    "kova-database",
+    "kova-kotlin-lsp",
+    "kova-scala-metals",
     "kova_app",
     "kova_buffer",
     "kova_config",
@@ -27,7 +39,11 @@ const EXPECTED_MEMBERS: [&str; 13] = [
     "kova_ui",
 ];
 
-const EXPECTED_HEADLESS: [&str; 11] = [
+const EXPECTED_HEADLESS: [&str; 15] = [
+    "kova-ai",
+    "kova-database",
+    "kova-kotlin-lsp",
+    "kova-scala-metals",
     "kova_buffer",
     "kova_config",
     "kova_core",
@@ -429,7 +445,7 @@ fn fixture(members: &[&str], edges: &[(&str, &str, Option<&str>)]) -> serde_json
 }
 
 #[test]
-fn workspace_has_exactly_13_members() {
+fn workspace_has_exactly_17_members() {
     let meta = load_workspace_metadata();
     let graph = parse_graph(&meta).expect("failed to parse workspace metadata");
     let mut member_names: Vec<&str> = graph
@@ -438,12 +454,12 @@ fn workspace_has_exactly_13_members() {
         .map(|id| graph.names.get(id).map_or("", String::as_str))
         .collect();
     member_names.sort_unstable();
-    assert_eq!(member_names.len(), 13);
+    assert_eq!(member_names.len(), 17);
     assert_eq!(member_names, EXPECTED_MEMBERS);
 }
 
 #[test]
-fn headless_set_is_exactly_the_expected_11() {
+fn headless_set_is_exactly_the_expected_15() {
     let meta = load_workspace_metadata();
     let graph = parse_graph(&meta).expect("failed to parse workspace metadata");
     let roots = headless_roots(&graph);
@@ -452,8 +468,45 @@ fn headless_set_is_exactly_the_expected_11() {
         .map(|id| graph.names.get(id).map_or("", String::as_str))
         .collect();
     root_names.sort_unstable();
-    assert_eq!(root_names.len(), 11);
+    assert_eq!(root_names.len(), 15);
     assert_eq!(root_names, EXPECTED_HEADLESS);
+}
+
+/// Zero-Bloat Core (KOVA-048): no core, SDK or UI crate may depend on a
+/// reference plugin, directly or transitively, through any dependency kind.
+#[test]
+fn core_and_ui_crates_never_depend_on_reference_plugins() {
+    let meta = load_workspace_metadata();
+    let graph = parse_graph(&meta).expect("failed to parse workspace metadata");
+    let name_of = |id: &str| graph.names.get(id).map_or("", String::as_str).to_owned();
+
+    let mut offenders = Vec::new();
+    for member in &graph.members {
+        let member_name = name_of(member);
+        if PLUGIN_CRATES.contains(&member_name.as_str()) {
+            continue;
+        }
+        let mut seen = HashSet::new();
+        let mut queue = VecDeque::from([member.clone()]);
+        while let Some(current) = queue.pop_front() {
+            for (dep, _) in graph.edges.get(&current).into_iter().flatten() {
+                if !seen.insert(dep.clone()) {
+                    continue;
+                }
+                let dep_name = name_of(dep);
+                if PLUGIN_CRATES.contains(&dep_name.as_str()) {
+                    offenders.push(format!("{member_name} -> {dep_name}"));
+                }
+                queue.push_back(dep.clone());
+            }
+        }
+    }
+    offenders.sort();
+    assert!(
+        offenders.is_empty(),
+        "core/UI crates must not depend on optional plugins:\n{}",
+        offenders.join("\n")
+    );
 }
 
 #[test]

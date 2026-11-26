@@ -1,0 +1,18 @@
+# Metals — optional Scala language pack (KOVA-048).
+# Installed outside the Kova core; the core ships no Scala tooling.
+id          = "kova-scala-metals"
+name        = "Scala (Metals)"
+version     = "0.1.0"
+entrypoint  = "kova_scala_metals.wasm"
+api_version = "0.1.0"
+description = "Optional Scala language pack: Metals adapter, commands and status Tool Window."
+
+[permissions]
+# Detects Scala buffers from the active editor snapshot.
+editor_read   = true
+editor_write  = false
+network       = false
+fs_read       = false
+fs_write      = false
+# The server is described as data; launching it is left to a host-side launcher.
+process_spawn = false
