@@ -461,6 +461,11 @@ action = "git.commit"
 
 [[bindings]]
 context = "Workspace"
+key = ["alt+`", "ctrl+shift+`"]
+action = "git.branches"
+
+[[bindings]]
+context = "Workspace"
 key = "ctrl+shift+k"
 action = "git.push"
 

@@ -91,7 +91,7 @@ use crate::editor::completion::CompletionPopupState;
 use crate::editor::syntax::{EditorSyntax, RunEntryPointRequested};
 use crate::editor::vim::VimKeyResult;
 use crate::editor::{EditorEvent, EditorView, SharedBuffer, is_go_to_def_modifiers};
-use crate::git::CommitPanel;
+use crate::git::{BranchesPopup, CommitPanel};
 use crate::http_runner::HttpResponseView;
 use crate::keymap::{
     CHORD_TIMEOUT, DispatchContext, DispatchOutcome, ExCommand, ExCommandLine, ExLineEvent,
@@ -611,6 +611,12 @@ pub struct WorkspaceShell {
     commit_panel: Option<(Entity<CommitPanel>, Subscription)>,
     /// Whether the `Cmd+K` Commit modal overlay is open.
     commit_panel_open: bool,
+    /// Floating *Git Branches* popup entity and subscription (`KOVA-060`).
+    branches_popup: Option<(Entity<BranchesPopup>, Subscription)>,
+    /// Whether the *Git Branches* modal overlay is open.
+    branches_popup_open: bool,
+    /// Background task reloading unmodified open files after a branch change (`KOVA-060`).
+    branch_reload_task: Option<Task<()>>,
     /// *Search Everywhere* (`Shift+Shift`) modal overlay (`KOVA-050`).
     search_everywhere: SearchEverywhereModal,
     /// *Find in Files* (`Cmd+Shift+F` / `Ctrl+Shift+F`) modal overlay (`KOVA-053`).
@@ -759,6 +765,9 @@ impl WorkspaceShell {
             git_discover_task: None,
             commit_panel: None,
             commit_panel_open: false,
+            branches_popup: None,
+            branches_popup_open: false,
+            branch_reload_task: None,
             search_everywhere: SearchEverywhereModal::new(cx.focus_handle()),
             find_in_files: FindInFilesModal::new(cx.focus_handle()),
             find_in_files_task: None,
@@ -2725,6 +2734,7 @@ impl WorkspaceShell {
     ) {
         let modal_open = self.settings_open
             || self.commit_panel_open
+            || self.branches_popup_open
             || self.open_project_modal.is_some()
             || self.new_item_modal.is_open()
             || self.find_in_files.is_open()
@@ -2864,6 +2874,9 @@ impl WorkspaceShell {
             return true;
         }
         if self.handle_commit_panel_key(keystroke, window, cx) {
+            return true;
+        }
+        if self.handle_branches_popup_key(keystroke, window, cx) {
             return true;
         }
         // *Evaluate Expression* (`Alt+F8`) owns every key while open (`KOVA-041`).
@@ -3062,6 +3075,7 @@ impl WorkspaceShell {
             ShellAction::RunAllTests => self.run_all_tests_action(cx),
             ShellAction::OpenSettings => self.open_settings(window, cx),
             ShellAction::ToggleCommitPanel => self.toggle_commit_panel(window, cx),
+            ShellAction::ToggleBranchesPopup => self.toggle_branches_popup(window, cx),
             ShellAction::GoToDefinition => self.go_to_definition_at(None, window, cx),
             ShellAction::CompleteBasic => {
                 self.trigger_completion(CompletionTriggerKind::Invoked, cx);
@@ -5089,7 +5103,16 @@ impl WorkspaceShell {
                                 window.dispatch_action(Box::new(OpenProject), cx);
                             }),
                     )
-                    .child(pill(branch, p.island, p.text_secondary)),
+                    .child(
+                        pill(branch, p.island, p.text_secondary)
+                            .child(div().text_color(p.text_muted).child("▾"))
+                            .id("titlebar-git-branch")
+                            .cursor_pointer()
+                            .hover(|style| style.border_color(p.text_muted))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.toggle_branches_popup(window, cx);
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -6428,7 +6451,16 @@ impl WorkspaceShell {
             .map(|(kind, text)| div().text_color(kind_color(kind)).child(text));
         left.child(
             div()
+                .id("statusbar-git-branch")
+                .px(px(4.0))
+                .py(px(1.0))
+                .rounded(px(4.0))
                 .text_color(p.text_secondary)
+                .cursor_pointer()
+                .hover(|style| style.bg(p.hover).text_color(p.text_primary))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.toggle_branches_popup(window, cx);
+                }))
                 .child(format!("git: {}", status.git_branch)),
         )
         .child(
@@ -6672,6 +6704,7 @@ impl Render for WorkspaceShell {
             .key_context(WORKSPACE_KEY_CONTEXT)
             .on_action(cx.listener(Self::save_action))
             .on_action(cx.listener(Self::toggle_commit_panel_action))
+            .on_action(cx.listener(Self::toggle_branches_popup_action))
             .on_action(cx.listener(Self::close_tab_action))
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::search_everywhere_action))
@@ -6717,6 +6750,10 @@ impl WorkspaceShell {
             None => root,
         };
         let root = match self.render_commit_overlay() {
+            Some(overlay) => root.child(overlay),
+            None => root,
+        };
+        let root = match self.render_branches_overlay() {
             Some(overlay) => root.child(overlay),
             None => root,
         };

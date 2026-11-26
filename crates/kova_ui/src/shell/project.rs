@@ -612,6 +612,9 @@ impl WorkspaceShell {
 
         self.commit_panel_open = false;
         self.commit_panel = None;
+        self.branches_popup_open = false;
+        self.branches_popup = None;
+        self.branch_reload_task = None;
         self.search_everywhere.close();
         self.find_in_files.close();
         self.find_in_files_task = None;
@@ -891,6 +894,7 @@ impl WorkspaceShell {
     pub(super) fn modal_owns_keys(&self) -> bool {
         self.settings_open
             || self.commit_panel_open
+            || self.branches_popup_open
             || self.open_project_modal.is_some()
             || self.new_item_modal.is_open()
             || self.search_everywhere.is_open()

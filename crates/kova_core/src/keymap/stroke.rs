@@ -210,6 +210,7 @@ impl KeyCode {
             "period" | "dot" => Some(Self::Char('.')),
             "slash" => Some(Self::Char('/')),
             "backslash" => Some(Self::Char('\\')),
+            "grave" | "backtick" => Some(Self::Char('`')),
             _ => {
                 if let Some(num_str) = lower.strip_prefix('f')
                     && let Ok(num) = num_str.parse::<u8>()
@@ -671,6 +672,9 @@ mod tests {
             "cmd+/",
             "cmd+[",
             "cmd+,",
+            "ctrl+v",
+            "cmd+shift+grave",
+            "alt+backtick",
             "alt+enter",
             "shift+f6",
             "f24",

@@ -471,6 +471,21 @@ impl EditorView {
         self.load_git_base_and_blame(repo, rel_path, epoch, cx);
     }
 
+    /// Synchronizes selections and caches after the underlying [`SharedBuffer`] was reloaded
+    /// from disk (for example after switching Git branches).
+    pub fn sync_reloaded_buffer(&mut self, cx: &mut Context<'_, Self>) {
+        if self.state.sync_external_edits() {
+            let snap = self.state.snapshot();
+            self.last_emitted_version = snap.version();
+            self.ensure_primary_cursor_visible();
+            if self.find_bar.is_open() {
+                self.find_bar.recompute(&snap, self.state.primary_head());
+            }
+            self.schedule_git_diff(cx);
+            cx.notify();
+        }
+    }
+
     fn load_git_base_and_blame(
         &mut self,
         repo: Arc<GitRepository>,
