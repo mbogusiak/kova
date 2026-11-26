@@ -22,10 +22,11 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Font, FontFallbacks,
     FontFeatures, FontStyle, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point,
-    Render, ScrollWheelEvent, ShapedLine, SharedString, Styled as _, Window, div, px,
+    Render, ScrollWheelEvent, ShapedLine, SharedString, Styled as _, Task, Window, div, px,
 };
 use kova_buffer::{Buffer, BufferSnapshot, BufferVersion, Motion, SelectionSet};
 use kova_syntax::EntryPoint;
+use kova_tools::git::{GitRepository, gutter_hunks};
 use smallvec::SmallVec;
 
 use crate::editor::element::EditorCanvasElement;
@@ -39,6 +40,7 @@ use crate::editor::viewport::{
     DEFAULT_EDITOR_FONT_SIZE_PX, GutterSlot, SCROLLBAR_RIGHT_MARGIN_PX, ViewportMetrics,
 };
 use crate::editor::vim::{CursorRenderKind, VimBridge, VimKeyResult};
+use crate::git::EditorGitState;
 
 const SCROLL_LINES_MULTIPLIER: f32 = 3.0;
 const SCROLLBAR_HIT_WIDTH_PX: f32 = 12.0;
@@ -168,6 +170,9 @@ pub struct EditorView {
     fold_map: FoldMap,
     fold_pills: Vec<(Bounds<Pixels>, usize)>,
     debug_gutter: DebugGutter,
+    git: EditorGitState,
+    git_base_task: Option<Task<()>>,
+    git_diff_task: Option<Task<()>>,
 }
 
 impl EditorView {
@@ -211,6 +216,9 @@ impl EditorView {
             fold_map: FoldMap::new(),
             fold_pills: Vec::new(),
             debug_gutter: DebugGutter::default(),
+            git: EditorGitState::default(),
+            git_base_task: None,
+            git_diff_task: None,
         }
     }
 
@@ -279,6 +287,99 @@ impl EditorView {
             self.reveal_row(row);
         }
         cx.notify();
+    }
+
+    /// Git gutter and inline blame state for this editor (`KOVA-043`).
+    #[must_use]
+    pub const fn git(&self) -> &EditorGitState {
+        &self.git
+    }
+
+    /// Enables or disables the inline Git blame annotation on the active line.
+    pub fn set_inline_blame(&mut self, enabled: bool, cx: &mut Context<'_, Self>) {
+        if self.git.inline_blame_enabled() != enabled {
+            self.git.set_inline_blame(enabled);
+            cx.notify();
+        }
+    }
+
+    /// Attaches this editor to `rel_path` in `repo` and loads its `HEAD` base and blame on
+    /// the background executor (`KOVA-043`).
+    pub fn attach_git(
+        &mut self,
+        repo: Arc<GitRepository>,
+        rel_path: String,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some((current_repo, current_path)) = self.git.file()
+            && Arc::ptr_eq(&current_repo, &repo)
+            && current_path == rel_path
+        {
+            return;
+        }
+        let epoch = self.git.attach(Arc::clone(&repo), rel_path.clone());
+        self.load_git_base_and_blame(repo, rel_path, epoch, cx);
+    }
+
+    /// Reloads the `HEAD` base and blame after `HEAD` moved (for example after a commit).
+    pub fn refresh_git_base(&mut self, cx: &mut Context<'_, Self>) {
+        let Some((repo, rel_path)) = self.git.file() else {
+            return;
+        };
+        let epoch = self.git.bump_epoch();
+        self.load_git_base_and_blame(repo, rel_path, epoch, cx);
+    }
+
+    fn load_git_base_and_blame(
+        &mut self,
+        repo: Arc<GitRepository>,
+        rel_path: String,
+        epoch: u64,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let load = cx.background_executor().spawn(async move {
+            let base = repo
+                .head_contents(&rel_path)
+                .ok()
+                .flatten()
+                .map_or_else(String::new, |bytes| {
+                    String::from_utf8_lossy(&bytes).into_owned()
+                });
+            let blame = repo.blame(&rel_path).ok();
+            (base, blame)
+        });
+        self.git_base_task = Some(cx.spawn(async move |this, cx| {
+            let (base, blame) = load.await;
+            let _ignored = this.update(cx, |editor, cx| {
+                editor.git.set_base(epoch, Some(base));
+                editor.git.set_blame(epoch, blame);
+                editor.schedule_git_diff(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Schedules a single-flight background gutter diff for the current buffer version.
+    pub fn schedule_git_diff(&mut self, cx: &mut Context<'_, Self>) {
+        let snapshot = self.state.snapshot();
+        let version = snapshot.version().as_u64();
+        let Some((base, epoch)) = self.git.begin_diff(version) else {
+            return;
+        };
+        let diff_job = cx.background_executor().spawn(async move {
+            let current = snapshot.text();
+            gutter_hunks(&base, &current)
+        });
+        self.git_diff_task = Some(cx.spawn(async move |this, cx| {
+            let hunks = diff_job.await;
+            let _ignored = this.update(cx, |editor, cx| {
+                editor.git.finish_diff(version, epoch, hunks);
+                if editor.state.snapshot().version().as_u64() != version {
+                    editor.schedule_git_diff(cx);
+                }
+                cx.notify();
+            });
+        }));
     }
 
     /// Creates an [`EditorView`] initialized from an in-memory UTF-8 string.
@@ -1040,6 +1141,7 @@ impl EditorView {
         let version = self.state.snapshot().version();
         if version != self.last_emitted_version {
             self.last_emitted_version = version;
+            self.schedule_git_diff(cx);
             cx.emit(EditorEvent::Edited);
         }
     }
@@ -1462,6 +1564,7 @@ impl Render for EditorView {
         // A sibling split may have edited the shared document since the last frame.
         if self.state.sync_external_edits() {
             self.last_emitted_version = self.state.snapshot().version();
+            self.schedule_git_diff(cx);
         }
         div()
             .size_full()

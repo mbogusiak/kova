@@ -90,6 +90,18 @@ impl KeymapLayer {
         }
     }
 
+    /// Returns the first single-stroke chord bound to `action` in this layer, used to
+    /// mirror built-in shortcuts (for example `git.commit` → `cmd+k`) into the UI toolkit.
+    #[must_use]
+    pub fn chord_for_action(&self, action: &str) -> Option<&KeyChord> {
+        self.rules.iter().find_map(|rule| match &rule.target {
+            BindingTarget::Action(id) if id.as_str() == action && rule.chord.len() == 1 => {
+                Some(&rule.chord)
+            }
+            _ => None,
+        })
+    }
+
     /// Creates an empty user override layer defaulting to
     /// [`KeymapPresetMode::JetBrains`].
     #[must_use]

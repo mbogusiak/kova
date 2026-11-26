@@ -8,6 +8,7 @@ pub mod debugger;
 pub mod dock;
 pub mod document;
 pub mod editor;
+pub mod git;
 pub mod http_runner;
 pub mod keymap;
 pub mod settings;
@@ -30,6 +31,9 @@ pub use dock::{
 pub use document::{DocumentState, SaveRequest, SaveSink, SaveStatus, SaveTicket, StatusKind};
 pub use editor::shared::SharedBuffer;
 pub use editor::{EditorEvent, EditorView};
+pub use git::{
+    CheckState, CommitPanel, CommitPanelEvent, CommitPanelModel, EditorGitState, StageOp,
+};
 pub use shell::{StartupMetrics, WorkspaceShell};
 pub use terminal::{TerminalDock, TerminalLaunch, TerminalView};
 pub use test_runner::{TestRunRequest, TestRunSink, TestRunnerAction, TestRunnerModel};

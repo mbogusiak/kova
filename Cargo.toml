@@ -45,6 +45,7 @@ cafebabe     = "0.8"
 criterion    = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 crc32fast    = "1"
 flate2       = "1"
+gix          = { version = "0.91", default-features = false, features = ["sha1", "status", "blame", "parallel", "unstable"] }
 gpui         = { version = "0.2.2", default-features = false, features = ["font-kit"] }
 ignore       = "0.4"
 lsp-types    = "0.97"
