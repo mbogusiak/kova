@@ -23,6 +23,7 @@ url            = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio    = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
+zip      = { workspace = true }
 
 [lints]
 workspace = true

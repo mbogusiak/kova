@@ -20,6 +20,8 @@ use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::LspDapError;
+use crate::lsp::diagnostics::DiagnosticsStore;
+use crate::lsp::features::ApplyEditCollector;
 use crate::lsp::session::{
     DefaultServerRequestHandler, LspSession, NotificationHook, ServerRequestHandler,
     SessionOptions, token_to_string,
@@ -103,7 +105,8 @@ pub enum LspEvent {
         /// `true` on `end`.
         finished: bool,
     },
-    /// `textDocument/publishDiagnostics` (parsed in detail in KOVA-037).
+    /// `textDocument/publishDiagnostics`; emitted after [`JdtlsClient::diagnostics`] has been
+    /// updated (KOVA-037).
     DiagnosticsReceived {
         /// Document URI.
         uri: String,
@@ -279,6 +282,7 @@ pub fn build_client_capabilities() -> Value {
 struct ClientShared {
     state: watch::Sender<LspLifecycleState>,
     events: broadcast::Sender<LspEvent>,
+    diagnostics: Arc<DiagnosticsStore>,
 }
 
 impl ClientShared {
@@ -358,6 +362,12 @@ impl ClientShared {
                 });
             }
             "textDocument/publishDiagnostics" => {
+                // Unparsable payloads are skipped: the hook must never block or fail.
+                if let Ok(parsed) =
+                    serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(params.clone())
+                {
+                    self.diagnostics.apply_publish_diagnostics(parsed);
+                }
                 self.emit(LspEvent::DiagnosticsReceived {
                     uri: text("uri").unwrap_or_default(),
                     version: params
@@ -377,6 +387,7 @@ pub struct JdtlsClient {
     session: LspSession,
     shared: Arc<ClientShared>,
     server_handler: Arc<DefaultServerRequestHandler>,
+    apply_edits: Arc<ApplyEditCollector>,
     capabilities: Option<ServerCapabilities>,
     child: tokio::sync::Mutex<Option<Child>>,
     child_pid: Option<u32>,
@@ -476,12 +487,18 @@ impl JdtlsClient {
     {
         let (state, _) = watch::channel(LspLifecycleState::Stopped);
         let (events, _) = broadcast::channel(config.event_capacity.max(1));
-        let shared = Arc::new(ClientShared { state, events });
+        let shared = Arc::new(ClientShared {
+            state,
+            events,
+            diagnostics: Arc::new(DiagnosticsStore::new()),
+        });
         shared.set_state(LspLifecycleState::Starting);
 
         let server_handler = Arc::new(DefaultServerRequestHandler::new(
             config.workspace_settings.clone(),
         ));
+        let apply_edits = Arc::new(ApplyEditCollector::new());
+        server_handler.set_apply_edit_handler(apply_edits.clone());
         let hook_shared = Arc::clone(&shared);
         let hook: NotificationHook = Arc::new(move |n| hook_shared.on_notification(n));
         let handler: Arc<dyn ServerRequestHandler> = server_handler.clone();
@@ -514,6 +531,7 @@ impl JdtlsClient {
             session,
             shared,
             server_handler,
+            apply_edits,
             capabilities: None,
             child: tokio::sync::Mutex::new(child),
             child_pid,
@@ -711,6 +729,19 @@ impl JdtlsClient {
     #[must_use]
     pub fn server_request_handler(&self) -> &Arc<DefaultServerRequestHandler> {
         &self.server_handler
+    }
+
+    /// Diagnostics kept up to date from `textDocument/publishDiagnostics` (KOVA-037).
+    #[must_use]
+    pub fn diagnostics(&self) -> &Arc<DiagnosticsStore> {
+        &self.shared.diagnostics
+    }
+
+    /// Collector of server `workspace/applyEdit` requests used by
+    /// [`crate::lsp::features::apply_code_action`].
+    #[must_use]
+    pub fn apply_edit_collector(&self) -> &Arc<ApplyEditCollector> {
+        &self.apply_edits
     }
 
     /// Project root of this session.
