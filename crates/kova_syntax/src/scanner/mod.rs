@@ -1,4 +1,4 @@
-//! Lightweight, deterministic, single-pass syntax scanners for YAML, XML, and Groovy.
+//! Lightweight, deterministic, single-pass syntax scanners for YAML, XML, Groovy, and SQL.
 //!
 //! These languages do not ship external Tree-sitter C grammars in `Cargo.lock`, so `kova_syntax`
 //! parses them on the same `rayon` worker pool into a [`ScannedDocument`] containing normalized
@@ -6,6 +6,7 @@
 //! bounded syntax diagnostics.
 
 pub(crate) mod groovy;
+pub(crate) mod sql;
 pub(crate) mod xml;
 pub(crate) mod yaml;
 
@@ -464,6 +465,7 @@ pub(crate) fn parse_snapshot(
         SyntaxLanguage::Yaml => yaml::scan(&source, budget)?,
         SyntaxLanguage::Xml => xml::scan(&source, budget)?,
         SyntaxLanguage::Groovy => groovy::scan(&source, budget)?,
+        SyntaxLanguage::Sql => sql::scan(&source, budget)?,
         SyntaxLanguage::Java
         | SyntaxLanguage::Kotlin
         | SyntaxLanguage::Http

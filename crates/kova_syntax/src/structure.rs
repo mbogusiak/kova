@@ -168,7 +168,10 @@ pub fn extract_structure(tree: &SyntaxTree, snapshot: &BufferSnapshot) -> Struct
         SyntaxLanguage::Http => extract_http_roots(root, snapshot),
         SyntaxLanguage::Toml => extract_toml_roots(root, snapshot),
         SyntaxLanguage::Json => extract_json_roots(root, snapshot),
-        SyntaxLanguage::Yaml | SyntaxLanguage::Xml | SyntaxLanguage::Groovy => Vec::new(),
+        SyntaxLanguage::Yaml
+        | SyntaxLanguage::Xml
+        | SyntaxLanguage::Groovy
+        | SyntaxLanguage::Sql => Vec::new(),
     };
 
     StructureOutline {

@@ -52,6 +52,8 @@ pub enum FileIconKind {
     Xml,
     /// Groovy / Gradle script (`.groovy`, `.gradle`).
     Groovy,
+    /// SQL, DDL, `PostgreSQL`, or `HiveQL` script (`.sql`, `.ddl`, `.psql`, `.hql`).
+    Sql,
     /// Rust source (`.rs`).
     Rust,
     /// JSON / JSONC (`.json`, `.jsonc`).
@@ -108,6 +110,7 @@ pub fn file_icon_kind_for(name: &str) -> FileIconKind {
         "yaml" | "yml" => FileIconKind::Yaml,
         "xml" | "pom" | "xsd" => FileIconKind::Xml,
         "groovy" | "gradle" => FileIconKind::Groovy,
+        "sql" | "ddl" | "psql" | "hql" => FileIconKind::Sql,
         "rs" => FileIconKind::Rust,
         "json" | "jsonc" => FileIconKind::Json,
         "toml" => FileIconKind::Toml,
@@ -191,7 +194,7 @@ pub enum TreeActivation {
     OpenFile(PathBuf),
 }
 
-/// Returns the short type badge for a file name (`J`, `T`, `K`, `G`, `Y`, `<>`, `H`, `⚙`, `≡`, `{}`, `·`).
+/// Returns the short type badge for a file name (`J`, `T`, `K`, `G`, `Y`, `<>`, `DB`, `H`, `⚙`, `≡`, `{}`, `·`).
 #[must_use]
 pub fn lang_hint_for(name: &str) -> &'static str {
     let path = Path::new(name);
@@ -218,6 +221,7 @@ pub fn lang_hint_for(name: &str) -> &'static str {
             "groovy" | "gradle" => "G",
             "yaml" | "yml" => "Y",
             "xml" | "pom" | "xsd" => "<>",
+            "sql" | "ddl" | "psql" | "hql" => "DB",
             "http" => "H",
             "toml" => "≡",
             "json" => "{}",
@@ -1034,6 +1038,10 @@ mod tests {
         assert_eq!(lang_hint_for("pom.xml"), "<>");
         assert_eq!(lang_hint_for("artifact.pom"), "<>");
         assert_eq!(lang_hint_for("schema.xsd"), "<>");
+        assert_eq!(lang_hint_for("schema.sql"), "DB");
+        assert_eq!(lang_hint_for("migrations.DDL"), "DB");
+        assert_eq!(lang_hint_for("queries.psql"), "DB");
+        assert_eq!(lang_hint_for("analytics.HQL"), "DB");
         assert_eq!(lang_hint_for("orders.http"), "H");
         assert_eq!(lang_hint_for("kova.toml"), "⚙");
     }
@@ -1242,6 +1250,10 @@ mod tests {
         assert_eq!(file_icon_kind_for("application.yml"), FileIconKind::Yaml);
         assert_eq!(file_icon_kind_for("pom.xml"), FileIconKind::Xml);
         assert_eq!(file_icon_kind_for("build.gradle"), FileIconKind::Groovy);
+        assert_eq!(file_icon_kind_for("schema.sql"), FileIconKind::Sql);
+        assert_eq!(file_icon_kind_for("migrations.DDL"), FileIconKind::Sql);
+        assert_eq!(file_icon_kind_for("queries.psql"), FileIconKind::Sql);
+        assert_eq!(file_icon_kind_for("analytics.HQL"), FileIconKind::Sql);
         assert_eq!(file_icon_kind_for("main.rs"), FileIconKind::Rust);
         assert_eq!(file_icon_kind_for("package.json"), FileIconKind::Json);
         assert_eq!(file_icon_kind_for("Cargo.toml"), FileIconKind::Toml);

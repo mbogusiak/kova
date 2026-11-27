@@ -40,6 +40,8 @@ pub struct ProjectIconPalette {
     pub xml: Hsla,
     /// Groovy / Gradle icon color.
     pub groovy: Hsla,
+    /// SQL / database cylinder icon color.
+    pub sql: Hsla,
     /// Rust icon color.
     pub rust: Hsla,
     /// JSON icon color.
@@ -77,6 +79,7 @@ impl ProjectIconPalette {
                 yaml: hex(0x00F8_7171),
                 xml: hex(0x00E5_A04D),
                 groovy: hex(0x0056_D4DD),
+                sql: hex(0x0060_A5FA),
                 rust: hex(0x00DE_7A48),
                 json: hex(0x00F5_C451),
                 toml: hex(0x007D_D3FC),
@@ -100,6 +103,7 @@ impl ProjectIconPalette {
                 yaml: hex(0x00DC_2626),
                 xml: hex(0x00C2_410C),
                 groovy: hex(0x000E_7490),
+                sql: hex(0x001D_4ED8),
                 rust: hex(0x00C2_410C),
                 json: hex(0x00B4_5309),
                 toml: hex(0x0002_84C7),
@@ -448,6 +452,41 @@ pub fn render_file_icon(
                 ox,
                 oy,
             );
+        }
+        FileIconKind::Sql => {
+            let color = tint(p.sql);
+            // 3-ring database cylinder using cubic Bézier ellipses and vertical walls.
+            let mut builder = PathBuilder::stroke(px(1.25));
+            builder.move_to(pt(ox, oy, 3.0, 4.3));
+            builder.cubic_bezier_to(
+                pt(ox, oy, 13.0, 4.3),
+                pt(ox, oy, 4.8, 2.4),
+                pt(ox, oy, 11.2, 2.4),
+            );
+            builder.cubic_bezier_to(
+                pt(ox, oy, 3.0, 4.3),
+                pt(ox, oy, 11.2, 6.2),
+                pt(ox, oy, 4.8, 6.2),
+            );
+            builder.move_to(pt(ox, oy, 3.0, 4.3));
+            builder.line_to(pt(ox, oy, 3.0, 11.8));
+            builder.move_to(pt(ox, oy, 13.0, 4.3));
+            builder.line_to(pt(ox, oy, 13.0, 11.8));
+            builder.move_to(pt(ox, oy, 3.0, 8.0));
+            builder.cubic_bezier_to(
+                pt(ox, oy, 13.0, 8.0),
+                pt(ox, oy, 4.8, 9.8),
+                pt(ox, oy, 11.2, 9.8),
+            );
+            builder.move_to(pt(ox, oy, 3.0, 11.8));
+            builder.cubic_bezier_to(
+                pt(ox, oy, 13.0, 11.8),
+                pt(ox, oy, 4.8, 13.6),
+                pt(ox, oy, 11.2, 13.6),
+            );
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, color);
+            }
         }
         FileIconKind::Rust => {
             let color = tint(p.rust);
