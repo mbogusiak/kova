@@ -1,8 +1,8 @@
 //! Project switching, interactive *Open Project* dialog flow, and native menu commands
 //! of [`WorkspaceShell`] (`KOVA-049`, `KOVA-054`).
 //!
-//! `File → Open Project…`, `File → Recent Projects`, and the titlebar project pill route
-//! through [`WorkspaceShell::request_open_project`]. Direct callers of
+//! `File → Open Project…`, `File → Recent Projects`, and the titlebar project dropdown
+//! (`KOVA-065`) route through [`WorkspaceShell::request_open_project`]. Direct callers of
 //! [`WorkspaceShell::switch_project`] keep the safe-by-default dirty check, while
 //! [`WorkspaceShell::switch_project_discarding`] discards unsaved edits after explicit
 //! user confirmation.
@@ -586,6 +586,7 @@ impl WorkspaceShell {
         self.close_after_save = None;
         self.open_project_modal = None;
         self.pending_project_switch = None;
+        self.project_dropdown = None;
         self.ex_line = None;
         self.analysis_task = None;
         self.project_task = None;

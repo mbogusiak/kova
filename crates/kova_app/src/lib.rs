@@ -329,6 +329,8 @@ pub(crate) struct AppHostState {
     pub(crate) process_tx: mpsc::UnboundedSender<ProcessEvent>,
     pub(crate) registry:
         WindowRegistry<WindowId, WindowHandle<WorkspaceShell>, mpsc::UnboundedSender<AppEvent>>,
+    /// Latest `Recent Projects` list, seeded into windows opened later (`KOVA-065`).
+    pub(crate) recent_projects: Vec<kova_core::RecentProject>,
 }
 
 impl gpui::Global for AppHostState {}
@@ -529,7 +531,10 @@ pub fn handle_app_event(
         AppEvent::Debug { session_id, update } => {
             shell.apply_debug_update(session_id, update, window, cx);
         }
-        AppEvent::RecentProjects(Ok(recent)) => menus::refresh_menus(&recent, cx),
+        AppEvent::RecentProjects(Ok(recent)) => {
+            menus::refresh_menus(&recent, cx);
+            shell.set_recent_projects(recent, cx);
+        }
         AppEvent::RecentProjects(Err(message)) => shell.set_notice(
             StatusKind::Warning,
             format!("Recent Projects unavailable: {message}"),
@@ -625,7 +630,7 @@ fn handle_process_event(event: ProcessEvent, cx: &mut App) {
                 }));
             }
         }
-        ProcessEvent::RecentProjects(Ok(recent)) => menus::refresh_menus(&recent, cx),
+        ProcessEvent::RecentProjects(Ok(recent)) => menus::broadcast_recent_projects(recent, cx),
         ProcessEvent::RecentProjects(Err(message)) => {
             if let Some((window, _)) = resolve_target_window(cx) {
                 drop(window.update(cx, |shell, _, cx| {
@@ -641,7 +646,7 @@ fn handle_process_event(event: ProcessEvent, cx: &mut App) {
     }
 }
 
-fn handle_project_host_command(command: ProjectHostCommand, cx: &mut App) {
+pub(crate) fn handle_project_host_command(command: ProjectHostCommand, cx: &mut App) {
     let (runtime, process_tx) = {
         let host = cx.global::<AppHostState>();
         (host.runtime.clone(), host.process_tx.clone())
@@ -765,6 +770,7 @@ pub fn open_workspace_window(
 
     let runtime_for_shell = runtime;
     let events_for_shell = events_tx.clone();
+    let recent_projects = cx.global::<AppHostState>().recent_projects.clone();
     let window = cx
         .open_window(default_window_options(cx), move |_, cx| {
             cx.activate(true);
@@ -776,6 +782,7 @@ pub fn open_workspace_window(
                     &events_for_shell,
                     project_host_sink,
                 );
+                shell.set_recent_projects(recent_projects, cx);
                 match project_root {
                     Some(root) => shell.with_project_root(root),
                     None => shell,
@@ -891,6 +898,7 @@ fn launch_initial_app(
         runtime: runtime_handle.clone(),
         process_tx: process_tx.clone(),
         registry: WindowRegistry::new(),
+        recent_projects: Vec::new(),
     });
 
     cx.on_window_closed(|cx| {

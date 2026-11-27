@@ -27,6 +27,8 @@ gpui::actions!(
     [
         /// Opens the native directory picker and switches the window to the chosen project.
         OpenProject,
+        /// Opens the native directory picker and opens the chosen project in a new window.
+        OpenProjectInNewWindow,
         /// Opens the native file picker and shows the chosen file in the editor.
         OpenFile,
         /// Forgets every entry of `File → Recent Projects`.
