@@ -20,6 +20,7 @@ members = [
     "plugins/kova-kotlin-lsp",  # Opcjonalny pakiet językowy: Kotlin LSP
     "plugins/kova-scala-metals", # Opcjonalny pakiet językowy: Scala (Metals)
 ]
+exclude = ["vendor/xattr"]      # Załatany crate zewnętrzny (patrz [patch.crates-io]), nie członek workspace
 
 [workspace.package]
 version      = "0.1.0"
@@ -125,3 +126,9 @@ exit                            = "warn"
 mem_forget                      = "warn"
 undocumented_unsafe_blocks      = "warn"
 wildcard_dependencies           = "warn"
+
+# xattr 0.2.3 (tranzytywnie: gpui -> gpui_http_client -> zed-async-tar) odwołuje się do
+# `libc::ENOATTR`, którego libc >= 0.2.191 nie eksportuje już na Linuksie/Androidzie.
+# Kopia w vendor/xattr używa tam `libc::ENODATA` (to samo errno); macOS/BSD bez zmian.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
