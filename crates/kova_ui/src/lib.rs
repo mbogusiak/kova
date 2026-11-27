@@ -23,8 +23,8 @@ pub mod theme;
 
 pub use debugger::{
     BreakpointIcon, BreakpointSpec, DebugCommand, DebugCommandSink, DebugLaunchRequest, DebugStep,
-    DebugUpdate, DebuggerModel, DebuggerStatus, EvaluateTarget, FrameItem, ThreadItem,
-    VariableItem,
+    DebugTargetKind, DebugUpdate, DebuggerModel, DebuggerStatus, EvaluateTarget, FrameItem,
+    ThreadItem, VariableItem,
 };
 pub use dock::{
     BadgeVariant, BottomPanelModel, BottomTab, BuildLogKind, BuildLogLine, BuildRunStatus,

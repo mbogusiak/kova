@@ -116,6 +116,67 @@ pub fn plan_build_backend(request: &BuildRequest) -> Option<BuildBackend> {
     )))
 }
 
+/// Finds the nearest enclosing Gradle/Maven submodule relative to `project_root` for `file`
+/// (excluding `project_root` itself).
+#[must_use]
+pub fn resolve_submodule_for_file(project_root: &Path, file: Option<&Path>) -> Option<PathBuf> {
+    let target = file?;
+    if !target.starts_with(project_root) {
+        return None;
+    }
+    let build_files = match BuildTool::detect(project_root) {
+        Some(BuildTool::Gradle) => ["build.gradle", "build.gradle.kts"].as_slice(),
+        Some(BuildTool::Maven) => ["pom.xml"].as_slice(),
+        _ => ["build.gradle", "build.gradle.kts", "pom.xml"].as_slice(),
+    };
+    let mut cur = Some(target);
+    while let Some(dir) = cur {
+        if dir == project_root {
+            break;
+        }
+        if build_files.iter().any(|f| dir.join(f).is_file()) {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// Applies submodule scoping (`:sub:test` for Gradle, `-pl sub` for Maven) to a [`TestCommand`].
+pub fn apply_submodule_scope(command: &mut TestCommand, project_root: &Path, submodule: &Path) {
+    let Ok(rel) = submodule.strip_prefix(project_root) else {
+        return;
+    };
+    let parts: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return;
+    }
+    match command.tool {
+        BuildTool::Gradle => {
+            if command.args.first().is_some_and(|a| a == "test") {
+                command.args[0] = format!(":{}:test", parts.join(":"));
+            }
+        }
+        BuildTool::Maven => {
+            let module_arg = parts.join("/");
+            command.args.insert(1, module_arg);
+            command.args.insert(1, "-pl".to_owned());
+        }
+        BuildTool::Cargo => {}
+    }
+    for dir in report_dirs(submodule) {
+        if !command.report_dirs.contains(&dir) {
+            command.report_dirs.push(dir);
+        }
+    }
+}
+
 /// Chooses the test backend for `request` (BSP connection first for JVM projects, then the
 /// detected or configured build tool).
 #[must_use]
@@ -140,6 +201,11 @@ pub fn plan_test_backend(request: &TestRunRequest) -> Option<TestBackend> {
     } else {
         module_report_dirs(&request.project_root)
     };
+    if let Some(submodule) =
+        resolve_submodule_for_file(&request.project_root, request.file.as_deref())
+    {
+        apply_submodule_scope(&mut command, &request.project_root, &submodule);
+    }
     Some(TestBackend::Cli(command))
 }
 
@@ -974,5 +1040,60 @@ fi
             BspEvent::Test(TestEvent::TestFinished { id, outcome })
                 if id.method.as_deref() == Some("fails") && outcome.status == kova_tools::junit::TestStatus::Failed
         )));
+    }
+
+    #[test]
+    fn plans_submodule_scoped_gradle_and_maven_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("settings.gradle.kts"), "").unwrap();
+        let sub = tmp.path().join("services/orders");
+        let test_file = sub.join("src/test/groovy/com/kova/OrderSpec.groovy");
+        std::fs::create_dir_all(test_file.parent().unwrap()).unwrap();
+        std::fs::write(sub.join("build.gradle.kts"), "").unwrap();
+        std::fs::write(&test_file, "").unwrap();
+
+        let req = TestRunRequest {
+            project_root: tmp.path().to_path_buf(),
+            targets: vec!["com.kova.OrderSpec#creates $10".to_owned()],
+            file: Some(test_file.clone()),
+            ..TestRunRequest::default()
+        };
+        let Some(TestBackend::Cli(gradle)) = plan_test_backend(&req) else {
+            panic!("expected Gradle CLI backend");
+        };
+        assert_eq!(
+            gradle.args,
+            vec![
+                ":services:orders:test",
+                "--tests",
+                "com.kova.OrderSpec.creates $10",
+                "--continue",
+                "--console=plain",
+            ]
+        );
+        assert!(
+            gradle
+                .report_dirs
+                .contains(&sub.join("build/test-results/test"))
+        );
+
+        std::fs::write(tmp.path().join("pom.xml"), "<project/>").unwrap();
+        std::fs::write(sub.join("pom.xml"), "<project/>").unwrap();
+        let maven_req = TestRunRequest {
+            project_root: tmp.path().to_path_buf(),
+            targets: Vec::new(),
+            file: Some(sub.clone()),
+            build_tool: Some(BuildTool::Maven),
+            ..TestRunRequest::default()
+        };
+        let Some(TestBackend::Cli(maven)) = plan_test_backend(&maven_req) else {
+            panic!("expected Maven CLI backend");
+        };
+        assert_eq!(maven.args, vec!["test", "-pl", "services/orders", "-B"]);
+        assert!(
+            maven
+                .report_dirs
+                .contains(&sub.join("target/surefire-reports"))
+        );
     }
 }

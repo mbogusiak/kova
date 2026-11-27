@@ -891,6 +891,13 @@ impl WorkspaceShell {
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.click_project_tree_row(row, window, cx);
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_project_context_menu(row, event.position, window, cx);
+                        }),
+                    )
                     .child(inner)
             })
             .collect()

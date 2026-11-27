@@ -335,4 +335,32 @@ mod tests {
         let (events, _) = collect_reports(&dirs, Some(future));
         assert_eq!(events.len(), 0);
     }
+
+    #[test]
+    fn parses_spock_feature_and_unroll_names_with_spaces_and_symbols() {
+        let spock_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.kova.spock.OrderSpec" tests="2" skipped="0" failures="0" errors="0" time="0.05">
+  <testcase name="should cost $10 (#1)" classname="com.kova.spock.OrderSpec" time="0.02"/>
+  <testcase name="should place order [item: book, #0]" classname="com.kova.spock.OrderSpec" time="0.03"/>
+</testsuite>
+"#;
+        let events = parse_junit_xml(spock_xml, None).unwrap();
+        let mut run = TestRun::new("OrderSpec", Vec::new());
+        run.apply_batch(events);
+        assert_eq!(run.counts().passed, 2);
+        assert!(
+            run.find(&TestId::method(
+                "com.kova.spock.OrderSpec",
+                "should cost $10 (#1)"
+            ))
+            .is_some()
+        );
+        assert!(
+            run.find(&TestId::method(
+                "com.kova.spock.OrderSpec",
+                "should place order [item: book, #0]"
+            ))
+            .is_some()
+        );
+    }
 }

@@ -162,7 +162,32 @@ pub fn build_compile_command(
     }
 }
 
-/// Builds the command running `targets` (`Class`, `Class#method`; empty = all tests).
+/// Formats a `JUnit` or `Spock` test target (`Class`, `Class#method`, `Outer$Inner#method`, or
+/// `pkg.*`) into a Gradle `--tests` filter without corrupting `$` or `#` inside Spock method names.
+#[must_use]
+pub fn format_gradle_test_filter(target: &str) -> String {
+    if let Some((class_part, method_part)) = target.split_once('#')
+        && !method_part.is_empty()
+    {
+        format!("{}.{method_part}", class_part.replace('$', "."))
+    } else {
+        target.replace('$', ".")
+    }
+}
+
+/// Formats a test target (`Class`, `Class#method`, or package pattern `pkg.*`) for Maven Surefire
+/// `-Dtest=...`.
+#[must_use]
+pub fn format_maven_test_filter(target: &str) -> String {
+    if !target.contains('#')
+        && let Some(pkg) = target.strip_suffix(".*")
+    {
+        return format!("{}/**", pkg.replace('.', "/"));
+    }
+    target.to_owned()
+}
+
+/// Builds the command running `targets` (`Class`, `Class#method`, `pkg.*`; empty = all tests).
 ///
 /// Gradle uses `test --tests 'Class.method' --console=plain`; Maven uses
 /// `test -Dtest=Class#method,Other -Dsurefire.failIfNoSpecifiedTests=false -B` so a filter
@@ -183,7 +208,7 @@ pub fn build_test_command(
             args.push("test".to_owned());
             for target in targets {
                 args.push("--tests".to_owned());
-                args.push(target.replace(['#', '$'], "."));
+                args.push(format_gradle_test_filter(target));
             }
             if !vm_options.is_empty() {
                 args.push(format!("-Dorg.gradle.jvmargs={}", vm_options.join(" ")));
@@ -198,7 +223,11 @@ pub fn build_test_command(
         BuildTool::Maven => {
             args.push("test".to_owned());
             if !targets.is_empty() {
-                args.push(format!("-Dtest={}", targets.join(",")));
+                let formatted: Vec<String> = targets
+                    .iter()
+                    .map(|t| format_maven_test_filter(t))
+                    .collect();
+                args.push(format!("-Dtest={}", formatted.join(",")));
                 args.push("-Dsurefire.failIfNoSpecifiedTests=false".to_owned());
             }
             if !vm_options.is_empty() {
@@ -340,5 +369,60 @@ mod tests {
             vec!["test", "--no-fail-fast", "suite::tests::it_works"]
         );
         assert_eq!(cargo_test.report_dirs, Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn gradle_and_maven_preserve_spock_method_names_and_package_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gradle = build_test_command(
+            BuildTool::Gradle,
+            tmp.path(),
+            &[
+                "com.example.OrderSpec#should cost $10 (#1)".to_owned(),
+                "com.example.Outer$InnerSpec#handles spaces".to_owned(),
+                "com.example.orders.*".to_owned(),
+            ],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            gradle.args,
+            vec![
+                "test",
+                "--tests",
+                "com.example.OrderSpec.should cost $10 (#1)",
+                "--tests",
+                "com.example.Outer.InnerSpec.handles spaces",
+                "--tests",
+                "com.example.orders.*",
+                "--continue",
+                "--console=plain",
+            ]
+        );
+        assert!(
+            gradle
+                .display()
+                .contains("--tests 'com.example.OrderSpec.should cost $10 (#1)'")
+        );
+
+        let maven = build_test_command(
+            BuildTool::Maven,
+            tmp.path(),
+            &[
+                "com.example.OrderSpec#should cost $10 (#1)".to_owned(),
+                "com.example.orders.*".to_owned(),
+            ],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            maven.args,
+            vec![
+                "test",
+                "-Dtest=com.example.OrderSpec#should cost $10 (#1),com/example/orders/**",
+                "-Dsurefire.failIfNoSpecifiedTests=false",
+                "-B",
+            ]
+        );
     }
 }

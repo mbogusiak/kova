@@ -12,6 +12,8 @@ use gpui::{
     AnyElement, Context, Div, IntoElement, ParentElement, Styled, Window, div, px, relative,
 };
 
+use kova_syntax::{EntryPoint, EntryPointKind};
+
 use super::{Palette, WorkspaceShell};
 use crate::debugger::evaluate_modal::{self, EvaluateButton, EvaluateKeyOutcome};
 use crate::debugger::{
@@ -176,11 +178,40 @@ impl WorkspaceShell {
             );
             return;
         };
+        let path = self.active_document_key();
+        self.start_debug_for_entry_point(&entry, path, cx);
+    }
+
+    /// Starts a debug session for an explicit `entry` (`main` class or `JUnit`/`Spock` test).
+    pub(super) fn start_debug_for_entry_point(
+        &mut self,
+        entry: &EntryPoint,
+        file_path: Option<PathBuf>,
+        cx: &mut Context<'_, Self>,
+    ) {
         let target = entry.qualified_target();
-        let label = target.rsplit('.').next().unwrap_or(&target).to_owned();
-        let command = self
-            .debugger
-            .start(label, target, None, self.project.root_owned());
+        let command = match entry.kind {
+            EntryPointKind::JvmTestClass | EntryPointKind::JvmTestMethod => {
+                self.save_dirty_project_files(cx);
+                let label = super::test_label(&target);
+                let abs_file = file_path.map(|path| self.debug_abs_path(&path));
+                self.debugger
+                    .start_test(label, target, abs_file, self.project.root_owned())
+            }
+            EntryPointKind::JavaMain | EntryPointKind::KotlinMain => {
+                let label = target.rsplit('.').next().unwrap_or(&target).to_owned();
+                self.debugger
+                    .start(label, target, None, self.project.root_owned())
+            }
+            EntryPointKind::HttpRequest => {
+                self.set_notice(
+                    StatusKind::Info,
+                    "HTTP requests cannot be debugged; use Send".to_owned(),
+                    cx,
+                );
+                return;
+            }
+        };
         self.dock_layout.bottom_open = Some(DockToolId::Debug);
         self.send_debug([command]);
         self.refresh_debug_gutters(cx);
