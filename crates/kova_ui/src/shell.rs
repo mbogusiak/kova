@@ -50,6 +50,7 @@ mod debug;
 mod git;
 mod open_project_modal;
 mod project;
+mod project_dropdown;
 mod project_panel;
 
 use context_menu::ContextMenuState;
@@ -62,12 +63,18 @@ pub use project::{
     OpenProjectRequestOutcome, PendingProjectSwitch, SwitchProjectError, SwitchProjectMode,
     canonicalize_or_raw, paths_match,
 };
+use project_dropdown::ProjectDropdownState;
+pub use project_dropdown::{
+    NO_RECENT_PROJECTS_PLACEHOLDER, PROJECT_DROPDOWN_WIDTH_PX, ProjectDropdownAction,
+    ProjectDropdownKeyOutcome, ProjectDropdownModel, ProjectDropdownRow, RECENT_PROJECTS_HEADER,
+    abbreviate_home, dropdown_origin,
+};
 use project_panel::NewProjectItemModal;
 pub use project_panel::{
     NewEntryKind, NewItemKeyOutcome, NewProjectItemState, create_project_item_on_disk,
 };
 
-use crate::app_menu::{OpenProject, OpenSettings, SearchEverywhere};
+use crate::app_menu::{OpenSettings, SearchEverywhere};
 use crate::debugger::{DebugCommand, DebugCommandSink, DebuggerModel};
 use crate::dock::bottom_panel::BOTTOM_TAB_BAR_HEIGHT_PX;
 use crate::dock::focus::{
@@ -566,6 +573,12 @@ pub struct WorkspaceShell {
     pending_project_switch: Option<PendingProjectSwitch>,
     /// Host callback coordinating `Recent Projects` and multi-window opens (`KOVA-054`).
     project_host_sink: Option<ProjectHostSink>,
+    /// `Recent Projects` list pushed by the host (`KOVA-065`).
+    recent_projects: Vec<kova_core::RecentProject>,
+    /// Open titlebar project dropdown (`KOVA-065`).
+    project_dropdown: Option<ProjectDropdownState>,
+    /// Bounds of the titlebar project pill captured at paint (dropdown anchor).
+    project_pill_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Settings overlay state, created lazily on the first `Cmd+,` (`KOVA-029`).
     settings_view: Option<SettingsView>,
     /// Whether the Settings overlay is visible.
@@ -749,6 +762,9 @@ impl WorkspaceShell {
             open_project_modal: None,
             pending_project_switch: None,
             project_host_sink: None,
+            recent_projects: Vec::new(),
+            project_dropdown: None,
+            project_pill_bounds: Rc::new(Cell::new(None)),
             settings_view: None,
             settings_open: false,
             settings_source: None,
@@ -2902,6 +2918,9 @@ impl WorkspaceShell {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> bool {
+        if self.handle_project_dropdown_key(keystroke, window, cx) {
+            return true;
+        }
         if self.handle_context_menu_key(keystroke, window, cx) {
             return true;
         }
@@ -5105,6 +5124,10 @@ impl WorkspaceShell {
             )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single GPUI element tree for the titlebar pills and search field"
+    )]
     fn render_titlebar(&self, p: Palette, cx: &Context<'_, Self>) -> Div {
         let pill = |text: String, bg: Hsla, fg: Hsla| {
             div()
@@ -5152,18 +5175,32 @@ impl WorkspaceShell {
                                     .child("Kova"),
                             ),
                     )
-                    .child(
-                        // Clickable project breadcrumb: `File → Open Project…` (`KOVA-049`).
-                        pill(self.project.name().to_owned(), p.island, p.text_primary)
+                    .child({
+                        // Project pill: toggles the `Recent Projects` dropdown (`KOVA-065`).
+                        let pill_bounds = Rc::clone(&self.project_pill_bounds);
+                        let open = self.project_dropdown.is_some();
+                        let pill_bg = if open { p.hover } else { p.island };
+                        pill(self.project.name().to_owned(), pill_bg, p.text_primary)
+                            .relative()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(div().text_color(p.text_muted).child("▾"))
+                            .child(
+                                gpui::canvas(
+                                    move |bounds, _, _| pill_bounds.set(Some(bounds)),
+                                    |_, (), _, _| {},
+                                )
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full(),
+                            )
                             .id("titlebar-open-project")
                             .cursor_pointer()
                             .hover(|style| style.border_color(p.text_muted))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(OpenProject), cx);
-                            }),
-                    )
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.toggle_project_dropdown(window, cx);
+                            }))
+                    })
                     .child(
                         pill(branch, p.island, p.text_secondary)
                             .child(div().text_color(p.text_muted).child("▾"))
@@ -6799,6 +6836,7 @@ impl Render for WorkspaceShell {
             }))
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.handle_context_menu_outside_click(event, cx);
+                this.handle_project_dropdown_outside_click(event, cx);
                 this.handle_completion_outside_click(event, window, cx);
                 this.handle_project_overlay_outside_click(event, window, cx);
             }))
@@ -6821,6 +6859,10 @@ impl WorkspaceShell {
             None => root,
         };
         let root = match self.render_context_menu_overlay(p, cx) {
+            Some(overlay) => root.child(overlay),
+            None => root,
+        };
+        let root = match self.render_project_dropdown_overlay(p, cx) {
             Some(overlay) => root.child(overlay),
             None => root,
         };

@@ -11,7 +11,8 @@ use gpui::{App, PathPromptOptions, WindowHandle, WindowId};
 use kova_config::KovaPaths;
 use kova_core::{MAX_RECENT_PROJECTS_IN_MENU, RecentProject, RecentProjectsStore};
 use kova_ui::app_menu::{
-    ClearRecentProjects, OpenFile, OpenProject, OpenRecentProject, Quit, app_menus, bind_menu_keys,
+    ClearRecentProjects, OpenFile, OpenProject, OpenProjectInNewWindow, OpenRecentProject, Quit,
+    app_menus, bind_menu_keys,
 };
 use kova_ui::{StatusKind, WorkspaceShell};
 use tokio::runtime::Handle;
@@ -33,7 +34,9 @@ pub enum RecentProjectsUpdate {
     Clear,
 }
 
-/// Applies `update` to the store under `paths` and returns the menu entries afterwards.
+/// Applies `update` to the store under `paths` and returns every remembered project whose
+/// directory still exists, most recent first (the titlebar dropdown shows them all, the native
+/// menu truncates to [`MAX_RECENT_PROJECTS_IN_MENU`]).
 ///
 /// # Errors
 ///
@@ -53,7 +56,7 @@ pub fn apply_recent_update(
         }
         RecentProjectsUpdate::Clear => store.clear().map_err(|err| err.to_string())?,
     }
-    Ok(store.menu_entries(MAX_RECENT_PROJECTS_IN_MENU))
+    Ok(store.menu_entries(usize::MAX))
 }
 
 /// Runs `update` on the blocking pool and reports [`ProcessEvent::RecentProjects`].
@@ -87,6 +90,10 @@ pub fn install(cx: &mut App) {
         prompt_and_open_project(cx);
     });
 
+    cx.on_action(|_: &OpenProjectInNewWindow, cx| {
+        prompt_and_open_project_in_new_window(cx);
+    });
+
     cx.on_action(|action: &OpenRecentProject, cx| {
         open_project(action.path.clone(), None, cx);
     });
@@ -104,9 +111,35 @@ pub fn install(cx: &mut App) {
     });
 }
 
-/// Rebuilds the menu bar from the latest `Recent Projects` entries.
+/// Rebuilds the menu bar from the latest `Recent Projects` entries (first
+/// [`MAX_RECENT_PROJECTS_IN_MENU`] only).
 pub fn refresh_menus(recent: &[RecentProject], cx: &mut App) {
-    cx.set_menus(app_menus(recent));
+    cx.set_menus(app_menus(menu_slice(recent)));
+}
+
+/// The part of `recent` listed in the native `File → Recent Projects` submenu.
+#[must_use]
+pub fn menu_slice(recent: &[RecentProject]) -> &[RecentProject] {
+    &recent[..recent.len().min(MAX_RECENT_PROJECTS_IN_MENU)]
+}
+
+/// Stores `recent` for windows opened later, rebuilds the menu bar and pushes the list to the
+/// titlebar dropdown of every open window (`KOVA-065`).
+pub fn broadcast_recent_projects(recent: Vec<RecentProject>, cx: &mut App) {
+    refresh_menus(&recent, cx);
+    crate::prune_closed_windows(cx);
+    let windows: Vec<WindowHandle<WorkspaceShell>> = cx
+        .global::<AppHostState>()
+        .registry
+        .slots()
+        .iter()
+        .map(|slot| slot.window)
+        .collect();
+    for window in windows {
+        let list = recent.clone();
+        drop(window.update(cx, |shell, _, cx| shell.set_recent_projects(list, cx)));
+    }
+    cx.global_mut::<AppHostState>().recent_projects = recent;
 }
 
 /// Routes a project open request for `root` across open windows (`KOVA-054`).
@@ -174,6 +207,33 @@ fn prompt_and_open_project(cx: &mut App) {
                 return;
             };
             open_project(root, preferred_id, cx);
+        })
+        .ok();
+    })
+    .detach();
+}
+
+/// Shows the native directory picker and opens the choice in a new window (`KOVA-065`).
+fn prompt_and_open_project_in_new_window(cx: &mut App) {
+    let preferred_window = crate::resolve_target_window(cx).map(|(w, _)| w);
+    let picked = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: Some("Open in New Window".into()),
+    });
+    cx.spawn(async move |cx| {
+        let outcome = picker_outcome(picked.await);
+        cx.update(|cx| {
+            let notice_window =
+                preferred_window.or_else(|| crate::resolve_target_window(cx).map(|(w, _)| w));
+            let Some(root) = first_picked_in_app(notice_window, outcome, cx) else {
+                return;
+            };
+            crate::handle_project_host_command(
+                kova_ui::ProjectHostCommand::OpenNewWindow(root),
+                cx,
+            );
         })
         .ok();
     })
@@ -262,7 +322,9 @@ mod tests {
     use kova_config::KovaPaths;
     use tempfile::TempDir;
 
-    use super::{RecentProjectsUpdate, apply_recent_update};
+    use kova_core::{MAX_RECENT_PROJECTS_IN_MENU, RecentProject};
+
+    use super::{RecentProjectsUpdate, apply_recent_update, menu_slice};
 
     fn paths(temp: &TempDir) -> KovaPaths {
         KovaPaths::from_roots(
@@ -308,6 +370,22 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn full_list_reaches_the_dropdown_and_menu_is_truncated() {
+        let temp = TempDir::new().expect("tempdir");
+        let total = MAX_RECENT_PROJECTS_IN_MENU + 3;
+        for i in 0..total {
+            let dir = temp.path().join(format!("p{i}"));
+            std::fs::create_dir(&dir).expect("dir");
+            apply_recent_update(paths(&temp), &RecentProjectsUpdate::Record(dir)).expect("record");
+        }
+        let entries = apply_recent_update(paths(&temp), &RecentProjectsUpdate::Load).expect("load");
+        assert_eq!(entries.len(), total);
+        assert_eq!(menu_slice(&entries).len(), MAX_RECENT_PROJECTS_IN_MENU);
+        let few: Vec<RecentProject> = entries.into_iter().take(2).collect();
+        assert_eq!(menu_slice(&few).len(), 2);
     }
 
     #[test]

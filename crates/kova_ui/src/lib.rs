@@ -49,7 +49,8 @@ pub use shell::{
     BuildEvent, BuildRunRequest, BuildRunSink, CancelRunKind, CancelRunSink, NewEntryKind,
     NewItemKeyOutcome, NewProjectItemState, OpenProjectButton, OpenProjectDirtyEntry,
     OpenProjectKeyOutcome, OpenProjectModal, OpenProjectModalMode, OpenProjectRequestOutcome,
-    PendingProjectSwitch, ProjectHostCommand, ProjectHostSink, StartupMetrics, SwitchProjectError,
+    PendingProjectSwitch, ProjectDropdownAction, ProjectDropdownKeyOutcome, ProjectDropdownModel,
+    ProjectDropdownRow, ProjectHostCommand, ProjectHostSink, StartupMetrics, SwitchProjectError,
     SwitchProjectMode, WorkspaceShell, canonicalize_or_raw, create_project_item_on_disk,
     paths_match,
 };
