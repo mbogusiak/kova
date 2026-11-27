@@ -236,11 +236,11 @@ impl LanguageRegistry {
         Self::default()
     }
 
-    /// Creates a [`LanguageRegistry`] pre-populated with all 8 built-in languages
-    /// (`Java`, `Kotlin`, `Http`, `Toml`, `Json`, `Yaml`, `Xml`, `Groovy`), including compiled
+    /// Creates a [`LanguageRegistry`] pre-populated with all 9 built-in languages
+    /// (`Java`, `Kotlin`, `Http`, `Toml`, `Json`, `Yaml`, `Xml`, `Groovy`, `Sql`), including compiled
     /// `highlights.scm` and `folds.scm` queries for Tree-sitter grammars, entry-point queries
     /// (`entry_points.scm`) for `Java`, `Kotlin`, and `Http`, and built-in scanners for
-    /// `Yaml`, `Xml`, and `Groovy`.
+    /// `Yaml`, `Xml`, `Groovy`, and `Sql`.
     ///
     /// Prefer [`Self::builtin`] on hot paths to reuse the process-wide cached registry.
     ///
@@ -288,10 +288,11 @@ impl LanguageRegistry {
         registry.register_scanner(SyntaxLanguage::Yaml);
         registry.register_scanner(SyntaxLanguage::Xml);
         registry.register_scanner(SyntaxLanguage::Groovy);
+        registry.register_scanner(SyntaxLanguage::Sql);
         Ok(registry)
     }
 
-    /// Returns a process-wide cached [`LanguageRegistry`] containing all 8 built-in languages
+    /// Returns a process-wide cached [`LanguageRegistry`] containing all 9 built-in languages
     /// and compiled highlight, fold, and entry-point queries, compiling them at most once per
     /// process.
     ///
@@ -305,7 +306,7 @@ impl LanguageRegistry {
             .map_err(Clone::clone)
     }
 
-    /// Registers a scanner-backed language (`Yaml`, `Xml`, or `Groovy`) in this registry.
+    /// Registers a scanner-backed language (`Yaml`, `Xml`, `Groovy`, or `Sql`) in this registry.
     pub fn register_scanner(&mut self, language: SyntaxLanguage) {
         self.entries.insert(
             language,
@@ -485,7 +486,7 @@ fn validate_language_abi(
 ///
 /// Recognizes `.java`, `.kt`, `.kts` (including `.gradle.kts`), `.http`, `.toml` (including
 /// `Cargo.toml`, `settings.toml`, `kova.toml`), `.json`, `.yaml`/`.yml`, `.xml`/`.pom`/`.xsd`,
-/// and `.groovy`/`.gradle`.
+/// `.groovy`/`.gradle`, and `.sql`/`.ddl`/`.psql`/`.hql`.
 #[must_use]
 pub fn detect_language(path: &Path) -> Option<SyntaxLanguage> {
     let ext = path.extension()?.to_str()?;
@@ -508,6 +509,12 @@ pub fn detect_language(path: &Path) -> Option<SyntaxLanguage> {
         Some(SyntaxLanguage::Xml)
     } else if ext.eq_ignore_ascii_case("groovy") || ext.eq_ignore_ascii_case("gradle") {
         Some(SyntaxLanguage::Groovy)
+    } else if ext.eq_ignore_ascii_case("sql")
+        || ext.eq_ignore_ascii_case("ddl")
+        || ext.eq_ignore_ascii_case("psql")
+        || ext.eq_ignore_ascii_case("hql")
+    {
+        Some(SyntaxLanguage::Sql)
     } else {
         None
     }
@@ -583,6 +590,22 @@ mod tests {
             detect_language(Path::new("build.GRADLE")),
             Some(SyntaxLanguage::Groovy)
         );
+        assert_eq!(
+            detect_language(Path::new("schema.sql")),
+            Some(SyntaxLanguage::Sql)
+        );
+        assert_eq!(
+            detect_language(Path::new("migrations.DDL")),
+            Some(SyntaxLanguage::Sql)
+        );
+        assert_eq!(
+            detect_language(Path::new("queries.psql")),
+            Some(SyntaxLanguage::Sql)
+        );
+        assert_eq!(
+            detect_language(Path::new("analytics.HQL")),
+            Some(SyntaxLanguage::Sql)
+        );
         assert_eq!(detect_language(Path::new("README")), None);
         assert_eq!(detect_language(Path::new("script.py")), None);
         assert_eq!(detect_language(Path::new("api.rest")), None);
@@ -626,9 +649,9 @@ mod tests {
     }
 
     #[test]
-    fn builtin_registry_returns_all_eight_languages() {
+    fn builtin_registry_returns_all_nine_languages() {
         let registry = LanguageRegistry::builtin().unwrap();
-        assert_eq!(registry.len(), 8);
+        assert_eq!(registry.len(), 9);
         for lang in [
             SyntaxLanguage::Java,
             SyntaxLanguage::Kotlin,
@@ -650,6 +673,7 @@ mod tests {
             SyntaxLanguage::Yaml,
             SyntaxLanguage::Xml,
             SyntaxLanguage::Groovy,
+            SyntaxLanguage::Sql,
         ] {
             let entry = registry.get(lang).unwrap();
             assert!(!entry.is_tree_sitter());

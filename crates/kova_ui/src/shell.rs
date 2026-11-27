@@ -76,12 +76,12 @@ use crate::dock::{
     BadgeVariant, BottomPanelModel, BottomTab, BuildLogKind, BuildRunStatus, Direction,
     DockLayoutState, DockToolId, FileIconKind, FocusModeVariant, FocusTilingController,
     FocusToggle, FocusedRegion, LEFT_STRIPE_BOTTOM_TOOLS, LEFT_STRIPE_TOP_TOOLS, LayoutDensity,
-    PaneId, ProblemEntry, ProblemRow, ProblemSeverity, ProjectNode, ProjectNodeKind,
-    ProjectTreeModel, RIGHT_STRIPE_BOTTOM_TOOLS, RIGHT_STRIPE_TOP_TOOLS, SplitAxis, SplitTree,
-    StatusBarState, StructureModel, TabGroupModel, TabId, TabItem, ToolStripeTooltip,
-    TreeActivation, VimModeBadge, render_build_hammer_icon, render_kova_brand_icon,
-    render_run_play_icon, render_run_tests_icon, render_stop_icon, render_tool_icon,
-    stripe_icon_color,
+    PaneId, ProblemEntry, ProblemRow, ProblemSeverity, ProjectIconPalette, ProjectNode,
+    ProjectNodeKind, ProjectTreeModel, RIGHT_STRIPE_BOTTOM_TOOLS, RIGHT_STRIPE_TOP_TOOLS,
+    SplitAxis, SplitTree, StatusBarState, StructureModel, TabGroupModel, TabId, TabItem,
+    ToolStripeTooltip, TreeActivation, VimModeBadge, render_build_hammer_icon, render_file_icon,
+    render_kova_brand_icon, render_run_play_icon, render_run_tests_icon, render_stop_icon,
+    render_tool_icon, stripe_icon_color,
 };
 use crate::document::{
     CompletionSink, DefinitionOutcome, DefinitionRequest, DefinitionSink, DefinitionTargetKind,
@@ -6188,19 +6188,29 @@ impl WorkspaceShell {
                 .text_size(px(10.0))
                 .child("RO")
         });
-        let tab_hint = tab
+        let tab_icon = if tab
             .path
             .as_deref()
-            .map_or("·", |path| lang_hint_for(&path.to_string_lossy()));
-        el.child(
+            .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+            .is_some_and(|name| file_icon_kind_for(name) == FileIconKind::Sql)
+        {
+            let icon_palette = ProjectIconPalette::from_theme(cx.global::<KovaTheme>());
+            render_file_icon(FileIconKind::Sql, &icon_palette, false)
+        } else {
+            let tab_hint = tab
+                .path
+                .as_deref()
+                .map_or("·", |path| lang_hint_for(&path.to_string_lossy()));
             div()
                 .text_color(file_badge_color(tab_hint, p))
                 .text_size(px(10.0))
-                .child(tab_hint),
-        )
-        .child(tab.display_title(compact))
-        .children(ro_badge)
-        .child(badge)
+                .child(tab_hint)
+                .into_any_element()
+        };
+        el.child(tab_icon)
+            .child(tab.display_title(compact))
+            .children(ro_badge)
+            .child(badge)
     }
 
     fn render_markdown_mode_switcher(
@@ -6824,7 +6834,8 @@ fn is_vim_insert_exit(keystroke: &gpui::Keystroke) -> bool {
 }
 
 /// Line comment prefix for `Cmd+/` by file type (`#` for TOML, YAML, properties, shell and
-/// `.http` files; `//` otherwise, including Java, Kotlin, Groovy and `.gradle`).
+/// `.http` files; `--` for SQL/DDL/`PostgreSQL`/`HiveQL` files; `//` otherwise, including Java,
+/// Kotlin, Groovy and `.gradle`).
 fn line_comment_prefix(path: Option<&Path>) -> &'static str {
     let ext = path
         .and_then(Path::extension)
@@ -6834,6 +6845,7 @@ fn line_comment_prefix(path: Option<&Path>) -> &'static str {
     match ext.as_str() {
         "toml" | "yaml" | "yml" | "properties" | "sh" | "bash" | "zsh" | "http" | "rest" | "py"
         | "gitignore" => "#",
+        "sql" | "ddl" | "psql" | "hql" => "--",
         _ => "//",
     }
 }
@@ -6854,10 +6866,10 @@ fn block_comment_delimiters(path: Option<&Path>) -> (&'static str, &'static str)
     }
 }
 
-/// Returns the semantic theme color for a file type badge (`J`, `K`, `G`, `Y`, `<>`, `T`, `H`, `⚙`).
+/// Returns the semantic theme color for a file type badge (`J`, `K`, `G`, `Y`, `<>`, `DB`, `T`, `H`, `⚙`).
 fn file_badge_color(hint: &str, p: Palette) -> Hsla {
     match hint {
-        "J" => p.tab_indicator,
+        "J" | "DB" => p.tab_indicator,
         "T" => p.run_icon,
         "K" | "⚙" => p.warning,
         "H" => p.error,
@@ -6941,6 +6953,7 @@ fn language_label(path: &Path) -> &'static str {
         Some(SyntaxLanguage::Yaml) => "YAML",
         Some(SyntaxLanguage::Xml) => "XML",
         Some(SyntaxLanguage::Groovy) => "Groovy",
+        Some(SyntaxLanguage::Sql) => "SQL",
         None => "Text",
     }
 }
@@ -7199,6 +7212,10 @@ mod tests {
         assert_eq!(language_label(Path::new("build.gradle")), "Groovy");
         assert_eq!(language_label(Path::new("build.gradle.kts")), "Kotlin");
         assert_eq!(language_label(Path::new("Script.groovy")), "Groovy");
+        assert_eq!(language_label(Path::new("schema.sql")), "SQL");
+        assert_eq!(language_label(Path::new("migrations.DDL")), "SQL");
+        assert_eq!(language_label(Path::new("queries.psql")), "SQL");
+        assert_eq!(language_label(Path::new("analytics.HQL")), "SQL");
         assert_eq!(language_label(Path::new("README.md")), "Markdown");
         assert_eq!(language_label(Path::new("docs/SPEC.markdown")), "Markdown");
         assert_eq!(language_label(Path::new("notes.txt")), "Text");
@@ -7231,6 +7248,10 @@ mod tests {
 
         assert_eq!(line_comment_prefix(Some(Path::new("app.YML"))), "#");
         assert_eq!(line_comment_prefix(Some(Path::new("build.gradle"))), "//");
+        assert_eq!(line_comment_prefix(Some(Path::new("schema.sql"))), "--");
+        assert_eq!(line_comment_prefix(Some(Path::new("V1.DDL"))), "--");
+        assert_eq!(line_comment_prefix(Some(Path::new("query.psql"))), "--");
+        assert_eq!(line_comment_prefix(Some(Path::new("etl.hql"))), "--");
         assert_eq!(
             block_comment_delimiters(Some(Path::new("pom.XML"))),
             ("<!--", "-->")
@@ -7243,9 +7264,15 @@ mod tests {
             block_comment_delimiters(Some(Path::new("Script.groovy"))),
             ("/*", "*/")
         );
+        assert_eq!(
+            block_comment_delimiters(Some(Path::new("schema.sql"))),
+            ("/*", "*/")
+        );
         assert_eq!(file_search_icon("application.yml"), "Y");
         assert_eq!(file_search_icon("pom.xml"), "<>");
         assert_eq!(file_search_icon("build.gradle"), "G");
+        assert_eq!(file_search_icon("schema.sql"), "DB");
+        assert_eq!(file_search_icon("analytics.HQL"), "DB");
         assert_eq!(
             file_search_icon("README.md"),
             SearchEntryKind::File.default_icon()
@@ -7330,6 +7357,19 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "plugins")
         );
+
+        let sql_snap = Buffer::from_text(
+            "CREATE TABLE users (\n    id BIGINT PRIMARY KEY,\n    email VARCHAR(255) NOT NULL\n);\n",
+        )
+        .snapshot();
+        let sql_res = analyze_document(
+            groovy_res.engine,
+            SyntaxLanguage::Sql,
+            &sql_snap,
+            "schema.sql",
+        );
+        assert_eq!(sql_res.problems.len(), 0);
+        assert!(sql_res.structure.items().iter().any(|s| s.name == "users"));
     }
 
     #[test]

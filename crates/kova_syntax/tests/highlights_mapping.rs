@@ -20,10 +20,11 @@ const TREE_SITTER_LANGUAGES: [SyntaxLanguage; 5] = [
     SyntaxLanguage::Json,
 ];
 
-const SCANNER_LANGUAGES: [SyntaxLanguage; 3] = [
+const SCANNER_LANGUAGES: [SyntaxLanguage; 4] = [
     SyntaxLanguage::Yaml,
     SyntaxLanguage::Xml,
     SyntaxLanguage::Groovy,
+    SyntaxLanguage::Sql,
 ];
 
 fn setup() -> (SyntaxEngine, Highlighter) {
@@ -112,7 +113,7 @@ fn assert_kinds(spans: &[HighlightSpan], expected: &[SyntaxTokenKind]) {
 #[test]
 fn all_default_grammars_and_queries_compile() {
     let registry = LanguageRegistry::with_defaults().expect("with_defaults succeeds");
-    assert_eq!(registry.len(), 8);
+    assert_eq!(registry.len(), 9);
     for lang in TREE_SITTER_LANGUAGES {
         assert!(registry.contains(lang), "missing {lang:?}");
         let entry = registry.get(lang).expect("entry exists");

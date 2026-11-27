@@ -218,6 +218,36 @@ fn captures_resolve_for_yaml_xml_and_groovy() {
 }
 
 #[test]
+fn captures_resolve_for_sql() {
+    for (capture, kind) in [
+        ("@keyword", SyntaxTokenKind::Keyword),
+        ("@keyword.control", SyntaxTokenKind::KeywordControl),
+        ("@type.builtin", SyntaxTokenKind::TypeBuiltin),
+        ("@function", SyntaxTokenKind::Function),
+        ("@function.call", SyntaxTokenKind::Function),
+        ("@variable", SyntaxTokenKind::Variable),
+        ("@variable.parameter", SyntaxTokenKind::Parameter),
+        ("@parameter", SyntaxTokenKind::Parameter),
+        ("@property", SyntaxTokenKind::Property),
+        ("@string", SyntaxTokenKind::String),
+        ("@string.escape", SyntaxTokenKind::StringEscape),
+        ("@number", SyntaxTokenKind::Number),
+        ("@boolean", SyntaxTokenKind::Boolean),
+        ("@operator", SyntaxTokenKind::Operator),
+        ("@punctuation", SyntaxTokenKind::Punctuation),
+        ("@comment", SyntaxTokenKind::Comment),
+        ("@comment.documentation", SyntaxTokenKind::CommentDoc),
+    ] {
+        assert_eq!(resolve_capture(SyntaxLanguage::Sql, capture), Some(kind));
+    }
+    assert_eq!(resolve_capture(SyntaxLanguage::Sql, ""), None);
+    assert_eq!(
+        resolve_capture(SyntaxLanguage::Sql, "@unknown.sql.token"),
+        None
+    );
+}
+
+#[test]
 fn registry_manages_builtin_and_custom_themes() {
     let mut registry = ThemeRegistry::new();
     assert_eq!(registry.len(), 2);

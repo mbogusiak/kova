@@ -212,7 +212,7 @@ impl SyntaxTree {
         self.language
     }
 
-    /// Returns the internal [`ScannedDocument`] for scanner-backed languages (`Yaml`, `Xml`, `Groovy`).
+    /// Returns the internal [`ScannedDocument`] for scanner-backed languages (`Yaml`, `Xml`, `Groovy`, `Sql`).
     #[must_use]
     pub(crate) fn scanned(&self) -> Option<&ScannedDocument> {
         match &self.repr {

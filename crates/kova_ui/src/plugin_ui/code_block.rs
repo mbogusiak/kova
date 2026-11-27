@@ -2,7 +2,7 @@
 //!
 //! Uses [`kova_syntax`] (`SyntaxEngine`, `LanguageRegistry`, `Highlighter`) for
 //! syntax highlighting when the block's language is one of Kova's built-in
-//! languages (`java`, `kotlin`, `http`, `toml`, `json`, `yaml`, `xml`, `groovy`), and
+//! languages (`java`, `kotlin`, `http`, `toml`, `json`, `yaml`, `xml`, `groovy`, `sql`), and
 //! falls back to plain theme-styled monospace text otherwise.
 
 use std::ops::Range;
@@ -68,6 +68,12 @@ pub fn parse_code_language(language: Option<&str>) -> Option<SyntaxLanguage> {
         Some(SyntaxLanguage::Xml)
     } else if raw.eq_ignore_ascii_case("groovy") || raw.eq_ignore_ascii_case("gradle") {
         Some(SyntaxLanguage::Groovy)
+    } else if raw.eq_ignore_ascii_case("sql")
+        || raw.eq_ignore_ascii_case("ddl")
+        || raw.eq_ignore_ascii_case("psql")
+        || raw.eq_ignore_ascii_case("hql")
+    {
+        Some(SyntaxLanguage::Sql)
     } else {
         None
     }
@@ -367,7 +373,11 @@ mod tests {
             parse_code_language(Some("gradle")),
             Some(SyntaxLanguage::Groovy)
         );
-        assert_eq!(parse_code_language(Some("sql")), None);
+        assert_eq!(parse_code_language(Some("sql")), Some(SyntaxLanguage::Sql));
+        assert_eq!(parse_code_language(Some("DDL")), Some(SyntaxLanguage::Sql));
+        assert_eq!(parse_code_language(Some("psql")), Some(SyntaxLanguage::Sql));
+        assert_eq!(parse_code_language(Some("HQL")), Some(SyntaxLanguage::Sql));
+        assert_eq!(parse_code_language(Some("plaintext")), None);
         assert_eq!(parse_code_language(None), None);
     }
 
@@ -401,9 +411,25 @@ mod tests {
                 .any(|(_, kind)| *kind == SyntaxTokenKind::Boolean)
         );
 
-        let plain = prepare_code_block("SELECT 1;\r\nSELECT 2;", Some("sql"));
+        let sql = prepare_code_block("SELECT 1;\r\nSELECT 2;", Some("sql"));
+        assert_eq!(sql.lines.len(), 2);
+        assert_eq!(sql.lines[0].text.as_ref(), "SELECT 1;");
+        assert!(
+            sql.lines[0]
+                .spans
+                .iter()
+                .any(|(_, kind)| *kind == SyntaxTokenKind::Keyword)
+        );
+        assert!(
+            sql.lines[0]
+                .spans
+                .iter()
+                .any(|(_, kind)| *kind == SyntaxTokenKind::Number)
+        );
+
+        let plain = prepare_code_block("hello\r\nworld", Some("plaintext"));
         assert_eq!(plain.lines.len(), 2);
-        assert_eq!(plain.lines[0].text.as_ref(), "SELECT 1;");
+        assert_eq!(plain.lines[0].text.as_ref(), "hello");
         assert_eq!(plain.lines[0].spans, Vec::new());
 
         let yaml = prepare_code_block("server:\n  port: 8080", Some("yaml"));

@@ -1,4 +1,4 @@
-//! Syntax highlight tokens and capture resolution for Java, Kotlin, HTTP, TOML, JSON, YAML, XML, and Groovy.
+//! Syntax highlight tokens and capture resolution for Java, Kotlin, HTTP, TOML, JSON, YAML, XML, Groovy, and SQL.
 
 use std::fmt;
 
@@ -291,6 +291,8 @@ pub enum SyntaxLanguage {
     Xml,
     /// Groovy sources and Gradle Groovy DSL build scripts (`.groovy`, `.gradle`).
     Groovy,
+    /// SQL, DDL, `PostgreSQL`, and `HiveQL` files (`.sql`, `.ddl`, `.psql`, `.hql`).
+    Sql,
 }
 
 /// Resolves a Tree-sitter capture name (with or without leading `@`) into an Aether [`SyntaxTokenKind`].

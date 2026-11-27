@@ -108,7 +108,7 @@ impl EntryPoint {
 /// in `tree` against `snapshot`.
 ///
 /// Returns an empty `Vec` in $O(1)$ time for [`SyntaxLanguage::Toml`], [`SyntaxLanguage::Json`],
-/// [`SyntaxLanguage::Yaml`], and [`SyntaxLanguage::Xml`].
+/// [`SyntaxLanguage::Yaml`], [`SyntaxLanguage::Xml`], and [`SyntaxLanguage::Sql`].
 /// Output is sorted ascending by `(line, byte_range.start)` and preserves `start_line <= line <= end_line`
 /// and `byte_range.end <= snapshot.len_bytes()`.
 #[must_use]
@@ -121,7 +121,8 @@ pub fn detect_entry_points(tree: &SyntaxTree, snapshot: &BufferSnapshot) -> Vec<
         SyntaxLanguage::Toml
         | SyntaxLanguage::Json
         | SyntaxLanguage::Yaml
-        | SyntaxLanguage::Xml => return Vec::new(),
+        | SyntaxLanguage::Xml
+        | SyntaxLanguage::Sql => return Vec::new(),
     };
 
     entry_points.sort_by_key(|ep| (ep.line, ep.byte_range.start));
