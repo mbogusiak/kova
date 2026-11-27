@@ -79,8 +79,9 @@ use crate::dock::{
     PaneId, ProblemEntry, ProblemRow, ProblemSeverity, ProjectNode, ProjectNodeKind,
     ProjectTreeModel, RIGHT_STRIPE_BOTTOM_TOOLS, RIGHT_STRIPE_TOP_TOOLS, SplitAxis, SplitTree,
     StatusBarState, StructureModel, TabGroupModel, TabId, TabItem, ToolStripeTooltip,
-    TreeActivation, VimModeBadge, render_build_hammer_icon, render_run_play_icon,
-    render_run_tests_icon, render_stop_icon, render_tool_icon, stripe_icon_color,
+    TreeActivation, VimModeBadge, render_build_hammer_icon, render_kova_brand_icon,
+    render_run_play_icon, render_run_tests_icon, render_stop_icon, render_tool_icon,
+    stripe_icon_color,
 };
 use crate::document::{
     CompletionSink, DefinitionOutcome, DefinitionRequest, DefinitionSink, DefinitionTargetKind,
@@ -5091,6 +5092,22 @@ impl WorkspaceShell {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("titlebar-brand")
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .pr(px(2.0))
+                            .child(render_kova_brand_icon())
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.text_secondary)
+                                    .child("Kova"),
+                            ),
+                    )
                     .child(
                         // Clickable project breadcrumb: `File → Open Project…` (`KOVA-049`).
                         pill(self.project.name().to_owned(), p.island, p.text_primary)

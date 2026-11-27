@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Kova IDE
+GenericName=JVM Integrated Development Environment
+Comment=Native Rust & GPUI IDE for Java, Kotlin, and Scala
+Exec=kova %F
+Icon=kova
+Terminal=false
+Categories=Development;IDE;
+Keywords=Java;Kotlin;Scala;JVM;IDE;Editor;Rust;
+StartupWMClass=dev.kova.ide
+StartupNotify=true
