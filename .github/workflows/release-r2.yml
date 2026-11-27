@@ -214,6 +214,22 @@ jobs:
             --content-type application/json \
             --only-show-errors
 
+      - name: Update stable latest/ download links
+        working-directory: dist
+        run: |
+          mkdir -p latest
+          cp "kova-${VERSION}-macos-arm64.dmg" latest/kova-macos-arm64.dmg
+          cp "kova-${VERSION}-macos-arm64.zip" latest/kova-macos-arm64.zip
+          cp "kova-${VERSION}-linux-x86_64.tar.gz" latest/kova-linux-x86_64.tar.gz
+          # Checksums for the stable names, so `sha256sum -c` works on latest/ downloads.
+          (cd latest && sha256sum kova-* > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          for f in kova-macos-arm64.dmg kova-macos-arm64.zip kova-linux-x86_64.tar.gz SHA256SUMS.txt; do
+            aws s3 cp "latest/$f" "s3://${R2_BUCKET}/releases/latest/$f" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --cache-control no-cache \
+              --only-show-errors
+          done
+
       - name: Summary
         working-directory: dist
         run: |
