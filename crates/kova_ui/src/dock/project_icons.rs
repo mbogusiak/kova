@@ -762,3 +762,77 @@ pub fn render_stop_icon(color: Hsla) -> AnyElement {
         paint_rounded_rect(window, (ox, oy), (2.2, 2.2, 7.6, 7.6), 1.4, color);
     })
 }
+
+/// Renders a crisp `16×16 px` Kova IDE brand monogram (`Aether Forge K`) for the titlebar (`KOVA-062`).
+#[must_use]
+pub fn render_kova_brand_icon() -> AnyElement {
+    vector_icon(16.0, 16.0, |ox, oy, window| {
+        // Obsidian squircle base with subtle blue-violet rim matching `assets/icons/kova.svg`.
+        paint_rounded_rect(
+            window,
+            (ox, oy),
+            (1.0, 1.0, 14.0, 14.0),
+            3.2,
+            hex(0x0013_1722),
+        );
+        paint_outlined_rounded_rect(
+            window,
+            (ox, oy),
+            (1.0, 1.0, 14.0, 14.0),
+            3.2,
+            0.8,
+            Hsla {
+                h: 213.0 / 360.0,
+                s: 1.0,
+                l: 0.74,
+                a: 0.38,
+            },
+        );
+        // Forged titanium vertical stem.
+        paint_rounded_rect(
+            window,
+            (ox, oy),
+            (4.3, 3.55, 2.3, 8.9),
+            0.45,
+            hex(0x00E6_EEFC),
+        );
+        // Lower cobalt-violet arm.
+        fill_polygon(
+            window,
+            hex(0x008B_5CF6),
+            &[
+                (7.0, 8.35),
+                (8.65, 6.95),
+                (11.9, 12.0),
+                (11.6, 12.45),
+                (9.65, 12.45),
+                (9.25, 12.2),
+            ],
+            ox,
+            oy,
+        );
+        // Upper electric-cyan velocity arm.
+        fill_polygon(
+            window,
+            hex(0x0038_BDF8),
+            &[
+                (7.0, 7.65),
+                (9.65, 3.55),
+                (11.8, 3.55),
+                (12.0, 4.1),
+                (8.75, 8.4),
+                (7.8, 8.55),
+            ],
+            ox,
+            oy,
+        );
+        // Forged spark node at the arm junction.
+        fill_polygon(
+            window,
+            hex(0x00E0_F2FE),
+            &[(7.05, 8.0), (8.0, 7.2), (8.7, 8.0), (8.0, 8.8)],
+            ox,
+            oy,
+        );
+    })
+}

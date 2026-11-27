@@ -29,8 +29,8 @@ pub use layout::{
 pub use project_icons::{
     ProjectIconPalette, render_build_hammer_icon, render_chevron, render_collapse_all_icon,
     render_expand_all_icon, render_file_icon, render_folder_icon, render_header_chevron,
-    render_hide_icon, render_locate_file_icon, render_new_item_icon, render_options_icon,
-    render_run_play_icon, render_run_tests_icon, render_stop_icon,
+    render_hide_icon, render_kova_brand_icon, render_locate_file_icon, render_new_item_icon,
+    render_options_icon, render_run_play_icon, render_run_tests_icon, render_stop_icon,
 };
 pub use project_tree::{
     FileIconKind, ProjectNode, ProjectNodeKind, ProjectTreeModel, TreeActivation,
