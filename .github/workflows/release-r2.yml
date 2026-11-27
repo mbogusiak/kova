@@ -1,0 +1,226 @@
+name: Release (Cloudflare R2)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, e.g. 0.1.0 (a leading "v" is stripped)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Untrusted input goes through env, never inline into run scripts.
+  RAW_VERSION: ${{ inputs.version || github.ref_name }}
+
+jobs:
+  build-macos:
+    name: Build macOS (aarch64-apple-darwin)
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        run: |
+          VERSION="${RAW_VERSION#v}"
+          if ! [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+            echo "error: invalid version '$RAW_VERSION'" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Install pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos-arm64
+
+      - name: Build release binary
+        run: cargo build --release --locked -p kova_app --target aarch64-apple-darwin
+
+      - name: Package Kova.app, zip and dmg
+        run: |
+          mkdir -p dist
+          ./scripts/package-macos-app.sh target/aarch64-apple-darwin/release/kova dist/Kova.app
+          ditto -c -k --keepParent dist/Kova.app "dist/kova-${VERSION}-macos-arm64.zip"
+          hdiutil create -volname "Kova" -srcfolder dist/Kova.app -ov -format UDZO \
+            "dist/kova-${VERSION}-macos-arm64.dmg"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kova-macos-arm64
+          path: |
+            dist/kova-*-macos-arm64.zip
+            dist/kova-*-macos-arm64.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  build-linux:
+    name: Build Linux (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        run: |
+          VERSION="${RAW_VERSION#v}"
+          if ! [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+            echo "error: invalid version '$RAW_VERSION'" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Install GPUI system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libvulkan-dev libwayland-dev \
+            libxcb1-dev libx11-xcb-dev \
+            libasound2-dev libfontconfig-dev libfreetype-dev \
+            libssl-dev libzstd-dev
+
+      - name: Install pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux-x86_64
+
+      - name: Build release binary
+        run: cargo build --release --locked -p kova_app --target x86_64-unknown-linux-gnu
+
+      - name: Package tarball
+        run: |
+          ./scripts/package-linux-tarball.sh "$VERSION" \
+            target/x86_64-unknown-linux-gnu/release/kova dist
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kova-linux-x86_64
+          path: dist/kova-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-r2:
+    name: Publish to Cloudflare R2
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      # R2 does not accept every default checksum header sent by recent AWS CLI v2.
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+    steps:
+      - name: Resolve version
+        run: |
+          VERSION="${RAW_VERSION#v}"
+          if ! [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+            echo "error: invalid version '$RAW_VERSION'" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Check R2 configuration
+        run: |
+          missing=0
+          for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY R2_BUCKET; do
+            if [ -z "${!name}" ]; then
+              echo "error: $name is empty (check repository secrets)" >&2
+              missing=1
+            fi
+          done
+          if [ "$R2_ENDPOINT" = "https://.r2.cloudflarestorage.com" ]; then
+            echo "error: secret R2_ACCOUNT_ID is not set" >&2
+            missing=1
+          fi
+          exit "$missing"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt and latest.json
+        working-directory: dist
+        run: |
+          ls -lh
+          sha256sum kova-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          python3 - <<'PY'
+          import datetime, json, os
+
+          version = os.environ["VERSION"]
+          base = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
+          files = []
+          with open("SHA256SUMS.txt", encoding="utf-8") as fh:
+              for line in fh:
+                  digest, name = line.split(maxsplit=1)
+                  name = name.strip().lstrip("*")
+                  entry = {"name": name, "size": os.path.getsize(name), "sha256": digest}
+                  if base:
+                      entry["url"] = f"{base}/releases/{version}/{name}"
+                  files.append(entry)
+
+          manifest = {
+              "version": version,
+              "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "files": files,
+          }
+          if base:
+              manifest["sha256sums_url"] = f"{base}/releases/{version}/SHA256SUMS.txt"
+          with open("latest.json", "w", encoding="utf-8") as fh:
+              json.dump(manifest, fh, indent=2)
+              fh.write("\n")
+          PY
+          cat latest.json
+
+      - name: Upload to R2
+        working-directory: dist
+        run: |
+          aws --version
+          for f in kova-* SHA256SUMS.txt latest.json; do
+            aws s3 cp "$f" "s3://${R2_BUCKET}/releases/${VERSION}/$f" \
+              --endpoint-url "$R2_ENDPOINT" --only-show-errors
+          done
+          aws s3 cp latest.json "s3://${R2_BUCKET}/releases/latest/latest.json" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --cache-control no-cache \
+            --content-type application/json \
+            --only-show-errors
+
+      - name: Summary
+        working-directory: dist
+        run: |
+          {
+            echo "## Kova ${VERSION} published to R2"
+            echo
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
