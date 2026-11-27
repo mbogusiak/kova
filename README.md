@@ -75,6 +75,39 @@ This single command verifies formatting (`cargo fmt`), strict linting (`clippy -
 
 ---
 
+## CI & Releases (Cloudflare R2)
+
+- `.github/workflows/ci.yml` runs on every push to `main` and every pull request, on `macos-15`
+  (Apple Silicon): `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace` and
+  `./scripts/verify-workspace.sh`.
+- `.github/workflows/release-r2.yml` runs on `v*` tags (or manually via *Run workflow* with a
+  `version`). It builds `kova-<version>-macos-arm64.zip` / `.dmg` and
+  `kova-<version>-linux-x86_64.tar.gz`, writes `SHA256SUMS.txt` and `latest.json`, and uploads
+  them to `releases/<version>/` in the R2 bucket, plus `releases/latest/latest.json`
+  (served with `Cache-Control: no-cache`).
+
+Required repository **secrets** (Settings → Secrets and variables → Actions):
+
+| Secret                 | Value                                         |
+|------------------------|-----------------------------------------------|
+| `R2_ACCOUNT_ID`        | Cloudflare account ID (used for the S3 endpoint) |
+| `R2_ACCESS_KEY_ID`     | R2 API token access key ID                    |
+| `R2_SECRET_ACCESS_KEY` | R2 API token secret access key                |
+| `R2_BUCKET`            | Target bucket name                            |
+
+Optional repository **variable**: `R2_PUBLIC_BASE_URL` (e.g. `https://downloads.example.com`).
+When set, `latest.json` includes download URLs for every file.
+
+Cut a release:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Linux tarballs can be built locally with `./scripts/package-linux-tarball.sh [VERSION] [BINARY] [OUT_DIR]`.
+
+---
+
 ## License
 
 Licensed under either of:
