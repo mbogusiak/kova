@@ -81,10 +81,11 @@ Latest release builds:
 
 | Platform              | Download |
 |-----------------------|----------|
-| macOS (Apple Silicon) | [kova-macos-arm64.dmg](<R2_PUBLIC_BASE_URL>/releases/latest/kova-macos-arm64.dmg) |
-| macOS (Apple Silicon) | [kova-macos-arm64.zip](<R2_PUBLIC_BASE_URL>/releases/latest/kova-macos-arm64.zip) |
-| Linux (x86_64)        | [kova-linux-x86_64.tar.gz](<R2_PUBLIC_BASE_URL>/releases/latest/kova-linux-x86_64.tar.gz) |
-| Checksums             | [SHA256SUMS.txt](<R2_PUBLIC_BASE_URL>/releases/latest/SHA256SUMS.txt) |
+| macOS (Apple Silicon) | [kova-macos-arm64.dmg](https://pub-96651a051b634ae7bf44a3d953424aa0.r2.dev/releases/latest/kova-macos-arm64.dmg) |
+| macOS (Apple Silicon) | [kova-macos-arm64.zip](https://pub-96651a051b634ae7bf44a3d953424aa0.r2.dev/releases/latest/kova-macos-arm64.zip) |
+| Linux (x86_64)        | [kova-linux-x86_64.tar.gz](https://pub-96651a051b634ae7bf44a3d953424aa0.r2.dev/releases/latest/kova-linux-x86_64.tar.gz) |
+| Checksums             | [SHA256SUMS.txt](https://pub-96651a051b634ae7bf44a3d953424aa0.r2.dev/releases/latest/SHA256SUMS.txt) |
+| Release manifest      | [latest.json](https://pub-96651a051b634ae7bf44a3d953424aa0.r2.dev/releases/latest/latest.json) |
 
 Verify a download with `sha256sum -c SHA256SUMS.txt --ignore-missing` (on macOS: `shasum -a 256 -c SHA256SUMS.txt --ignore-missing`).
 
