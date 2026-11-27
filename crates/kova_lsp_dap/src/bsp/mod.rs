@@ -17,6 +17,7 @@ pub use client::{
 };
 pub use events::{BspEvent, BspEventMapper, BspMessageLevel, BspStatusCode};
 pub use runner::{
-    BuildBackend, BuildRequest, TestBackend, TestRunRequest, module_report_dirs,
-    plan_build_backend, plan_test_backend, run_build, run_over_bsp, run_tests, run_with_backend,
+    BuildBackend, BuildRequest, TestBackend, TestRunRequest, apply_submodule_scope,
+    module_report_dirs, plan_build_backend, plan_test_backend, resolve_submodule_for_file,
+    run_build, run_over_bsp, run_tests, run_with_backend,
 };

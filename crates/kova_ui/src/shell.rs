@@ -45,11 +45,14 @@ use kova_syntax::{
 use kova_theme::{RgbaColor, SyntaxLanguage};
 
 mod completion;
+mod context_menu;
 mod debug;
 mod git;
 mod open_project_modal;
 mod project;
 mod project_panel;
+
+use context_menu::ContextMenuState;
 
 pub use open_project_modal::{
     MAX_DIRTY_PREVIEW_ITEMS, OpenProjectButton, OpenProjectDirtyEntry, OpenProjectKeyOutcome,
@@ -654,6 +657,8 @@ pub struct WorkspaceShell {
     project_options_open: bool,
     project_options_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     project_options_btn_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Floating right-click context menu overlay (`KOVA-063`).
+    context_menu: Option<ContextMenuState>,
     /// Automatically reveal the active editor file in the `Project` tree when switching tabs.
     always_select_opened_file: bool,
     /// Draw vertical indent guide lines inside the `Project` tree (off by default).
@@ -688,6 +693,10 @@ impl WorkspaceShell {
     /// a real project directory set via [`Self::with_project_root`] is scanned off-thread after
     /// the first frame so the `< 120 ms` cold-start budget is never blocked by disk I/O.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "flat field-by-field initialisation of the workspace shell state"
+    )]
     pub fn with_probe(
         process_start: Instant,
         exit_after_first_frame: bool,
@@ -792,6 +801,7 @@ impl WorkspaceShell {
             project_options_open: false,
             project_options_bounds: Rc::new(Cell::new(None)),
             project_options_btn_bounds: Rc::new(Cell::new(None)),
+            context_menu: None,
             always_select_opened_file: false,
             show_indent_guides: false,
         }
@@ -1182,7 +1192,31 @@ impl WorkspaceShell {
                     }
                 }
             }
+            EditorEvent::ContextMenuRequested {
+                position,
+                row,
+                byte,
+                ..
+            } => self.on_editor_context_menu(pane, tab, *position, *row, *byte, cx),
         }
+    }
+
+    /// Activates `pane`/`tab` and opens the editor context menu for a right-click (`KOVA-063`).
+    fn on_editor_context_menu(
+        &mut self,
+        pane: PaneId,
+        tab: TabId,
+        position: gpui::Point<Pixels>,
+        row: usize,
+        byte: usize,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(state) = self.panes.get_mut(&pane) {
+            state.tabs.select_tab(tab);
+        }
+        self.set_active_pane(pane, cx);
+        self.dock_layout.focus(FocusedRegion::EditorPane(pane));
+        self.open_editor_context_menu(position, row, byte, cx);
     }
 
     /// Handles a gutter `▶` click: `@Test` methods / classes start a *Test Runner* run
@@ -2091,6 +2125,10 @@ impl WorkspaceShell {
         .detach();
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "sequential open-or-focus flow for a document tab"
+    )]
     fn show_document(
         &mut self,
         rel_path: &Path,
@@ -2100,6 +2138,7 @@ impl WorkspaceShell {
         cx: &mut Context<'_, Self>,
     ) {
         self.close_completion_popup(cx);
+        self.close_context_menu(cx);
         let pane_id = self.active_pane;
         let existing = self
             .panes
@@ -2218,6 +2257,7 @@ impl WorkspaceShell {
         cx: &mut Context<'_, Self>,
     ) {
         self.close_completion_popup(cx);
+        self.close_context_menu(cx);
         let path = if let Some(state) = self.panes.get_mut(&pane) {
             state.tabs.select_tab(tab);
             state.tabs.active_tab().and_then(|t| t.path.clone())
@@ -2243,6 +2283,7 @@ impl WorkspaceShell {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.close_context_menu(cx);
         let Some(state) = self.panes.get_mut(&pane) else {
             return;
         };
@@ -2861,6 +2902,9 @@ impl WorkspaceShell {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> bool {
+        if self.handle_context_menu_key(keystroke, window, cx) {
+            return true;
+        }
         if self.settings_open {
             self.handle_settings_key(keystroke, window, cx);
             cx.stop_propagation();
@@ -6750,7 +6794,11 @@ impl Render for WorkspaceShell {
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.close_context_menu(cx);
+            }))
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.handle_context_menu_outside_click(event, cx);
                 this.handle_completion_outside_click(event, window, cx);
                 this.handle_project_overlay_outside_click(event, window, cx);
             }))
@@ -6769,6 +6817,10 @@ impl WorkspaceShell {
         cx: &Context<'_, Self>,
     ) -> Div {
         let root = match self.render_completion_overlay(cx) {
+            Some(overlay) => root.child(overlay),
+            None => root,
+        };
+        let root = match self.render_context_menu_overlay(p, cx) {
             Some(overlay) => root.child(overlay),
             None => root,
         };
@@ -6901,7 +6953,7 @@ fn load_run_configurations(root: &Path) -> Result<Vec<RunConfiguration>, String>
 }
 
 /// Tool window label for a runner target (`OrderTest.creates` / `OrderTest`).
-fn test_label(target: &str) -> String {
+pub(super) fn test_label(target: &str) -> String {
     let (class, method) = match target.split_once('#') {
         Some((class, method)) => (class, Some(method)),
         None => (target, None),

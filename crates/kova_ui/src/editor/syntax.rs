@@ -14,6 +14,16 @@ use kova_syntax::{
 
 use crate::editor::folding::FoldCandidate;
 
+/// Entry points enclosing a queried line inside an [`EditorSyntax`] snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EnclosingEntryPoints<'a> {
+    /// Narrowest non-class entry point (`JvmTestMethod`, `JavaMain`, `KotlinMain`, `HttpRequest`)
+    /// covering the queried line.
+    pub method: Option<&'a EntryPoint>,
+    /// Narrowest enclosing `JvmTestClass` covering the queried line.
+    pub class: Option<&'a EntryPoint>,
+}
+
 /// Syntax snapshot for one buffer revision: the parsed tree, the exact [`BufferSnapshot`] it
 /// was parsed from (all byte offsets refer to it), fold candidates and runnable entry points.
 ///
@@ -90,6 +100,31 @@ impl EditorSyntax {
     pub fn entry_point_at(&self, line: usize) -> Option<&EntryPoint> {
         let idx = self.entry_points.partition_point(|e| e.line < line);
         self.entry_points.get(idx).filter(|e| e.line == line)
+    }
+
+    /// Returns the narrowest runnable method/request and enclosing test class covering `row`
+    /// (`start_line <= row && row <= end_line`).
+    #[must_use]
+    pub fn enclosing_entry_points_at(&self, row: usize) -> EnclosingEntryPoints<'_> {
+        let span_len = |ep: &EntryPoint| ep.end_line.saturating_sub(ep.start_line);
+        let mut best_method: Option<&EntryPoint> = None;
+        let mut best_class: Option<&EntryPoint> = None;
+        for ep in &self.entry_points {
+            if ep.start_line > row || row > ep.end_line {
+                continue;
+            }
+            if ep.kind == EntryPointKind::JvmTestClass {
+                if best_class.is_none_or(|cur| span_len(ep) < span_len(cur)) {
+                    best_class = Some(ep);
+                }
+            } else if best_method.is_none_or(|cur| span_len(ep) < span_len(cur)) {
+                best_method = Some(ep);
+            }
+        }
+        EnclosingEntryPoints {
+            method: best_method,
+            class: best_class,
+        }
     }
 
     /// Returns the grammar language of this syntax snapshot.
@@ -265,5 +300,100 @@ public class OrderService {
             assert_eq!(request.kind, EntryPointKind::HttpRequest);
             assert!(request.log_line().contains("HTTP request:"));
         }
+    }
+
+    #[test]
+    fn enclosing_entry_points_at_resolves_method_class_nested_spock_and_outside() {
+        let java = "\
+package dev.kova;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+
+class OuterTest {
+    int helperField = 1;
+
+    @Test
+    void outerMethod() {
+        int a = 1;
+    }
+
+    @Nested
+    class InnerTest {
+        @Test
+        void innerMethod() {
+            int b = 2;
+        }
+    }
+}
+";
+        let syntax = build(SyntaxLanguage::Java, java);
+        // Outside class
+        assert_eq!(
+            syntax.enclosing_entry_points_at(0),
+            EnclosingEntryPoints::default()
+        );
+        // Inside class between methods (field line)
+        let field_ctx = syntax.enclosing_entry_points_at(5);
+        assert!(field_ctx.method.is_none());
+        assert_eq!(
+            field_ctx.class.map(EntryPoint::qualified_target).as_deref(),
+            Some("dev.kova.OuterTest")
+        );
+        // On @Test annotation line
+        let ann_ctx = syntax.enclosing_entry_points_at(7);
+        assert_eq!(
+            ann_ctx.method.map(EntryPoint::qualified_target).as_deref(),
+            Some("dev.kova.OuterTest#outerMethod")
+        );
+        assert_eq!(
+            ann_ctx.class.map(EntryPoint::qualified_target).as_deref(),
+            Some("dev.kova.OuterTest")
+        );
+        // Inside method body
+        let body_ctx = syntax.enclosing_entry_points_at(9);
+        assert_eq!(
+            body_ctx.method.map(EntryPoint::qualified_target).as_deref(),
+            Some("dev.kova.OuterTest#outerMethod")
+        );
+        // Inside @Nested method body picks narrowest class and method
+        let nested_ctx = syntax.enclosing_entry_points_at(16);
+        assert_eq!(
+            nested_ctx
+                .method
+                .map(EntryPoint::qualified_target)
+                .as_deref(),
+            Some("dev.kova.OuterTest$InnerTest#innerMethod")
+        );
+        assert_eq!(
+            nested_ctx
+                .class
+                .map(EntryPoint::qualified_target)
+                .as_deref(),
+            Some("dev.kova.OuterTest$InnerTest")
+        );
+
+        let spock = "\
+package com.kova
+import spock.lang.Specification
+class OrderSpec extends Specification {
+    def \"places order\"() {
+        expect:
+        1 == 1
+    }
+}
+";
+        let spock_syntax = build(SyntaxLanguage::Groovy, spock);
+        let spock_ctx = spock_syntax.enclosing_entry_points_at(5);
+        assert_eq!(
+            spock_ctx
+                .method
+                .map(EntryPoint::qualified_target)
+                .as_deref(),
+            Some("com.kova.OrderSpec#places order")
+        );
+        assert_eq!(
+            spock_ctx.class.map(EntryPoint::qualified_target).as_deref(),
+            Some("com.kova.OrderSpec")
+        );
     }
 }

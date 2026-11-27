@@ -178,6 +178,16 @@ pub enum EvaluateTarget {
     Watch(usize),
 }
 
+/// Kind of JVM target launched by a debug session (`KOVA-063`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DebugTargetKind {
+    /// Standard JVM `main` class launched directly via `java-debug`.
+    #[default]
+    MainClass,
+    /// `JUnit` / `Spock` test class or method launched via Gradle/Maven with JDWP suspended.
+    JvmTest,
+}
+
 /// How a debug session is started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebugLaunchRequest {
@@ -185,8 +195,12 @@ pub struct DebugLaunchRequest {
     pub session_id: u64,
     /// Toolbar title.
     pub label: String,
-    /// Fully qualified main class (or test class) to launch.
+    /// Fully qualified main class (or test target `Class` / `Class#method`) to launch.
     pub main_class: String,
+    /// Target kind (`MainClass` vs `JvmTest`).
+    pub target_kind: DebugTargetKind,
+    /// Optional absolute file path for submodule resolution when debugging tests.
+    pub target_file: Option<PathBuf>,
     /// Attach to a JVM already listening on this JDWP port instead of launching.
     pub attach_port: Option<u16>,
     /// Project root.
@@ -498,6 +512,43 @@ impl DebuggerModel {
         attach_port: Option<u16>,
         project_root: Option<PathBuf>,
     ) -> DebugCommand {
+        self.start_request(
+            label,
+            main_class,
+            DebugTargetKind::MainClass,
+            None,
+            attach_port,
+            project_root,
+        )
+    }
+
+    /// Starts a new debug session for a `JUnit` or `Spock` test target (`Class` or `Class#method`).
+    pub fn start_test(
+        &mut self,
+        label: impl Into<String>,
+        test_target: impl Into<String>,
+        target_file: Option<PathBuf>,
+        project_root: Option<PathBuf>,
+    ) -> DebugCommand {
+        self.start_request(
+            label,
+            test_target,
+            DebugTargetKind::JvmTest,
+            target_file,
+            None,
+            project_root,
+        )
+    }
+
+    fn start_request(
+        &mut self,
+        label: impl Into<String>,
+        main_class: impl Into<String>,
+        target_kind: DebugTargetKind,
+        target_file: Option<PathBuf>,
+        attach_port: Option<u16>,
+        project_root: Option<PathBuf>,
+    ) -> DebugCommand {
         self.session_id += 1;
         self.label = label.into();
         self.status = DebuggerStatus::Connecting;
@@ -514,6 +565,8 @@ impl DebuggerModel {
             session_id: self.session_id,
             label: self.label.clone(),
             main_class: main_class.into(),
+            target_kind,
+            target_file,
             attach_port,
             project_root,
             breakpoints: self.breakpoints.clone(),

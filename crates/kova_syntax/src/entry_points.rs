@@ -1191,6 +1191,11 @@ enum GroovyTokKind {
     StringLit(String),
     At,
     Dot,
+    Colon,
+    LAngle,
+    RAngle,
+    LBracket,
+    RBracket,
     LParen,
     RParen,
     LBrace,
@@ -1210,6 +1215,17 @@ struct GroovyTok {
 }
 
 #[derive(Debug, Clone)]
+struct PendingGroovyClass {
+    name: String,
+    line: usize,
+    start_line: usize,
+    start_byte: usize,
+    is_nested: bool,
+    is_abstract: bool,
+    superclass_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct GroovyClassScope {
     id: usize,
     name: String,
@@ -1218,7 +1234,18 @@ struct GroovyClassScope {
     start_byte: usize,
     body_depth: usize,
     is_nested: bool,
+    is_abstract: bool,
+    superclass_name: Option<String>,
     has_tests: bool,
+}
+
+impl GroovyClassScope {
+    /// `true` when the class directly extends `Specification` / `spock.lang.Specification`.
+    fn is_spock_direct(&self) -> bool {
+        self.superclass_name
+            .as_deref()
+            .is_some_and(is_spock_specification_name)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1241,12 +1268,35 @@ struct GroovyScanState {
     completed_classes: Vec<GroovyCompletedClass>,
     pending_annotations: Vec<(String, usize, usize)>,
     pending_modifiers: Vec<(String, usize, usize)>,
-    pending_class: Option<(String, usize, usize, usize, bool)>,
+    pending_class: Option<PendingGroovyClass>,
     next_class_id: usize,
     brace_depth: usize,
     len_bytes: usize,
     last_line: usize,
     out: Vec<EntryPoint>,
+}
+
+const SPOCK_ANY_BLOCK_LABELS: &[&str] =
+    &["given", "when", "then", "expect", "where", "and", "cleanup"];
+const SPOCK_TEST_BLOCK_LABELS: &[&str] = &["expect", "when", "then", "where"];
+
+fn is_spock_specification_name(superclass: &str) -> bool {
+    let simple = superclass
+        .rsplit_once('.')
+        .map_or(superclass, |(_, tail)| tail);
+    simple == "Specification"
+}
+
+fn ends_with_spec_suffix(name: &str) -> bool {
+    let simple = name.rsplit_once('.').map_or(name, |(_, tail)| tail);
+    simple.ends_with("Spec") || simple.ends_with("Specification")
+}
+
+fn is_spock_lifecycle_or_main(name: &str) -> bool {
+    matches!(
+        name,
+        "setup" | "cleanup" | "setupSpec" | "cleanupSpec" | "main"
+    )
 }
 
 impl GroovyScanState {
@@ -1267,19 +1317,19 @@ impl GroovyScanState {
     }
 
     fn handle_lbrace(&mut self) {
-        if let Some((name, name_line, start_line, start_byte, is_nested)) =
-            self.pending_class.take()
-        {
+        if let Some(pending) = self.pending_class.take() {
             let id = self.next_class_id;
             self.next_class_id += 1;
             self.class_stack.push(GroovyClassScope {
                 id,
-                name,
-                line: name_line,
-                start_line,
-                start_byte,
+                name: pending.name,
+                line: pending.line,
+                start_line: pending.start_line,
+                start_byte: pending.start_byte,
                 body_depth: self.brace_depth + 1,
-                is_nested,
+                is_nested: pending.is_nested,
+                is_abstract: pending.is_abstract,
+                superclass_name: pending.superclass_name,
                 has_tests: false,
             });
             self.pending_annotations.clear();
@@ -1390,24 +1440,94 @@ impl GroovyScanState {
                 .pending_annotations
                 .iter()
                 .any(|(ann, _, _)| is_nested_annotation_name(ann));
-        self.pending_class = Some((
-            class_name.clone(),
-            next.line,
+        let is_abstract = self
+            .pending_modifiers
+            .iter()
+            .any(|(m, _, _)| m == "abstract");
+
+        let mut j = idx + 2;
+        if j < tokens.len() && tokens[j].kind == GroovyTokKind::LAngle {
+            j = skip_balanced_angles(tokens, j);
+        }
+
+        let mut superclass_name: Option<String> = None;
+        let mut found_lbrace = false;
+        while j < tokens.len() {
+            match &tokens[j].kind {
+                GroovyTokKind::LBrace => {
+                    found_lbrace = true;
+                    break;
+                }
+                GroovyTokKind::Semi => {
+                    j += 1;
+                    break;
+                }
+                GroovyTokKind::LAngle => {
+                    j = skip_balanced_angles(tokens, j);
+                }
+                GroovyTokKind::Ident(kw) if kw == "extends" => {
+                    let (parts, next_j) = collect_dotted_ident(tokens, j + 1);
+                    if !parts.is_empty() {
+                        superclass_name = Some(parts.join("."));
+                    }
+                    j = next_j;
+                    if j < tokens.len() && tokens[j].kind == GroovyTokKind::LAngle {
+                        j = skip_balanced_angles(tokens, j);
+                    }
+                }
+                GroovyTokKind::Ident(kw)
+                    if matches!(kw.as_str(), "class" | "interface" | "enum" | "trait") =>
+                {
+                    break;
+                }
+                _ => j += 1,
+            }
+        }
+
+        if !found_lbrace {
+            self.pending_annotations.clear();
+            self.pending_modifiers.clear();
+            return Some(j);
+        }
+
+        self.pending_class = Some(PendingGroovyClass {
+            name: class_name.clone(),
+            line: next.line,
             start_line,
             start_byte,
             is_nested,
-        ));
-        Some(idx + 2)
+            is_abstract,
+            superclass_name,
+        });
+        Some(j)
+    }
+
+    /// Returns the `$`-joined class chain and the `pkg.Class#method` id for `method_name`.
+    fn method_class_chain_and_id(&self, method_name: &str) -> (String, String) {
+        let class_chain = self
+            .class_stack
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join("$");
+        let pkg_ref = self.package_name.as_deref();
+        let id = match (build_fqcn(pkg_ref, Some(&class_chain)), pkg_ref) {
+            (Some(fqcn), _) => format!("{fqcn}#{method_name}"),
+            (None, Some(pkg)) => format!("{pkg}#{method_name}"),
+            (None, None) => method_name.to_owned(),
+        };
+        (class_chain, id)
     }
 
     fn try_parse_method(&mut self, tokens: &[GroovyTok], idx: usize) -> Option<usize> {
-        if self.class_stack.is_empty() {
+        let scope = self.class_stack.last()?;
+        if idx > 0 && matches!(tokens[idx - 1].kind, GroovyTokKind::Dot | GroovyTokKind::Eq) {
             return None;
         }
         let tok = &tokens[idx];
-        let method_name = match &tok.kind {
-            GroovyTokKind::Ident(name) => name.clone(),
-            GroovyTokKind::StringLit(name) if !name.is_empty() => name.clone(),
+        let (method_name, is_quoted) = match &tok.kind {
+            GroovyTokKind::Ident(name) => (name.clone(), false),
+            GroovyTokKind::StringLit(name) if !name.is_empty() => (name.clone(), true),
             _ => return None,
         };
         if !tokens
@@ -1419,16 +1539,32 @@ impl GroovyScanState {
         let params_start = idx + 1;
         let after_params = skip_balanced_parens(tokens, params_start);
         let body_open = find_method_body_open(tokens, after_params)?;
+        let body_end_idx = find_matching_brace(tokens, body_open);
 
-        let is_test = self
+        let method_is_abstract = self
+            .pending_modifiers
+            .iter()
+            .any(|(m, _, _)| m == "abstract");
+        let has_test_annotation = self
             .pending_annotations
             .iter()
             .any(|(ann, _, _)| is_test_annotation_name(ann));
-        let is_main = method_name == "main"
+        let is_spock_test = !method_is_abstract
+            && is_spock_feature_method(
+                scope,
+                &method_name,
+                is_quoted,
+                tokens,
+                body_open,
+                body_end_idx,
+            );
+        let is_test =
+            !scope.is_abstract && !method_is_abstract && (has_test_annotation || is_spock_test);
+        let is_main = !method_is_abstract
+            && method_name == "main"
             && is_groovy_main_method(&self.pending_modifiers, &tokens[params_start..after_params]);
 
         if is_test || is_main {
-            let body_end_idx = find_matching_brace(tokens, body_open);
             let end_line = body_end_idx
                 .and_then(|end_i| tokens.get(end_i))
                 .map_or(self.last_line, |t| t.line)
@@ -1443,19 +1579,7 @@ impl GroovyScanState {
                 &self.pending_modifiers,
                 tok.start_byte,
             );
-            let class_chain = self
-                .class_stack
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join("$");
-            let pkg_ref = self.package_name.as_deref();
-            let fqcn = build_fqcn(pkg_ref, Some(&class_chain));
-            let id = match (&fqcn, pkg_ref) {
-                (Some(fqcn), _) => format!("{fqcn}#{method_name}"),
-                (None, Some(pkg)) => format!("{pkg}#{method_name}"),
-                (None, None) => method_name.clone(),
-            };
+            let (class_chain, id) = self.method_class_chain_and_id(&method_name);
             let label = format!("Run '{class_chain}.{method_name}()'");
             let byte_range = clamp_byte_range(start_byte..end_byte, self.len_bytes);
 
@@ -1635,13 +1759,72 @@ fn earliest_byte(
 fn find_method_body_open(tokens: &[GroovyTok], start: usize) -> Option<usize> {
     let mut idx = start;
     while idx < tokens.len() {
-        match tokens[idx].kind {
+        match &tokens[idx].kind {
             GroovyTokKind::LBrace => return Some(idx),
             GroovyTokKind::Semi | GroovyTokKind::Eq => return None,
+            GroovyTokKind::Ident(kw)
+                if matches!(
+                    kw.as_str(),
+                    "class" | "interface" | "enum" | "trait" | "package" | "import"
+                ) =>
+            {
+                return None;
+            }
             _ => idx += 1,
         }
     }
     None
+}
+
+fn has_spock_block_label(
+    tokens: &[GroovyTok],
+    body_open: usize,
+    body_end_idx: Option<usize>,
+    allowed_labels: &[&str],
+) -> bool {
+    let end = body_end_idx.unwrap_or(tokens.len());
+    let mut brace_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+
+    let mut k = body_open;
+    while k < end {
+        match &tokens[k].kind {
+            GroovyTokKind::LBrace => brace_depth += 1,
+            GroovyTokKind::RBrace => {
+                brace_depth = brace_depth.saturating_sub(1);
+                if brace_depth == 0 {
+                    break;
+                }
+            }
+            GroovyTokKind::LParen => paren_depth += 1,
+            GroovyTokKind::RParen => paren_depth = paren_depth.saturating_sub(1),
+            GroovyTokKind::LBracket => bracket_depth += 1,
+            GroovyTokKind::RBracket => bracket_depth = bracket_depth.saturating_sub(1),
+            GroovyTokKind::Ident(label)
+                if brace_depth == 1
+                    && paren_depth == 0
+                    && bracket_depth == 0
+                    && allowed_labels.contains(&label.as_str())
+                    && tokens
+                        .get(k + 1)
+                        .is_some_and(|next| next.kind == GroovyTokKind::Colon) =>
+            {
+                let at_stmt_start = k == body_open + 1
+                    || tokens[k - 1].line < tokens[k].line
+                    || matches!(
+                        tokens[k - 1].kind,
+                        GroovyTokKind::LBrace | GroovyTokKind::Semi
+                    );
+                if at_stmt_start {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    false
 }
 
 fn detect_groovy_entry_points(snapshot: &BufferSnapshot) -> Vec<EntryPoint> {
@@ -1777,6 +1960,79 @@ fn is_groovy_main_method(modifiers: &[(String, usize, usize)], param_tokens: &[G
     }
 }
 
+fn skip_balanced_angles(tokens: &[GroovyTok], open_idx: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = open_idx;
+    while i < tokens.len() {
+        match tokens[i].kind {
+            GroovyTokKind::LAngle => depth += 1,
+            GroovyTokKind::RAngle => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            GroovyTokKind::LBrace | GroovyTokKind::Semi => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    tokens.len()
+}
+
+/// Decides whether a Groovy method is a Spock feature method (quoted name in a Spock-like class,
+/// or an identifier-named method with Spock test block labels in a direct `Specification`).
+fn is_spock_feature_method(
+    scope: &GroovyClassScope,
+    method_name: &str,
+    is_quoted: bool,
+    tokens: &[GroovyTok],
+    body_open: usize,
+    body_end_idx: Option<usize>,
+) -> bool {
+    if scope.is_abstract {
+        return false;
+    }
+    if is_quoted {
+        scope.is_spock_direct()
+            || ends_with_spec_suffix(&scope.name)
+            || scope
+                .superclass_name
+                .as_deref()
+                .is_some_and(ends_with_spec_suffix)
+            || has_spock_block_label(tokens, body_open, body_end_idx, SPOCK_ANY_BLOCK_LABELS)
+    } else {
+        scope.is_spock_direct()
+            && !is_spock_lifecycle_or_main(method_name)
+            && has_spock_block_label(tokens, body_open, body_end_idx, SPOCK_TEST_BLOCK_LABELS)
+    }
+}
+
+fn unescape_groovy_string(raw: &str) -> String {
+    if !raw.contains('\\') {
+        return raw.to_owned();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\'') => out.push('\''),
+                Some('\\') | None => out.push('\\'),
+                Some('$') => out.push('$'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 fn skip_balanced_parens(tokens: &[GroovyTok], open_idx: usize) -> usize {
     let mut depth = 0usize;
     let mut i = open_idx;
@@ -1839,7 +2095,7 @@ fn scan_groovy_string(
                 && bytes[*i + 1] == quote
                 && bytes[*i + 2] == quote
             {
-                let content = source[content_start..*i].to_owned();
+                let content = unescape_groovy_string(&source[content_start..*i]);
                 *i += 3;
                 return Some(GroovyTok {
                     kind: GroovyTokKind::StringLit(content),
@@ -1864,7 +2120,7 @@ fn scan_groovy_string(
             return None;
         }
         if bytes[*i] == quote {
-            let content = source[content_start..*i].to_owned();
+            let content = unescape_groovy_string(&source[content_start..*i]);
             *i += 1;
             return Some(GroovyTok {
                 kind: GroovyTokKind::StringLit(content),
@@ -1948,6 +2204,11 @@ fn tokenize_groovy(source: &str) -> Vec<GroovyTok> {
         let kind = match b {
             b'@' => GroovyTokKind::At,
             b'.' => GroovyTokKind::Dot,
+            b':' => GroovyTokKind::Colon,
+            b'<' => GroovyTokKind::LAngle,
+            b'>' => GroovyTokKind::RAngle,
+            b'[' => GroovyTokKind::LBracket,
+            b']' => GroovyTokKind::RBracket,
             b'(' => GroovyTokKind::LParen,
             b')' => GroovyTokKind::RParen,
             b'{' => GroovyTokKind::LBrace,

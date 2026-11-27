@@ -508,3 +508,76 @@ fn entry_points_resilience_toml_json_empty_and_syntax_errors_utf8() {
         Some("https://example.com/search?q=zażółć")
     );
 }
+
+#[test]
+fn groovy_spock_and_junit_nested_entry_points_and_line_ranges() {
+    let source = r#"package com.example.billing
+
+import spock.lang.Specification
+import org.junit.jupiter.api.Nested
+import org.junit.jupiter.api.Test
+
+class InvoiceSpec extends Specification {
+    def "creates invoice for $10"() {
+        given:
+        def amount = 10
+
+        expect:
+        amount == 10
+    }
+
+    @Nested
+    class NestedSpec extends Specification {
+        def 'handles #caseName'(String caseName) {
+            expect:
+            caseName != null
+
+            where:
+            caseName << ["ok"]
+        }
+
+        @Test
+        void junitInsideSpock() {}
+    }
+}
+"#;
+    let (_snap, eps) = parse_and_detect(SyntaxLanguage::Groovy, source);
+    let classes: Vec<&EntryPoint> = eps
+        .iter()
+        .filter(|e| e.kind == EntryPointKind::JvmTestClass)
+        .collect();
+    assert_eq!(classes.len(), 2, "classes: {classes:?}");
+    assert_eq!(
+        classes[0].qualified_target(),
+        "com.example.billing.InvoiceSpec"
+    );
+    assert_eq!(
+        classes[1].qualified_target(),
+        "com.example.billing.InvoiceSpec$NestedSpec"
+    );
+
+    let methods: Vec<&EntryPoint> = eps
+        .iter()
+        .filter(|e| e.kind == EntryPointKind::JvmTestMethod)
+        .collect();
+    assert_eq!(methods.len(), 3, "methods: {methods:?}");
+    assert_eq!(
+        methods[0].qualified_target(),
+        "com.example.billing.InvoiceSpec#creates invoice for $10"
+    );
+    assert_eq!(methods[0].line, 7);
+    assert_eq!(methods[0].start_line, 7);
+    assert_eq!(methods[0].end_line, 13);
+
+    assert_eq!(
+        methods[1].qualified_target(),
+        "com.example.billing.InvoiceSpec$NestedSpec#handles #caseName"
+    );
+    assert_eq!(methods[1].line, 17);
+    assert_eq!(methods[1].end_line, 23);
+
+    assert_eq!(
+        methods[2].qualified_target(),
+        "com.example.billing.InvoiceSpec$NestedSpec#junitInsideSpock"
+    );
+}

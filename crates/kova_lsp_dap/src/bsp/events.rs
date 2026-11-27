@@ -422,7 +422,28 @@ fn test_id_from(display: &str, parent: Option<&TestId>, data: &Value) -> TestId 
     let junit_class = (data["dataKind"].as_str() == Some("junit-style-test-case-data"))
         .then(|| str_field(&data["data"], "className"))
         .flatten();
-    if let Some((class, method)) = display.split_once('#') {
+    if let Some(parent) = parent
+        && parent.method.is_none()
+    {
+        if let Some((class, method)) = display.split_once('#')
+            && class == parent.class_name
+        {
+            return TestId::method(class, strip_parens(method));
+        }
+        if let Some(open) = display.find('(')
+            && display.ends_with(')')
+        {
+            let inner = &display[open + 1..display.len() - 1];
+            if inner == parent.class_name {
+                return TestId::method(inner, &display[..open]);
+            }
+        }
+        return TestId::method(parent.class_name.clone(), strip_parens(display));
+    }
+    if let Some((class, method)) = display.split_once('#')
+        && !class.is_empty()
+        && !class.contains(' ')
+    {
         return TestId::method(class, strip_parens(method));
     }
     if let Some(open) = display.find('(')
@@ -435,11 +456,6 @@ fn test_id_from(display: &str, parent: Option<&TestId>, data: &Value) -> TestId 
     }
     if let Some(class) = junit_class {
         return TestId::method(class, strip_parens(display));
-    }
-    if let Some(parent) = parent
-        && parent.method.is_none()
-    {
-        return TestId::method(parent.class_name.clone(), strip_parens(display));
     }
     TestId::class(display)
 }
@@ -610,5 +626,41 @@ mod tests {
         assert!(BspStatusCode::from_code(1).is_ok());
         assert_eq!(BspStatusCode::from_code(3), BspStatusCode::Cancelled);
         assert_eq!(BspStatusCode::from_code(9), BspStatusCode::Error);
+    }
+
+    #[test]
+    fn spock_feature_and_unroll_bsp_events_preserve_full_method_name() {
+        let mut mapper = BspEventMapper::new();
+        mapper.map(&n(
+            "build/taskStart",
+            json!({"taskId": {"id": "c"}, "dataKind": "test-start",
+                   "data": {"displayName": "com.kova.spock.OrderSpec"}}),
+        ));
+        let start = mapper.map(&n(
+            "build/taskStart",
+            json!({"taskId": {"id": "m", "parents": ["c"]}, "eventTime": 1000,
+                   "dataKind": "test-start",
+                   "data": {"displayName": "should place order [item: book, #0]"}}),
+        ));
+        assert_eq!(
+            start,
+            vec![BspEvent::Test(TestEvent::TestStarted(TestId::method(
+                "com.kova.spock.OrderSpec",
+                "should place order [item: book, #0]"
+            )))]
+        );
+        let finish = mapper.map(&n(
+            "build/taskFinish",
+            json!({"taskId": {"id": "m", "parents": ["c"]}, "eventTime": 1025,
+                   "dataKind": "test-finish",
+                   "data": {"displayName": "should place order [item: book, #0]", "status": 1}}),
+        ));
+        assert!(matches!(
+            &finish[0],
+            BspEvent::Test(TestEvent::TestFinished { id, outcome })
+                if id.class_name == "com.kova.spock.OrderSpec"
+                    && id.method.as_deref() == Some("should place order [item: book, #0]")
+                    && outcome.status == TestStatus::Passed
+        ));
     }
 }

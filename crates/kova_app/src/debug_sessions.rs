@@ -8,25 +8,36 @@
 //! error in the *Debugger* dock instead of hanging.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use kova_config::{ProjectBuildTool, ProjectConfig};
+use kova_lsp_dap::bsp::{apply_submodule_scope, resolve_submodule_for_file};
 use kova_lsp_dap::dap::{
     BreakpointStore, DapClient, DapScope, DapStackFrame, DapVariable, DebugEvent, DebugSession,
     EvaluateContext, JavaAttachConfig, JavaLaunchConfig, OutputCategory, SourceBreakpoint,
     StepKind, VariablesFilter, VariablesPage,
 };
+use kova_toolchain::{ToolchainEnvOptions, resolve_executable, resolve_toolchain_env};
+use kova_tools::junit::{BuildTool, TestCommand, build_test_command};
 use kova_ui::debugger::{
-    BreakpointSpec, DebugCommand, DebugCommandSink, DebugLaunchRequest, DebugStep, DebugUpdate,
-    DebuggerStatus, EvaluateTarget, FrameItem, STACK_PAGE_SIZE, ThreadItem, VariableItem,
+    BreakpointSpec, DebugCommand, DebugCommandSink, DebugLaunchRequest, DebugStep, DebugTargetKind,
+    DebugUpdate, DebuggerStatus, EvaluateTarget, FrameItem, STACK_PAGE_SIZE, ThreadItem,
+    VariableItem,
 };
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::process::{Child, Command};
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::AppEvent;
 
 /// Environment variable naming a running `java-debug` DAP server (`host:port`).
 pub const DAP_ADAPTER_ENV: &str = "KOVA_DAP_ADAPTER";
+/// Default JDWP port opened by Gradle `--debug-jvm` and Maven `-Dmaven.surefire.debug`.
+const DEFAULT_JDWP_PORT: u16 = 5005;
 
 type Current = Arc<Mutex<Option<(u64, mpsc::UnboundedSender<DebugCommand>)>>>;
 
@@ -85,6 +96,215 @@ fn parse_endpoint(value: &str) -> Option<(String, u16)> {
     Some((host.to_owned(), port))
 }
 
+fn map_project_build_tool(project_root: &Path) -> Option<BuildTool> {
+    let cfg = ProjectConfig::load_optional(project_root).ok().flatten()?;
+    match cfg.build_tool? {
+        ProjectBuildTool::Auto => None,
+        ProjectBuildTool::Gradle => Some(BuildTool::Gradle),
+        ProjectBuildTool::Maven => Some(BuildTool::Maven),
+        ProjectBuildTool::Cargo => Some(BuildTool::Cargo),
+    }
+}
+
+/// Plans the Gradle `--debug-jvm` or Maven `-Dmaven.surefire.debug` test command for debugging
+/// a `JUnit` or `Spock` target.
+fn plan_jvm_test_debug_command(
+    project_root: &Path,
+    target: &str,
+    target_file: Option<&Path>,
+) -> Result<TestCommand, String> {
+    let tool = map_project_build_tool(project_root)
+        .or_else(|| BuildTool::detect(project_root))
+        .ok_or_else(|| "Debugging JVM tests requires a Gradle or Maven project".to_owned())?;
+    if !matches!(tool, BuildTool::Gradle | BuildTool::Maven) {
+        return Err("Debugging JVM tests requires a Gradle or Maven project".to_owned());
+    }
+    let targets = [target.to_owned()];
+    let mut cmd = build_test_command(tool, project_root, &targets, &[], &BTreeMap::new());
+    if let Some(submodule) = resolve_submodule_for_file(project_root, target_file) {
+        apply_submodule_scope(&mut cmd, project_root, &submodule);
+    }
+    match tool {
+        BuildTool::Gradle => {
+            if let Some(pos) = cmd.args.iter().position(|a| a == "--console=plain") {
+                cmd.args.insert(pos, "--debug-jvm".to_owned());
+            } else {
+                cmd.args.push("--debug-jvm".to_owned());
+            }
+        }
+        BuildTool::Maven => {
+            if let Some(pos) = cmd.args.iter().position(|a| a == "-B") {
+                cmd.args.insert(pos, "-Dmaven.surefire.debug".to_owned());
+            } else {
+                cmd.args.push("-Dmaven.surefire.debug".to_owned());
+            }
+        }
+        BuildTool::Cargo => {}
+    }
+    Ok(cmd)
+}
+
+fn spawn_test_for_jdwp(
+    command: &TestCommand,
+    reporter: &Reporter,
+) -> Result<(Child, oneshot::Receiver<()>), String> {
+    let toolchain = resolve_toolchain_env(&ToolchainEnvOptions {
+        project_root: Some(command.working_dir.clone()),
+        ..ToolchainEnvOptions::default()
+    });
+    let mut env_vars = toolchain.vars;
+    for (k, v) in &command.env {
+        env_vars.insert(k.clone(), v.clone());
+    }
+    let effective_path = env_vars
+        .get("PATH")
+        .map_or_else(OsString::new, OsString::from);
+    let mut resolved_program = resolve_executable(&command.program, &effective_path);
+    let mut resolved_args = command.args.clone();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&resolved_program)
+            && meta.is_file()
+            && meta.permissions().mode() & 0o111 == 0
+        {
+            let script = resolved_program.to_string_lossy().into_owned();
+            resolved_program = resolve_executable(Path::new("sh"), &effective_path);
+            resolved_args.insert(0, script);
+        }
+    }
+
+    let mut child = Command::new(&resolved_program)
+        .args(&resolved_args)
+        .envs(&env_vars)
+        .current_dir(&command.working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|err| format!("Failed to start `{}`: {err}", resolved_program.display()))?;
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
+
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(pump_test_debug_stream(
+            stdout,
+            false,
+            reporter.session_id,
+            reporter.events.clone(),
+            Arc::clone(&ready_tx),
+        ));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(pump_test_debug_stream(
+            stderr,
+            true,
+            reporter.session_id,
+            reporter.events.clone(),
+            ready_tx,
+        ));
+    }
+
+    Ok((child, ready_rx))
+}
+
+async fn pump_test_debug_stream<R: AsyncRead + Unpin>(
+    reader: R,
+    is_stderr: bool,
+    session_id: u64,
+    events: mpsc::UnboundedSender<AppEvent>,
+    ready_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.contains("Listening for transport dt_socket")
+            && let Some(tx) = ready_tx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        {
+            tx.send(()).ok();
+        }
+        let formatted = if is_stderr {
+            format!("[stderr] {line}\n")
+        } else {
+            format!("{line}\n")
+        };
+        drop(events.send(AppEvent::Debug {
+            session_id,
+            update: DebugUpdate::Output(formatted),
+        }));
+    }
+}
+
+/// Launches the Gradle/Maven test process with JDWP suspended and waits until it listens on
+/// [`DEFAULT_JDWP_PORT`]. `Err(None)` means the user stopped the session before it was ready.
+async fn start_jvm_test_debuggee(
+    request: &DebugLaunchRequest,
+    reporter: &Reporter,
+    commands: &mut mpsc::UnboundedReceiver<DebugCommand>,
+) -> Result<Child, Option<String>> {
+    let project_root = request
+        .project_root
+        .as_deref()
+        .ok_or_else(|| Some("Open a Gradle or Maven project to debug tests".to_owned()))?;
+    let cmd = plan_jvm_test_debug_command(
+        project_root,
+        &request.main_class,
+        request.target_file.as_deref(),
+    )
+    .map_err(Some)?;
+    reporter.send(DebugUpdate::Output(format!(
+        "Starting test debugger: {}\n",
+        cmd.display()
+    )));
+    let (mut child, mut ready_rx) = spawn_test_for_jdwp(&cmd, reporter).map_err(Some)?;
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(120));
+    tokio::pin!(timeout);
+    let outcome = loop {
+        tokio::select! {
+            res = &mut ready_rx => break if res.is_ok() {
+                Ok(())
+            } else {
+                Err(Some(format!(
+                    "Test process closed output before JDWP became ready on port {DEFAULT_JDWP_PORT}"
+                )))
+            },
+            status = child.wait() => break Err(Some(match status {
+                Ok(exit) => format!(
+                    "Test process exited ({exit}) before JDWP became ready on port {DEFAULT_JDWP_PORT}"
+                ),
+                Err(err) => format!("Test process failed before JDWP became ready: {err}"),
+            })),
+            cmd = commands.recv() => {
+                if matches!(cmd, None | Some(DebugCommand::Stop)) {
+                    break Err(None);
+                }
+            }
+            () = &mut timeout => break Err(Some(format!(
+                "Timed out waiting for JDWP listener on port {DEFAULT_JDWP_PORT}"
+            ))),
+        }
+    };
+    match outcome {
+        Ok(()) => Ok(child),
+        Err(message) => {
+            drop(child.kill().await);
+            Err(message)
+        }
+    }
+}
+
+/// Kills the Gradle/Maven test process backing a JVM test debug session, if any.
+async fn kill_test_child(child: &mut Option<Child>) {
+    if let Some(mut child) = child.take() {
+        drop(child.kill().await);
+    }
+}
+
 async fn run_session(
     request: DebugLaunchRequest,
     adapter: Option<String>,
@@ -102,19 +322,36 @@ async fn run_session(
         )));
         return;
     };
+
+    let mut test_child: Option<Child> = None;
+    let attach_port = if let Some(port) = request.attach_port {
+        Some(port)
+    } else if request.target_kind == DebugTargetKind::JvmTest {
+        match start_jvm_test_debuggee(&request, &reporter, &mut commands).await {
+            Ok(child) => test_child = Some(child),
+            Err(message) => {
+                reporter.terminated(message);
+                return;
+            }
+        }
+        Some(DEFAULT_JDWP_PORT)
+    } else {
+        None
+    };
+
     let (client, adapter_events) = match DapClient::connect_tcp(&host, port).await {
         Ok(connected) => connected,
         Err(err) => {
+            kill_test_child(&mut test_child).await;
             reporter.terminated(Some(err.to_string()));
             return;
         }
     };
     let mut session =
         DebugSession::new(client, adapter_events).with_breakpoints(store_of(&request.breakpoints));
-    let target = match request.attach_port {
+    let target = match attach_port {
         Some(port) => JavaAttachConfig::localhost(port).target(),
         None => JavaLaunchConfig {
-            // `Class#method` test targets launch their class.
             main_class: request
                 .main_class
                 .split('#')
@@ -127,6 +364,7 @@ async fn run_session(
         .target(),
     };
     if let Err(err) = session.start(&target).await {
+        kill_test_child(&mut test_child).await;
         reporter.terminated(Some(err.to_string()));
         return;
     }
@@ -160,6 +398,7 @@ async fn run_session(
             }
         };
         if !keep_going {
+            kill_test_child(&mut test_child).await;
             break;
         }
     }
@@ -451,6 +690,8 @@ mod tests {
             session_id: 3,
             label: "App".to_owned(),
             main_class: "com.acme.App".to_owned(),
+            target_kind: DebugTargetKind::MainClass,
+            target_file: None,
             attach_port: None,
             project_root: None,
             breakpoints: BTreeMap::new(),
@@ -465,5 +706,78 @@ mod tests {
             DebugUpdate::Status(DebuggerStatus::Terminated { message: Some(ref m) })
                 if m.contains(DAP_ADAPTER_ENV)
         ));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let test_request = DebugLaunchRequest {
+            session_id: 4,
+            label: "OrderSpec.creates".to_owned(),
+            main_class: "com.acme.OrderSpec#creates".to_owned(),
+            target_kind: DebugTargetKind::JvmTest,
+            target_file: None,
+            attach_port: None,
+            project_root: None,
+            breakpoints: BTreeMap::new(),
+        };
+        run_session(test_request, None, commands_rx, tx).await;
+        let Some(AppEvent::Debug { session_id, update }) = rx.recv().await else {
+            panic!("expected a debug update");
+        };
+        assert_eq!(session_id, 4);
+        assert!(matches!(
+            update,
+            DebugUpdate::Status(DebuggerStatus::Terminated { message: Some(ref m) })
+                if m.contains(DAP_ADAPTER_ENV)
+        ));
+    }
+
+    #[test]
+    fn plans_jvm_test_debug_commands_for_gradle_maven_and_submodules() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(plan_jvm_test_debug_command(tmp.path(), "a.B#c", None).is_err());
+
+        std::fs::write(tmp.path().join("settings.gradle.kts"), "").unwrap();
+        let sub = tmp.path().join("api");
+        let spec = sub.join("src/test/groovy/com/kova/OrderSpec.groovy");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        std::fs::write(sub.join("build.gradle.kts"), "").unwrap();
+        std::fs::write(&spec, "").unwrap();
+
+        let gradle = plan_jvm_test_debug_command(
+            tmp.path(),
+            "com.kova.OrderSpec#should cost $10 (#1)",
+            Some(&spec),
+        )
+        .unwrap();
+        assert_eq!(
+            gradle.args,
+            vec![
+                ":api:test",
+                "--tests",
+                "com.kova.OrderSpec.should cost $10 (#1)",
+                "--continue",
+                "--debug-jvm",
+                "--console=plain",
+            ]
+        );
+
+        std::fs::write(tmp.path().join("pom.xml"), "<project/>").unwrap();
+        std::fs::write(sub.join("pom.xml"), "<project/>").unwrap();
+        std::fs::write(tmp.path().join("kova.toml"), "build_tool = \"maven\"\n").unwrap();
+        let maven =
+            plan_jvm_test_debug_command(tmp.path(), "com.kova.OrderSpec#should work", Some(&spec))
+                .unwrap();
+        assert_eq!(
+            maven.args,
+            vec![
+                "test",
+                "-pl",
+                "api",
+                "-Dtest=com.kova.OrderSpec#should work",
+                "-Dsurefire.failIfNoSpecifiedTests=false",
+                "-Dmaven.surefire.debug",
+                "-B",
+            ]
+        );
     }
 }

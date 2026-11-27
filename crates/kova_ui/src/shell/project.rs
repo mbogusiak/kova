@@ -596,6 +596,7 @@ impl WorkspaceShell {
         self.new_item_modal.clear_bounds();
         self.project_options_open = false;
         self.project_options_bounds.set(None);
+        self.context_menu = None;
         self.structure = StructureModel::default();
         self.bottom_panel = BottomPanelModel::default();
         self.test_runner.set_project_files(Vec::new());

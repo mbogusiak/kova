@@ -194,6 +194,112 @@ pub enum TreeActivation {
     OpenFile(PathBuf),
 }
 
+/// Returns `true` when `name` follows JVM test naming conventions (`*Test.*`, `*Tests.*`,
+/// `*IT.*`, `Test*.*`, `*Spec.groovy`, `*Specification.groovy`, `*Spec.kt`).
+#[must_use]
+pub fn is_test_file_name(name: &str) -> bool {
+    let path = Path::new(name);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "java" | "kt" | "groovy") {
+        return false;
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let lower = stem.to_ascii_lowercase();
+    lower.ends_with("test")
+        || lower.ends_with("tests")
+        || stem.ends_with("IT")
+        || stem.starts_with("Test")
+        || (ext == "groovy" && (lower.ends_with("spec") || lower.ends_with("specification")))
+        || (ext == "kt" && lower.ends_with("spec"))
+}
+
+/// Returns `true` when `rel_path` is a JVM test file by naming convention or test source root.
+#[must_use]
+pub fn is_test_file_path(rel_path: &Path) -> bool {
+    let Some(ext) = rel_path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if !matches!(ext.to_ascii_lowercase().as_str(), "java" | "kt" | "groovy") {
+        return false;
+    }
+    let name_matches = rel_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_test_file_name);
+    name_matches || is_in_test_source_root(rel_path)
+}
+
+fn normal_segments(path: &Path) -> Vec<&str> {
+    path.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_test_source_segment(seg: &str) -> bool {
+    matches!(seg, "test" | "integrationTest" | "it" | "testFixtures")
+}
+
+fn is_in_test_source_root(rel_path: &Path) -> bool {
+    let segs = normal_segments(rel_path);
+    segs.windows(2)
+        .any(|w| w[0] == "src" && is_test_source_segment(w[1]))
+}
+
+fn is_test_source_root_or_package_dir(rel_path: &Path) -> bool {
+    let segs = normal_segments(rel_path);
+    let Some(src_idx) = segs
+        .windows(2)
+        .position(|w| w[0] == "src" && is_test_source_segment(w[1]))
+    else {
+        return false;
+    };
+    let rest = &segs[src_idx + 2..];
+    rest.is_empty() || matches!(rest[0], "java" | "kotlin" | "groovy")
+}
+
+/// Extracts the dotted package name when `rel_path` points to a package directory under
+/// `src/{test,integrationTest,it,testFixtures}/{java,kotlin,groovy}/<pkg_dirs>`.
+#[must_use]
+pub fn test_package_for_dir(rel_path: &Path) -> Option<String> {
+    let segs = normal_segments(rel_path);
+    let src_idx = segs.windows(3).position(|w| {
+        w[0] == "src"
+            && is_test_source_segment(w[1])
+            && matches!(w[2], "java" | "kotlin" | "groovy")
+    })?;
+    let pkg_parts = &segs[src_idx + 3..];
+    if pkg_parts.is_empty() {
+        None
+    } else {
+        Some(pkg_parts.join("."))
+    }
+}
+
+/// Derives a fallback FQCN for a JVM test file path relative to the project root.
+#[must_use]
+pub fn fallback_fqcn_for_test_file(rel_path: &Path) -> Option<String> {
+    let stem = rel_path.file_stem()?.to_str()?.trim();
+    if stem.is_empty() {
+        return None;
+    }
+    let parent = rel_path.parent().unwrap_or_else(|| Path::new(""));
+    if let Some(pkg) = test_package_for_dir(parent) {
+        Some(format!("{pkg}.{stem}"))
+    } else {
+        Some(stem.to_owned())
+    }
+}
+
 /// Returns the short type badge for a file name (`J`, `T`, `K`, `G`, `Y`, `<>`, `DB`, `H`, `⚙`, `≡`, `{}`, `·`).
 #[must_use]
 pub fn lang_hint_for(name: &str) -> &'static str {
@@ -203,16 +309,9 @@ pub fn lang_hint_for(name: &str) -> &'static str {
         .and_then(|e| e.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
     if name.eq_ignore_ascii_case("kova.toml") {
         "⚙"
-    } else if matches!(ext.as_str(), "java" | "kt" | "groovy")
-        && (stem.ends_with("test") || stem.ends_with("tests"))
-    {
+    } else if is_test_file_name(name) {
         "T"
     } else {
         match ext.as_str() {
@@ -741,6 +840,18 @@ impl ProjectTreeModel {
         }
     }
 
+    /// Returns `true` when `rel_path` represents the project root, a test source root, a test
+    /// package directory, or any directory containing at least one test file in its subtree.
+    #[must_use]
+    pub fn is_test_directory(&self, rel_path: &Path) -> bool {
+        if rel_path.as_os_str().is_empty() || is_test_source_root_or_package_dir(rel_path) {
+            return true;
+        }
+        self.nodes.iter().any(|node| {
+            !node.is_dir() && node.path.starts_with(rel_path) && is_test_file_path(&node.path)
+        })
+    }
+
     /// Inserts a newly created file or directory (plus any missing intermediate directories)
     /// into the flattened tree in sorted order (`directories` before `files`, case-insensitive),
     /// expands its ancestors, and reveals/selects the created entry.
@@ -1262,5 +1373,60 @@ mod tests {
         assert_eq!(file_icon_kind_for("verify.sh"), FileIconKind::Shell);
         assert_eq!(file_icon_kind_for(".gitignore"), FileIconKind::DotConfig);
         assert_eq!(file_icon_kind_for("notes.txt"), FileIconKind::Generic);
+    }
+
+    #[test]
+    fn spock_and_junit_test_file_and_directory_predicates() {
+        assert_eq!(lang_hint_for("OrderSpec.groovy"), "T");
+        assert_eq!(lang_hint_for("OrderSpecification.groovy"), "T");
+        assert_eq!(lang_hint_for("OrderSpec.kt"), "T");
+        assert_eq!(lang_hint_for("OrderIT.java"), "T");
+        assert_eq!(lang_hint_for("TestOrder.java"), "T");
+
+        assert!(is_test_file_path(Path::new(
+            "src/test/groovy/com/kova/OrderSpec.groovy"
+        )));
+        assert!(is_test_file_path(Path::new(
+            "src/test/java/com/kova/Helper.java"
+        )));
+        assert!(!is_test_file_path(Path::new(
+            "src/main/java/com/kova/Order.java"
+        )));
+        assert!(!is_test_file_path(Path::new("build.gradle")));
+
+        assert_eq!(
+            test_package_for_dir(Path::new("src/test/groovy/com/kova/orders")),
+            Some("com.kova.orders".to_owned())
+        );
+        assert_eq!(
+            test_package_for_dir(Path::new("services/api/src/integrationTest/java/com/kova")),
+            Some("com.kova".to_owned())
+        );
+        assert_eq!(test_package_for_dir(Path::new("src/test/groovy")), None);
+        assert_eq!(
+            fallback_fqcn_for_test_file(Path::new(
+                "src/test/groovy/com/kova/orders/OrderSpec.groovy"
+            )),
+            Some("com.kova.orders.OrderSpec".to_owned())
+        );
+
+        let tree = ProjectTreeModel::from_nodes(vec![
+            root_node("shop", "~/shop"),
+            dir(1, "src", 1, true),
+            dir(2, "src/main", 2, true),
+            dir(3, "src/main/java", 3, true),
+            file(4, "src/main/java/App.java", 4),
+            dir(5, "src/test", 2, true),
+            dir(6, "src/test/groovy", 3, true),
+            dir(7, "src/test/groovy/com/kova", 4, true),
+            file(8, "src/test/groovy/com/kova/OrderSpec.groovy", 5),
+        ]);
+        assert!(tree.is_test_directory(Path::new("")));
+        assert!(tree.is_test_directory(Path::new("src")));
+        assert!(tree.is_test_directory(Path::new("src/test")));
+        assert!(tree.is_test_directory(Path::new("src/test/groovy")));
+        assert!(tree.is_test_directory(Path::new("src/test/groovy/com/kova")));
+        assert!(!tree.is_test_directory(Path::new("src/main")));
+        assert!(!tree.is_test_directory(Path::new("src/main/java")));
     }
 }

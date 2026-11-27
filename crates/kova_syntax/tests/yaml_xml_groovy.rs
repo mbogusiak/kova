@@ -698,6 +698,145 @@ class OrderServiceTest {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture covering direct, indirect, nested and abstract Spock specs"
+)]
+fn groovy_entry_points_detect_spock_specs_and_ignore_abstract_or_helpers() {
+    let (engine, _) = setup();
+
+    let spock_src = r#"package com.kova.spock
+
+import spock.lang.Specification
+import spock.lang.Unroll
+
+abstract class BaseIntegrationSpec extends Specification {
+    def "abstract base feature should not run"() {
+        expect:
+        1 == 1
+    }
+}
+
+class OrderSpec extends spock.lang.Specification {
+    def setup() {}
+    def cleanup() {}
+    def setupSpec() {}
+    def cleanupSpec() {}
+    private void helper() {
+        def map = [expect: 1, when: 2]
+        assert map.expect == 1
+    }
+
+    def "should create order with \"quoted\" item and \$price"() {
+        given: "an order"
+        def price = 10
+
+        expect:
+        price == 10
+    }
+
+    @Unroll
+    void 'calculates total for #qty items'(int qty, int expected) {
+        expect:
+        qty * 2 == expected
+
+        where:
+        qty | expected
+        1   | 2
+    }
+
+    def unquotedFeatureMethod() {
+        when:
+        def x = 2 + 2
+
+        then:
+        x == 4
+    }
+
+    def """triple quoted feature"""() {
+        expect:
+        true
+    }
+
+    def ""() {}
+
+    abstract def "abstract method ignored"() {
+        expect:
+        false
+    }
+}
+
+class ApiSpec extends BaseIntegrationSpec {
+    def "returns 200 OK"() {
+        expect:
+        200 == 200
+    }
+}
+
+class IndirectCustomBase extends CustomHelperBase {
+    def "detected via block label"() {
+        when:
+        def a = 1
+        then:
+        a == 1
+    }
+
+    def notASpockTest() {
+        return 42
+    }
+}
+"#;
+    let (snap, tree) = parse(&engine, SyntaxLanguage::Groovy, spock_src);
+    let eps = detect_entry_points(&tree, &snap);
+
+    let targets: Vec<(&str, kova_syntax::EntryPointKind)> =
+        eps.iter().map(|ep| (ep.id.as_str(), ep.kind)).collect();
+
+    assert!(targets.contains(&(
+        "com.kova.spock.OrderSpec",
+        kova_syntax::EntryPointKind::JvmTestClass
+    )));
+    assert!(targets.contains(&(
+        "com.kova.spock.OrderSpec#should create order with \"quoted\" item and $price",
+        kova_syntax::EntryPointKind::JvmTestMethod
+    )));
+    assert!(targets.contains(&(
+        "com.kova.spock.OrderSpec#calculates total for #qty items",
+        kova_syntax::EntryPointKind::JvmTestMethod
+    )));
+    assert!(targets.contains(&(
+        "com.kova.spock.OrderSpec#unquotedFeatureMethod",
+        kova_syntax::EntryPointKind::JvmTestMethod
+    )));
+    assert!(targets.contains(&(
+        "com.kova.spock.OrderSpec#triple quoted feature",
+        kova_syntax::EntryPointKind::JvmTestMethod
+    )));
+    assert!(targets.contains(&(
+        "com.kova.spock.ApiSpec",
+        kova_syntax::EntryPointKind::JvmTestClass
+    )));
+    assert!(targets.contains(&(
+        "com.kova.spock.ApiSpec#returns 200 OK",
+        kova_syntax::EntryPointKind::JvmTestMethod
+    )));
+    assert!(targets.contains(&(
+        "com.kova.spock.IndirectCustomBase",
+        kova_syntax::EntryPointKind::JvmTestClass
+    )));
+    assert!(targets.contains(&(
+        "com.kova.spock.IndirectCustomBase#detected via block label",
+        kova_syntax::EntryPointKind::JvmTestMethod
+    )));
+
+    // Abstract classes, lifecycle methods, helpers, empty names, and non-Spock methods must be excluded.
+    assert_eq!(eps.len(), 9, "unexpected Spock entry points: {eps:?}");
+    for ep in &eps {
+        assert!(ep.start_line <= ep.line && ep.line <= ep.end_line);
+    }
+}
+
+#[test]
 fn deep_nesting_respects_max_structure_depth() {
     let (engine, _) = setup();
     let mut xml = String::new();

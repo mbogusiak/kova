@@ -147,6 +147,17 @@ pub enum EditorEvent {
         /// Primary caret byte offset immediately after the character was inserted.
         cursor_byte: usize,
     },
+    /// Right-click in the editor surface or gutter (`KOVA-063`).
+    ContextMenuRequested {
+        /// Window-space cursor position where the popup should anchor.
+        position: Point<Pixels>,
+        /// 0-based buffer row under the cursor.
+        row: usize,
+        /// Clamped UTF-8 byte offset under the cursor.
+        byte: usize,
+        /// Whether the click landed in the gutter rather than the code area.
+        in_gutter: bool,
+    },
 }
 
 /// Identifier currently underlined under `Cmd+Hover` / `Ctrl+Hover` (`KOVA-051`).
@@ -1777,13 +1788,23 @@ impl EditorView {
         self.finish_input(started, changed, cx);
     }
 
-    fn copy_action(&mut self, _: &actions::Copy, _window: &mut Window, cx: &mut Context<'_, Self>) {
+    /// Returns `true` when `byte` points to a navigable identifier (`Go to Definition`).
+    #[must_use]
+    pub fn can_go_to_definition_at(&self, byte: usize) -> bool {
+        self.language_hint != SourceLanguageKind::Unknown
+            && navigable_identifier_at_byte(&self.state.snapshot(), byte, self.language_hint)
+                .is_some()
+    }
+
+    /// Copies the current selection (or active line) to the system clipboard.
+    pub fn copy_selection(&mut self, cx: &mut Context<'_, Self>) {
         if let Some(text) = self.state.copy() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
-    fn cut_action(&mut self, _: &actions::Cut, window: &mut Window, cx: &mut Context<'_, Self>) {
+    /// Cuts the current selection (or active line) to the system clipboard.
+    pub fn cut_selection(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
         self.run_edit(window, cx, |state, cx| {
             state.cut().is_some_and(|text| {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -1792,17 +1813,30 @@ impl EditorView {
         });
     }
 
+    /// Pastes plain text from the system clipboard at the active cursor(s).
+    pub fn paste_from_clipboard(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.run_edit(window, cx, |state, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .is_some_and(|text| state.paste(&text))
+        });
+    }
+
+    fn copy_action(&mut self, _: &actions::Copy, _window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.copy_selection(cx);
+    }
+
+    fn cut_action(&mut self, _: &actions::Cut, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.cut_selection(window, cx);
+    }
+
     fn paste_action(
         &mut self,
         _: &actions::Paste,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.run_edit(window, cx, |state, cx| {
-            cx.read_from_clipboard()
-                .and_then(|item| item.text())
-                .is_some_and(|text| state.paste(&text))
-        });
+        self.paste_from_clipboard(window, cx);
     }
 
     fn select_all_action(
@@ -2005,6 +2039,37 @@ impl EditorView {
         }
         cx.stop_propagation();
         self.finish_input(started, false, cx);
+    }
+
+    fn handle_right_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        window.focus(&self.focus_handle);
+        self.reset_cursor_blink(window, cx);
+        self.state.sync_external_edits();
+        cx.emit(EditorEvent::Focused);
+
+        let (row, byte, in_gutter) = self.hit_test_point(event.position);
+        if !in_gutter {
+            let inside_selection = self.state.selections().as_slice().iter().any(|sel| {
+                let range = sel.range();
+                !range.is_empty() && byte >= range.start && byte <= range.end
+            });
+            if !inside_selection {
+                self.state.set_caret(byte);
+            }
+        }
+        cx.emit(EditorEvent::ContextMenuRequested {
+            position: event.position,
+            row,
+            byte,
+            in_gutter,
+        });
+        cx.stop_propagation();
+        cx.notify();
     }
 
     /// Handles single clicks on the gutter `▶` / fold chevron slots and on `... (N lines)`
@@ -2269,6 +2334,10 @@ impl Render for EditorView {
             }))
             .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(Self::handle_right_mouse_down),
+            )
             .on_mouse_move(cx.listener(Self::handle_hover_move))
             .child(EditorCanvasElement::new(cx.entity()));
         if self.find_bar.is_open() {
