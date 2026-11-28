@@ -5,6 +5,7 @@
 
 pub mod jdk_fallback;
 pub mod resolver;
+pub mod types;
 
 use std::ops::Range;
 use std::path::Path;
@@ -22,6 +23,11 @@ pub use jdk_fallback::{
 pub use resolver::{
     LocalCompletionResult, ReceiverTarget, resolve_local_completion, resolve_receiver_target,
 };
+pub use types::{
+    ComposedCompletionEdit, TYPE_COMPLETION_LIMIT, TypeCandidate, build_type_proposals,
+    compose_completion_edits, import_edit_for_type, project_type_candidates, type_name_matches,
+    type_requires_import,
+};
 
 /// Visual category of a completion proposal (`M` / `F` / `C` / `K`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,10 +40,14 @@ pub enum CompletionProposalKind {
     Field,
     /// Local variable or function parameter.
     Variable,
-    /// Class or record type.
+    /// Class type.
     Class,
+    /// Java 16+ record type.
+    Record,
     /// Interface type.
     Interface,
+    /// Annotation type (`@interface`).
+    Annotation,
     /// Enum type.
     Enum,
     /// Rust struct.
@@ -58,13 +68,49 @@ impl CompletionProposalKind {
             Self::Method | Self::Constructor => 'M',
             Self::Field | Self::Variable => 'F',
             Self::Class
+            | Self::Record
             | Self::Interface
+            | Self::Annotation
             | Self::Enum
             | Self::Struct
             | Self::Trait
             | Self::Module => 'C',
             Self::Keyword => 'K',
         }
+    }
+
+    /// `IntelliJ`-style letter drawn inside the round kind icon (`C`, `I`, `E`, `@`, `m`, `f`, ...).
+    #[must_use]
+    pub const fn icon_letter(self) -> char {
+        match self {
+            Self::Method | Self::Constructor => 'm',
+            Self::Field => 'f',
+            Self::Variable => 'v',
+            Self::Class => 'C',
+            Self::Record => 'R',
+            Self::Interface => 'I',
+            Self::Annotation => '@',
+            Self::Enum => 'E',
+            Self::Struct => 'S',
+            Self::Trait => 'T',
+            Self::Module => 'p',
+            Self::Keyword => 'k',
+        }
+    }
+
+    /// Whether this kind denotes a type (class, interface, enum, record, ...).
+    #[must_use]
+    pub const fn is_type(self) -> bool {
+        matches!(
+            self,
+            Self::Class
+                | Self::Record
+                | Self::Interface
+                | Self::Annotation
+                | Self::Enum
+                | Self::Struct
+                | Self::Trait
+        )
     }
 }
 
@@ -79,6 +125,8 @@ pub enum CompletionSource {
     JdkBytecode,
     /// Built-in deterministic JDK fallback catalog.
     JdkBuiltin,
+    /// Gradle / Maven dependency `.jar` bytecode (`KOVA-074`).
+    Library,
     /// Language keyword.
     Keyword,
     /// Language server (`jdt.ls` `textDocument/completion`).
@@ -133,16 +181,54 @@ pub struct CompletionProposal {
     pub is_deprecated: bool,
     /// Base ordering tier (`0` = highest local/static priority, `3` = `Object`, `5` = keyword).
     pub sort_priority: u16,
+    /// Whether the member is `static` (drawn as a diamond badge on the kind icon).
+    pub is_static: bool,
+    /// Generic type parameters shown after a type name (e.g. `"<T>"`).
+    pub type_params: Option<String>,
+    /// Fully-qualified name of a type proposal (identity for de-duplication and auto-import).
+    pub fqcn: Option<String>,
 }
 
 impl CompletionProposal {
     /// Text displayed on the right edge of the completion row (`return_type` or `detail_right`).
+    ///
+    /// Type proposals show their package inline (see [`Self::inline_detail`]) instead.
     #[must_use]
     pub fn right_label(&self) -> Option<&str> {
+        if self.kind.is_type() {
+            return self.return_type.as_deref().filter(|s| !s.is_empty());
+        }
         self.return_type
             .as_deref()
             .filter(|s| !s.is_empty())
             .or_else(|| self.detail_right.as_deref().filter(|s| !s.is_empty()))
+    }
+
+    /// Muted text rendered right after the label: `<T>` + package for types (`"<T> java.util.function"`),
+    /// the parameter list for callables (`"(int index, int length)"`).
+    #[must_use]
+    pub fn inline_detail(&self) -> Option<String> {
+        if self.kind.is_type() {
+            let params = self.type_params.as_deref().unwrap_or_default();
+            let pkg = self.detail_right.as_deref().unwrap_or_default();
+            let joined = match (params.is_empty(), pkg.is_empty()) {
+                (true, true) => return None,
+                (false, true) => params.to_owned(),
+                (true, false) => pkg.to_owned(),
+                (false, false) => format!("{params} {pkg}"),
+            };
+            return Some(joined);
+        }
+        self.params_signature.clone().filter(|s| !s.is_empty())
+    }
+
+    /// Identity used to merge Level-1 and Level-2 results: FQCN for types, `label + params` otherwise.
+    #[must_use]
+    pub fn identity_key(&self) -> (String, Option<String>) {
+        if let Some(fqcn) = self.fqcn.as_deref().filter(|_| self.kind.is_type()) {
+            return (fqcn.to_owned(), None);
+        }
+        (self.label.clone(), self.params_signature.clone())
     }
 }
 
@@ -153,6 +239,73 @@ pub enum CompletionTriggerKind {
     Invoked,
     /// Auto-triggered after typing `.` or `:` (second colon of `::`).
     AutoChar(char),
+    /// Auto-triggered while typing an identifier (`IntelliJ` as-you-type popup, `KOVA-074`).
+    AutoIdentifier,
+}
+
+/// Minimum identifier length that auto-opens the as-you-type completion popup (`KOVA-074`).
+pub const AUTO_TRIGGER_MIN_IDENT_CHARS: usize = 2;
+
+/// Returns `true` when the identifier ending at `cursor_byte` (just typed) should open the
+/// as-you-type completion popup (`KOVA-074` §FR-1).
+///
+/// Requires at least [`AUTO_TRIGGER_MIN_IDENT_CHARS`] identifier characters, a non-digit first
+/// character, a supported language, and rejects comments, string literals and `package` / `import`
+/// lines.
+#[must_use]
+pub fn should_auto_trigger_identifier_completion(
+    snapshot: &BufferSnapshot,
+    lang: SourceLanguageKind,
+    cursor_byte: usize,
+) -> bool {
+    if lang == SourceLanguageKind::Unknown {
+        return false;
+    }
+    let len = snapshot.len_bytes();
+    let cursor = snapshot.clamp_byte_to_char_boundary(cursor_byte.min(len));
+    if cursor == 0 {
+        return false;
+    }
+    let Ok(pt) = snapshot.byte_to_point(cursor) else {
+        return false;
+    };
+    let line_start = snapshot.rope().line_to_byte(pt.row);
+    let Ok(line_slice) = snapshot.line_slice(pt.row) else {
+        return false;
+    };
+    let line: String = line_slice.chunks().collect();
+    let rel = cursor.saturating_sub(line_start).min(line.len());
+    if !line.is_char_boundary(rel) {
+        return false;
+    }
+    let before = &line[..rel];
+    // The caret must sit at the end of the identifier (not in the middle of a word).
+    if line[rel..].chars().next().is_some_and(is_ident_char) {
+        return false;
+    }
+    let token_start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_ident_char(*c))
+        .last()
+        .map_or(rel, |(idx, _)| idx);
+    let token = &before[token_start..];
+    if token.chars().count() < AUTO_TRIGGER_MIN_IDENT_CHARS
+        || token.chars().next().is_none_or(|c| c.is_ascii_digit())
+    {
+        return false;
+    }
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("package ") || trimmed.starts_with("import ") {
+        return false;
+    }
+    if lang == SourceLanguageKind::Rust
+        && (trimmed.starts_with("use ") || trimmed.starts_with("mod "))
+    {
+        return false;
+    }
+    let check_rel = rel - 1;
+    !is_inside_comment_or_string_or_block(snapshot, &line, check_rel, line_start + check_rel, lang)
 }
 
 /// Member-access separator immediately before the completion anchor.
@@ -1033,6 +1186,9 @@ class Demo {
             source: CompletionSource::JdkBuiltin,
             is_deprecated,
             sort_priority,
+            is_static: false,
+            type_params: None,
+            fqcn: None,
         };
 
         let items = vec![

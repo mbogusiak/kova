@@ -358,6 +358,9 @@ fn method_reference_and_lsp_auto_import_apply_atomically() {
         source: CompletionSource::Lsp,
         is_deprecated: false,
         sort_priority: 1,
+        is_static: false,
+        type_params: None,
+        fqcn: None,
     };
     prop.additional_text_edits[0].new_text = "import java.util.Objects;\n".to_owned();
     let mut ed4 = EditorState::from_text("class Demo { void f() { Objects.req } }\n");

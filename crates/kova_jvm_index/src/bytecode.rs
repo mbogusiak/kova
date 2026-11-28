@@ -19,8 +19,9 @@ use crate::model::{
     split_package_and_simple,
 };
 use crate::signature::{
-    decode_constructor_descriptor, decode_constructor_signature, decode_field_descriptor,
-    decode_field_signature, decode_method_descriptor, decode_method_signature,
+    TypeDisplayMode, decode_constructor_descriptor, decode_constructor_signature,
+    decode_field_descriptor, decode_field_signature, decode_method_descriptor,
+    decode_method_signature, parse_class_signature,
 };
 
 /// Default per-classfile decompression safety limit (`16 MiB`) to guard against zip bombs.
@@ -198,6 +199,84 @@ pub fn parse_class_bytes(
     };
 
     Ok(Some(ParsedClassUnit { ty, members }))
+}
+
+/// Lightweight class-header summary used by as-you-type type completion (`KOVA-074`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JvmTypeSummary {
+    /// Canonical FQCN (`java.util.function.ObjIntConsumer`).
+    pub fqcn: String,
+    /// Type kind (`Class`, `Interface`, `Enum`, `Record`, `Annotation`).
+    pub kind: JvmSymbolKind,
+    /// Whether the type is `public` (top-level access flag or `InnerClasses` entry).
+    pub is_public: bool,
+    /// Whether the type is `@Deprecated`.
+    pub is_deprecated: bool,
+    /// Generic parameter names only (`Some("<T>")`, `Some("<K, V>")`), bounds stripped.
+    pub type_params: Option<String>,
+}
+
+/// Parses only the header of `bytes` (access flags, kind, `Signature`) without members or code.
+#[must_use]
+pub fn summarize_class_bytes(bytes: &[u8]) -> Option<JvmTypeSummary> {
+    let mut parse_opts = ParseOptions::default();
+    parse_opts.parse_bytecode(false);
+    let class_file = cafebabe::parse_class_with_options(bytes, &parse_opts).ok()?;
+    if class_file.access_flags.contains(ClassAccessFlags::MODULE)
+        || class_file
+            .access_flags
+            .contains(ClassAccessFlags::SYNTHETIC)
+    {
+        return None;
+    }
+    let inner_entry = find_self_inner_class(&class_file);
+    let modifiers = resolve_class_modifiers(&class_file, inner_entry, false);
+    let type_params = find_signature_attribute(&class_file.attributes)
+        .and_then(|raw| parse_class_signature(raw, TypeDisplayMode::Short).ok())
+        .and_then(|decoded| decoded.type_parameters)
+        .map(|params| type_parameter_names(&params));
+    Some(JvmTypeSummary {
+        fqcn: internal_name_to_fqcn(class_file.this_class.as_ref()),
+        kind: classify_symbol_kind(&class_file),
+        is_public: modifiers.visibility == JvmVisibility::Public,
+        is_deprecated: modifiers.is_deprecated,
+        type_params,
+    })
+}
+
+/// `"<T extends Comparable<T>, U>"` → `"<T, U>"`.
+#[must_use]
+pub fn type_parameter_names(decoded: &str) -> String {
+    let inner = decoded
+        .trim()
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(decoded);
+    let mut names = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for ch in inner.chars() {
+        match ch {
+            '<' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '>' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                names.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    names.push(current);
+    let names: Vec<&str> = names
+        .iter()
+        .filter_map(|p| p.split_whitespace().next())
+        .collect();
+    format!("<{}>", names.join(", "))
 }
 
 /// Scans all `.class` entries inside a `.jar`, `.zip`, or `.jmod` archive using a single

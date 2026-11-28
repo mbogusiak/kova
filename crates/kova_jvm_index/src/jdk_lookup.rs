@@ -6,15 +6,19 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read as _};
+use std::io::{BufReader, Cursor, Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use zip::ZipArchive;
 
-use crate::bytecode::{BytecodeScanOptions, DEFAULT_MAX_CLASS_BYTES, parse_class_bytes};
+use crate::bytecode::{
+    BytecodeScanOptions, DEFAULT_MAX_CLASS_BYTES, JvmTypeSummary, parse_class_bytes,
+    summarize_class_bytes,
+};
 use crate::model::{JvmSourceOrigin, JvmSymbolKind, JvmVisibility, ParsedClassUnit};
 use crate::snapshot::JvmIndexSnapshot;
+use crate::source::{SourceScanOptions, parse_java_source};
 
 /// Header preceding the ZIP stream in JDK `.jmod` files.
 const JMOD_MAGIC: [u8; 4] = [b'J', b'M', 1, 0];
@@ -144,13 +148,51 @@ fn split_top_level_colon(sig: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// Package prefixes whose public JDK types are offered by as-you-type class completion.
+const API_PACKAGE_PREFIXES: &[&str] = &["java.", "javax.", "org.w3c.", "org.xml."];
+
+/// Returns `true` for a completable top-level type name (no `$`, not `package-info` /
+/// `module-info`, simple name starting with a letter).
+#[must_use]
+pub fn is_completable_type_name(fqcn: &str) -> bool {
+    if fqcn.contains('$') {
+        return false;
+    }
+    let simple = fqcn.rsplit('.').next().unwrap_or(fqcn);
+    simple != "package-info"
+        && simple != "module-info"
+        && simple.chars().next().is_some_and(char::is_alphabetic)
+}
+
+/// Returns `true` when `fqcn` is a completable type in a public JDK API package (`java.*`,
+/// `javax.*`, `org.w3c.*`, `org.xml.*`).
+#[must_use]
+pub fn is_public_api_type_name(fqcn: &str) -> bool {
+    API_PACKAGE_PREFIXES.iter().any(|p| fqcn.starts_with(p)) && is_completable_type_name(fqcn)
+}
+
+/// Type names listed from the JDK archives with the index of the archive holding each one.
+#[derive(Debug, Default)]
+struct JdkTypeNameTable {
+    archives: Vec<PathBuf>,
+    names: Vec<(String, usize)>,
+}
+
+/// Cached `(method name, named parameter list)` pairs parsed from `lib/src.zip`.
+type SourceParamTable = Arc<Vec<(String, String)>>;
+
 /// Fast, cached, on-demand reader for JDK `.jmod` / `rt.jar` classes.
 #[derive(Debug, Default)]
 pub struct JdkOnDemandIndex {
     jmods_dir: Option<PathBuf>,
     rt_jar: Option<PathBuf>,
+    src_zip: Option<PathBuf>,
     jmod_files: RwLock<Option<Vec<PathBuf>>>,
     cache: RwLock<HashMap<String, Option<ParsedClassUnit>>>,
+    type_names: OnceLock<JdkTypeNameTable>,
+    summaries: RwLock<HashMap<String, Option<JvmTypeSummary>>>,
+    source_entries: OnceLock<HashMap<String, String>>,
+    source_params: RwLock<HashMap<String, SourceParamTable>>,
 }
 
 impl JdkOnDemandIndex {
@@ -168,11 +210,14 @@ impl JdkOnDemandIndex {
         let rt_jar = [jdk_home.join("jre/lib/rt.jar"), jdk_home.join("lib/rt.jar")]
             .into_iter()
             .find(|p| p.is_file());
+        let src_zip = [jdk_home.join("lib/src.zip"), jdk_home.join("src.zip")]
+            .into_iter()
+            .find(|p| p.is_file());
         Self {
             jmods_dir,
             rt_jar,
-            jmod_files: RwLock::new(None),
-            cache: RwLock::new(HashMap::new()),
+            src_zip,
+            ..Self::default()
         }
     }
 
@@ -181,10 +226,151 @@ impl JdkOnDemandIndex {
     pub fn from_jmods_dir(jmods_dir: PathBuf) -> Self {
         Self {
             jmods_dir: jmods_dir.is_dir().then_some(jmods_dir),
-            rt_jar: None,
-            jmod_files: RwLock::new(None),
-            cache: RwLock::new(HashMap::new()),
+            ..Self::default()
         }
+    }
+
+    /// Uses `src_zip` (a JDK `lib/src.zip`) for parameter names in completion signatures.
+    #[must_use]
+    pub fn with_src_zip(mut self, src_zip: PathBuf) -> Self {
+        self.src_zip = src_zip.is_file().then_some(src_zip);
+        self
+    }
+
+    /// Whether the public JDK type-name table has already been listed (no disk access needed).
+    #[must_use]
+    pub fn type_names_ready(&self) -> bool {
+        self.type_names.get().is_some()
+    }
+
+    /// Lists (once, from ZIP central directories only) every public-API top-level type name in the
+    /// configured `.jmod` / `rt.jar` archives (`java.util.Objects`, `java.util.function.ObjIntConsumer`).
+    pub fn type_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.type_name_table().names.iter().map(|(n, _)| n.as_str())
+    }
+
+    fn type_name_table(&self) -> &JdkTypeNameTable {
+        self.type_names.get_or_init(|| {
+            let mut archives: Vec<PathBuf> = self
+                .jmods_dir
+                .as_ref()
+                .map(|_| self.ordered_jmods_for(""))
+                .unwrap_or_default();
+            if let Some(rt) = &self.rt_jar {
+                archives.push(rt.clone());
+            }
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut names = Vec::new();
+            for (idx, path) in archives.iter().enumerate() {
+                let Some(archive) = open_zip_archive(path) else {
+                    continue;
+                };
+                let prefix = archive_class_prefix(path);
+                for raw in archive.file_names() {
+                    let Some(internal) = raw
+                        .strip_prefix(prefix)
+                        .and_then(|r| r.strip_suffix(".class"))
+                    else {
+                        continue;
+                    };
+                    let fqcn = internal.replace('/', ".");
+                    if is_public_api_type_name(&fqcn) && seen.insert(fqcn.clone()) {
+                        names.push((fqcn, idx));
+                    }
+                }
+            }
+            JdkTypeNameTable { archives, names }
+        })
+    }
+
+    /// Returns class-header summaries for `fqcns` (listed by [`Self::type_names`]), opening each
+    /// archive at most once per call and caching results. Unknown names are skipped.
+    #[must_use]
+    pub fn type_summaries(&self, fqcns: &[&str]) -> Vec<JvmTypeSummary> {
+        let mut missing: Vec<&str> = Vec::new();
+        {
+            let cache = self
+                .summaries
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            for fqcn in fqcns {
+                if !cache.contains_key(*fqcn) {
+                    missing.push(fqcn);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let table = self.type_name_table();
+            let wanted: HashSet<&str> = missing.iter().copied().collect();
+            let mut by_archive: HashMap<usize, Vec<&str>> = HashMap::new();
+            for (name, idx) in &table.names {
+                if wanted.contains(name.as_str()) {
+                    by_archive.entry(*idx).or_default().push(name.as_str());
+                }
+            }
+            let mut loaded: HashMap<String, Option<JvmTypeSummary>> =
+                missing.iter().map(|f| ((*f).to_owned(), None)).collect();
+            for (idx, names) in by_archive {
+                let Some(path) = table.archives.get(idx) else {
+                    continue;
+                };
+                let Some(mut archive) = open_zip_archive(path) else {
+                    continue;
+                };
+                let prefix = archive_class_prefix(path);
+                for name in names {
+                    let entry_name = format!("{prefix}{}.class", name.replace('.', "/"));
+                    let bytes = {
+                        let Ok(mut entry) = archive.by_name(&entry_name) else {
+                            continue;
+                        };
+                        read_zip_entry_bounded(&mut entry, DEFAULT_MAX_CLASS_BYTES)
+                    };
+                    let summary = bytes.as_deref().and_then(summarize_class_bytes);
+                    loaded.insert(name.to_owned(), summary);
+                }
+            }
+            self.summaries
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(loaded);
+        }
+        let cache = self
+            .summaries
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        fqcns
+            .iter()
+            .filter_map(|f| cache.get(*f).cloned().flatten())
+            .collect()
+    }
+
+    /// Returns `(method name, named parameter list)` pairs for `fqcn` parsed from `lib/src.zip`
+    /// (e.g. `("checkIndex", "(int index, int length)")`), or an empty list without sources.
+    #[must_use]
+    pub fn source_parameter_lists(&self, fqcn: &str) -> SourceParamTableView {
+        let Some(src_zip) = &self.src_zip else {
+            return SourceParamTableView(Arc::new(Vec::new()));
+        };
+        if let Some(hit) = self
+            .source_params
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(fqcn)
+        {
+            return SourceParamTableView(Arc::clone(hit));
+        }
+        let table = Arc::new(load_source_params(
+            src_zip,
+            self.source_entries
+                .get_or_init(|| list_source_entries(src_zip)),
+            fqcn,
+        ));
+        self.source_params
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(fqcn.to_owned(), Arc::clone(&table));
+        SourceParamTableView(table)
     }
 
     /// Returns `true` when at least one `.jmod` directory or `rt.jar` is configured.
@@ -237,21 +423,33 @@ impl JdkOnDemandIndex {
                 continue;
             }
 
-            let (members, super_fqcn, interfaces, from_project_snapshot) = if let Some(snap) =
-                snapshot
-                && let Some(ty) = snap.resolve_fqcn(&current_fqcn)
-            {
-                let is_project = matches!(ty.origin, JvmSourceOrigin::ProjectSource { .. });
-                (
-                    snap.members_of(&current_fqcn).to_vec(),
-                    ty.super_fqcn.clone(),
-                    ty.interfaces.clone(),
-                    is_project,
-                )
-            } else if let Some(unit) = self.lookup_class(&current_fqcn) {
-                (unit.members, unit.ty.super_fqcn, unit.ty.interfaces, false)
+            let (members, super_fqcn, interfaces, from_project_snapshot, from_jdk) =
+                if let Some(snap) = snapshot
+                    && let Some(ty) = snap.resolve_fqcn(&current_fqcn)
+                {
+                    let is_project = matches!(ty.origin, JvmSourceOrigin::ProjectSource { .. });
+                    (
+                        snap.members_of(&current_fqcn).to_vec(),
+                        ty.super_fqcn.clone(),
+                        ty.interfaces.clone(),
+                        is_project,
+                        false,
+                    )
+                } else if let Some(unit) = self.lookup_class(&current_fqcn) {
+                    (
+                        unit.members,
+                        unit.ty.super_fqcn,
+                        unit.ty.interfaces,
+                        false,
+                        true,
+                    )
+                } else {
+                    continue;
+                };
+            let source_params = if from_jdk {
+                self.source_parameter_lists(&current_fqcn)
             } else {
-                continue;
+                SourceParamTableView(Arc::new(Vec::new()))
             };
 
             let base_priority = if depth == 0 {
@@ -278,8 +476,14 @@ impl JdkOnDemandIndex {
                     continue;
                 }
 
-                let (params_signature, return_type) =
+                let (mut params_signature, return_type) =
                     split_display_signature(member.kind, &member.display_signature);
+                if let Some(named) = params_signature
+                    .as_deref()
+                    .and_then(|p| source_params.match_params(&member.name, p))
+                {
+                    params_signature = Some(named);
+                }
                 let key = (member.name.clone(), params_signature.clone());
                 if !seen_sigs.insert(key) {
                     continue;
@@ -524,7 +728,7 @@ fn locate_in_jar_archive(
     read_from_archive(&mut archive, jar_path, "", entry_candidates)
 }
 
-fn read_from_archive<R: std::io::Read + std::io::Seek>(
+fn read_from_archive<R: std::io::Read + Seek>(
     archive: &mut ZipArchive<R>,
     archive_path: &Path,
     prefix: &str,
@@ -596,6 +800,230 @@ fn descriptor_to_fqcn(descriptor: &str) -> Option<String> {
         return Some(inner.replace(['/', '$'], "."));
     }
     None
+}
+
+/// Read-only view over parameter lists parsed from `lib/src.zip` for one class.
+#[derive(Debug, Clone)]
+pub struct SourceParamTableView(SourceParamTable);
+
+impl SourceParamTableView {
+    /// All `(method name, named parameter list)` pairs.
+    #[must_use]
+    pub fn entries(&self) -> &[(String, String)] {
+        &self.0
+    }
+
+    /// Finds the named source parameter list matching bytecode `params` (`"(int, int)"`) of
+    /// method `name`: same arity and, when overloaded, the same erased simple parameter types.
+    #[must_use]
+    pub fn match_params(&self, name: &str, params: &str) -> Option<String> {
+        let byte_types: Vec<String> = split_param_list(params)
+            .iter()
+            .map(|p| normalize_param_type(p))
+            .collect();
+        let same_arity: Vec<&(String, String)> = self
+            .0
+            .iter()
+            .filter(|(n, p)| n == name && split_param_list(p).len() == byte_types.len())
+            .collect();
+        if byte_types.is_empty() {
+            return None;
+        }
+        let exact = same_arity.iter().find(|(_, p)| {
+            split_param_list(p)
+                .iter()
+                .map(|param| normalize_param_type(strip_param_name(param)))
+                .eq(byte_types.iter().cloned())
+        });
+        exact
+            .or_else(|| (same_arity.len() == 1).then(|| &same_arity[0]))
+            .map(|(_, p)| p.clone())
+    }
+}
+
+/// Splits `"(A a, Map<K, V> m)"` into top-level parameters (`["A a", "Map<K, V> m"]`).
+fn split_param_list(params: &str) -> Vec<&str> {
+    let trimmed = params.trim();
+    let inner = trimmed
+        .find('(')
+        .and_then(|open| trimmed.rfind(')').map(|close| &trimmed[open + 1..close]))
+        .unwrap_or(trimmed);
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in inner.char_indices() {
+        match ch {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(inner[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = inner[start..].trim();
+    if !last.is_empty() {
+        out.push(last);
+    }
+    out
+}
+
+/// `"final Map<K, V> map"` → `"final Map<K, V>"` (drops the trailing parameter name).
+fn strip_param_name(param: &str) -> &str {
+    let trimmed = param.trim();
+    trimmed
+        .rfind(|c: char| c.is_whitespace())
+        .map_or(trimmed, |idx| trimmed[..idx].trim_end())
+}
+
+/// Erases generics, annotations, `final` and package qualifiers: `"java.util.List<T>"` → `"List"`,
+/// `"Object..."` → `"Object[]"`.
+fn normalize_param_type(ty: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    for ch in ty.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    let words: Vec<&str> = out
+        .split_whitespace()
+        .filter(|w| !w.starts_with('@') && *w != "final")
+        .collect();
+    let joined = words.join("").replace("...", "[]");
+    joined.rsplit('.').next().unwrap_or(&joined).to_owned()
+}
+
+/// Maps `java/util/Objects.java` → entry name (`java.base/java/util/Objects.java`) for `src.zip`.
+fn list_source_entries(src_zip: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(archive) = open_zip_archive(src_zip) else {
+        return out;
+    };
+    for raw in archive.file_names() {
+        if !Path::new(raw)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("java"))
+        {
+            continue;
+        }
+        let rel = match raw.split_once('/') {
+            Some((first, rest)) if first.contains('.') => rest,
+            _ => raw,
+        };
+        out.entry(rel.to_owned()).or_insert_with(|| raw.to_owned());
+    }
+    out
+}
+
+/// Maximum `.java` size read from `src.zip` for parameter names.
+const MAX_JDK_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+
+fn load_source_params(
+    src_zip: &Path,
+    entries: &HashMap<String, String>,
+    fqcn: &str,
+) -> Vec<(String, String)> {
+    let rel = format!("{}.java", fqcn.replace('.', "/"));
+    let Some(entry_name) = entries.get(&rel) else {
+        return Vec::new();
+    };
+    let Some(mut archive) = open_zip_archive(src_zip) else {
+        return Vec::new();
+    };
+    let Some(bytes) = archive
+        .by_name(entry_name)
+        .ok()
+        .and_then(|mut e| read_zip_entry_bounded(&mut e, MAX_JDK_SOURCE_BYTES))
+    else {
+        return Vec::new();
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    let opts = SourceScanOptions {
+        max_source_bytes: MAX_JDK_SOURCE_BYTES,
+        ..SourceScanOptions::default()
+    };
+    let Ok(units) = parse_java_source(Path::new(&rel), &text, &opts) else {
+        return Vec::new();
+    };
+    units
+        .into_iter()
+        .filter(|u| u.ty.fqcn == fqcn)
+        .flat_map(|u| u.members)
+        .filter(|m| matches!(m.kind, JvmSymbolKind::Method | JvmSymbolKind::Constructor))
+        .filter_map(|m| {
+            let (params, _) = split_display_signature(m.kind, &m.display_signature);
+            params.map(|p| (m.name, p))
+        })
+        .collect()
+}
+
+/// `classes/` for `.jmod`, `""` for `.jar` / `rt.jar`.
+fn archive_class_prefix(path: &Path) -> &'static str {
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("jmod"))
+    {
+        "classes/"
+    } else {
+        ""
+    }
+}
+
+/// `Read + Seek` over a file that hides a leading header (the 4-byte `JM\x01\x00` of `.jmod`).
+struct OffsetReader {
+    inner: BufReader<File>,
+    offset: u64,
+}
+
+impl std::io::Read for OffsetReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for OffsetReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let abs = match pos {
+            SeekFrom::Start(n) => self.inner.seek(SeekFrom::Start(n + self.offset))?,
+            other => self.inner.seek(other)?,
+        };
+        abs.checked_sub(self.offset).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before archive start",
+            )
+        })
+    }
+}
+
+/// Opens a `.jmod` / `.jar` / `.zip` reading only its central directory (no full-file buffering).
+///
+/// Tries the file as-is first (the `zip` crate detects prepended data whose offsets are absolute),
+/// then hides the 4-byte `.jmod` header for archives whose offsets are relative to the ZIP start.
+fn open_zip_archive(path: &Path) -> Option<ZipArchive<OffsetReader>> {
+    let open = |offset: u64| {
+        let mut file = File::open(path).ok()?;
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        ZipArchive::new(OffsetReader {
+            inner: BufReader::new(file),
+            offset,
+        })
+        .ok()
+    };
+    if let Some(archive) = open(0) {
+        return Some(archive);
+    }
+    let mut magic = [0u8; 4];
+    let has_header =
+        File::open(path).is_ok_and(|mut f| f.read_exact(&mut magic).is_ok() && magic == JMOD_MAGIC);
+    if has_header { open(4) } else { None }
 }
 
 #[cfg(test)]
@@ -724,5 +1152,212 @@ mod tests {
         assert_eq!(names, vec!["length", "toString"]);
         assert_eq!(members[0].sort_priority, 1);
         assert_eq!(members[1].sort_priority, 3);
+    }
+
+    fn build_class(internal: &str, access: u16, methods: &[(&str, &str, u16)]) -> Vec<u8> {
+        let mut cp: Vec<Vec<u8>> = Vec::new();
+        let utf8 = |cp: &mut Vec<Vec<u8>>, s: &str| {
+            let mut e = vec![1];
+            e.extend_from_slice(&u16::try_from(s.len()).unwrap().to_be_bytes());
+            e.extend_from_slice(s.as_bytes());
+            cp.push(e);
+            u16::try_from(cp.len()).unwrap()
+        };
+        let class = |cp: &mut Vec<Vec<u8>>, idx: u16| {
+            let mut e = vec![7];
+            e.extend_from_slice(&idx.to_be_bytes());
+            cp.push(e);
+            u16::try_from(cp.len()).unwrap()
+        };
+        let this_u = utf8(&mut cp, internal);
+        let this_c = class(&mut cp, this_u);
+        let sup_u = utf8(&mut cp, "java/lang/Object");
+        let sup_c = class(&mut cp, sup_u);
+        let mut ms = Vec::new();
+        for (name, desc, flags) in methods {
+            let n = utf8(&mut cp, name);
+            let d = utf8(&mut cp, desc);
+            ms.push((n, d, *flags));
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xCAFE_BABEu32.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&61u16.to_be_bytes());
+        out.extend_from_slice(&u16::try_from(cp.len() + 1).unwrap().to_be_bytes());
+        for e in cp {
+            out.extend_from_slice(&e);
+        }
+        out.extend_from_slice(&access.to_be_bytes());
+        out.extend_from_slice(&this_c.to_be_bytes());
+        out.extend_from_slice(&sup_c.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&u16::try_from(ms.len()).unwrap().to_be_bytes());
+        for (n, d, f) in ms {
+            out.extend_from_slice(&f.to_be_bytes());
+            out.extend_from_slice(&n.to_be_bytes());
+            out.extend_from_slice(&d.to_be_bytes());
+            out.extend_from_slice(&0u16.to_be_bytes());
+        }
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out
+    }
+
+    fn write_zip(path: &Path, jmod_header: bool, entries: &[(&str, Vec<u8>)]) {
+        use std::io::Write as _;
+        let mut file = File::create(path).unwrap();
+        if jmod_header {
+            file.write_all(&JMOD_MAGIC).unwrap();
+        }
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, bytes) in entries {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn lists_public_api_type_names_and_summaries_from_jmod_central_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let jmods = dir.path().join("jmods");
+        std::fs::create_dir_all(&jmods).unwrap();
+        write_zip(
+            &jmods.join("java.base.jmod"),
+            true,
+            &[
+                (
+                    "classes/java/util/Objects.class",
+                    build_class("java/util/Objects", 0x0031, &[]),
+                ),
+                (
+                    "classes/java/util/function/ObjIntConsumer.class",
+                    build_class("java/util/function/ObjIntConsumer", 0x0601, &[]),
+                ),
+                (
+                    "classes/java/util/ImmutableHidden.class",
+                    build_class("java/util/ImmutableHidden", 0x0030, &[]),
+                ),
+                (
+                    "classes/java/util/Map$Entry.class",
+                    build_class("java/util/Map$Entry", 0x0601, &[]),
+                ),
+                (
+                    "classes/jdk/internal/misc/Unsafe.class",
+                    build_class("jdk/internal/misc/Unsafe", 0x0031, &[]),
+                ),
+                ("classes/module-info.class", vec![0]),
+            ],
+        );
+        let index = JdkOnDemandIndex::from_jmods_dir(jmods);
+        assert!(!index.type_names_ready());
+        let mut names: Vec<&str> = index.type_names().collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "java.util.ImmutableHidden",
+                "java.util.Objects",
+                "java.util.function.ObjIntConsumer"
+            ]
+        );
+        assert!(index.type_names_ready());
+
+        let summaries = index.type_summaries(&[
+            "java.util.Objects",
+            "java.util.function.ObjIntConsumer",
+            "java.util.ImmutableHidden",
+            "java.util.Missing",
+        ]);
+        assert_eq!(summaries.len(), 3);
+        assert_eq!(summaries[0].kind, JvmSymbolKind::Class);
+        assert!(summaries[0].is_public);
+        assert_eq!(summaries[1].kind, JvmSymbolKind::Interface);
+        assert!(!summaries[2].is_public);
+    }
+
+    #[test]
+    fn src_zip_supplies_parameter_names_for_jdk_bytecode_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let jdk = dir.path().join("jdk");
+        std::fs::create_dir_all(jdk.join("jmods")).unwrap();
+        std::fs::create_dir_all(jdk.join("lib")).unwrap();
+        write_zip(
+            &jdk.join("jmods/java.base.jmod"),
+            true,
+            &[(
+                "classes/java/util/Objects.class",
+                build_class(
+                    "java/util/Objects",
+                    0x0031,
+                    &[
+                        ("checkIndex", "(II)I", 0x0009),
+                        ("checkIndex", "(JJ)J", 0x0009),
+                        ("isNull", "(Ljava/lang/Object;)Z", 0x0009),
+                    ],
+                ),
+            )],
+        );
+        let source = "package java.util;\n\npublic final class Objects {\n    \
+public static int checkIndex(int index, int length) { return index; }\n    \
+public static long checkIndex(long index, long length) { return index; }\n    \
+public static boolean isNull(Object obj) { return obj == null; }\n}\n";
+        write_zip(
+            &jdk.join("lib/src.zip"),
+            false,
+            &[(
+                "java.base/java/util/Objects.java",
+                source.as_bytes().to_vec(),
+            )],
+        );
+        let index = JdkOnDemandIndex::from_jdk_home(&jdk);
+        let members = index.collect_members("java.util.Objects", true, None);
+        let sig = |name: &str, needle: &str| {
+            members
+                .iter()
+                .find(|m| {
+                    m.name == name
+                        && m.params_signature
+                            .as_deref()
+                            .is_some_and(|p| p.contains(needle))
+                })
+                .and_then(|m| m.params_signature.clone())
+        };
+        assert_eq!(
+            sig("checkIndex", "int").as_deref(),
+            Some("(int index, int length)")
+        );
+        assert_eq!(
+            sig("checkIndex", "long").as_deref(),
+            Some("(long index, long length)")
+        );
+        assert_eq!(sig("isNull", "Object").as_deref(), Some("(Object obj)"));
+        assert!(members.iter().all(|m| m.is_static));
+    }
+
+    #[test]
+    fn source_param_matching_erases_generics_varargs_and_names() {
+        let view = SourceParamTableView(Arc::new(vec![
+            ("hash".to_owned(), "(Object... values)".to_owned()),
+            ("of".to_owned(), "(K k1, V v1)".to_owned()),
+            (
+                "of".to_owned(),
+                "(List<? extends T> list, int size)".to_owned(),
+            ),
+        ]));
+        assert_eq!(
+            view.match_params("hash", "(Object[])").as_deref(),
+            Some("(Object... values)")
+        );
+        assert_eq!(
+            view.match_params("of", "(java.util.List<T>, int)")
+                .as_deref(),
+            Some("(List<? extends T> list, int size)")
+        );
+        assert_eq!(view.match_params("of", "(String)"), None);
+        assert_eq!(view.match_params("none", "()"), None);
+        assert_eq!(normalize_param_type("final java.util.Map<K, V>"), "Map");
+        assert_eq!(strip_param_name("@NonNull String s"), "@NonNull String");
     }
 }

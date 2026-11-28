@@ -6,21 +6,27 @@
 //! - **Level 2 (`jdt.ls`):** asynchronous `textDocument/completion` merged cleanly into an open
 //!   popup without interrupting user typing or selection.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use kova_buffer::{Buffer, BufferSnapshot};
 use kova_config::KovaPaths;
-use kova_core::completion::jdk_fallback::{builtin_jdk_type_proposals, lookup_jdk_fallback};
+use kova_core::completion::jdk_fallback::lookup_jdk_fallback;
 use kova_core::completion::resolver::resolve_local_completion_with_options;
 use kova_core::completion::{
     CompletionContext, CompletionProposal, CompletionProposalKind, CompletionSource,
     CompletionTextEdit, CompletionTriggerKind, ReceiverAccessKind, ReceiverTarget,
-    extract_completion_context,
+    TYPE_COMPLETION_LIMIT, TypeCandidate, build_type_proposals, extract_completion_context,
+    score_completion_match, type_name_matches,
 };
 use kova_core::navigation::SourceLanguageKind;
-use kova_jvm_index::{JdkOnDemandIndex, JvmCompletionMember, JvmIndexSnapshot, JvmSymbolKind};
+use kova_jvm_index::{
+    BytecodeScanOptions, DependencyArchiveConfig, DependencyArchiveIndex, JdkOnDemandIndex,
+    JvmCompletionMember, JvmIndexSnapshot, JvmSourceOrigin, JvmSymbolKind, JvmTypeSummary,
+    parse_class_bytes,
+};
 use kova_lsp_dap::lsp::features::{CompletionCandidate, CompletionTrigger, completion};
 use kova_lsp_dap::lsp::{JdtlsClient, LspLifecycleState, path_to_lsp_uri};
 use kova_toolchain::{JdkDiscoveryRoots, discover_jdks};
@@ -42,7 +48,25 @@ pub struct CompletionBackend {
     jdk_index: Arc<OnceLock<Arc<JdkOnDemandIndex>>>,
     workspace_snapshot: Arc<Mutex<Option<Arc<JvmIndexSnapshot>>>>,
     lsp_client: Arc<Mutex<Option<Arc<JdtlsClient>>>>,
+    dependencies: DependencySource,
 }
+
+/// Where Gradle / Maven dependency `.jar` type names come from (`KOVA-074`).
+#[derive(Clone, Default)]
+enum DependencySource {
+    /// `~/.gradle`, `~/.m2` and `<project>/libs` per project root, scanned in the background.
+    #[default]
+    HostEnv,
+    /// No dependency lookup (deterministic tests).
+    Disabled,
+    /// Explicit pre-built index (tests or embedders).
+    Explicit(Arc<DependencyArchiveIndex>),
+}
+
+/// Lazily created dependency indexes keyed by project root (shared across backend clones).
+static HOST_DEPENDENCY_INDEXES: OnceLock<
+    Mutex<HashMap<Option<PathBuf>, Arc<DependencyArchiveIndex>>>,
+> = OnceLock::new();
 
 impl std::fmt::Debug for CompletionBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -67,6 +91,49 @@ impl CompletionBackend {
             jdk_index: Arc::new(lock),
             workspace_snapshot: Arc::new(Mutex::new(None)),
             lsp_client: Arc::new(Mutex::new(None)),
+            dependencies: DependencySource::Disabled,
+        }
+    }
+
+    /// Uses `index` for dependency `.jar` type names and members (`KOVA-074`).
+    #[must_use]
+    pub fn with_dependency_index(mut self, index: Arc<DependencyArchiveIndex>) -> Self {
+        self.dependencies = DependencySource::Explicit(index);
+        self
+    }
+
+    /// Returns the dependency index for `project_root`, starting a background scan of the
+    /// `.jar` central directories on first use so completion never blocks on it.
+    fn dependency_index_for(
+        &self,
+        project_root: Option<&Path>,
+    ) -> Option<Arc<DependencyArchiveIndex>> {
+        match &self.dependencies {
+            DependencySource::Disabled => None,
+            DependencySource::Explicit(index) => Some(Arc::clone(index)),
+            DependencySource::HostEnv => {
+                let map = HOST_DEPENDENCY_INDEXES.get_or_init(|| Mutex::new(HashMap::new()));
+                let key = project_root.map(Path::to_path_buf);
+                let mut guard = map.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(existing) = guard.get(&key) {
+                    return Some(Arc::clone(existing));
+                }
+                let created = Arc::new(DependencyArchiveIndex::new(
+                    DependencyArchiveConfig::from_host_env(key.clone()),
+                ));
+                guard.insert(key, Arc::clone(&created));
+                drop(guard);
+                let warm = Arc::clone(&created);
+                drop(
+                    std::thread::Builder::new()
+                        .name("kova-completion-deps".to_owned())
+                        .spawn(move || {
+                            warm.warm();
+                            let _ = warm.type_names().len();
+                        }),
+                );
+                Some(created)
+            }
         }
     }
 
@@ -163,7 +230,14 @@ async fn resolve_and_emit(
     let level1 = tokio::task::spawn_blocking(move || {
         let jdk = backend_clone.get_or_init_jdk();
         let snapshot = backend_clone.current_snapshot();
-        resolve_level1(&req_clone, &jdk, snapshot.as_deref(), has_lsp)
+        let deps = backend_clone.dependency_index_for(req_clone.project_root.as_deref());
+        resolve_level1(
+            &req_clone,
+            &jdk,
+            snapshot.as_deref(),
+            deps.as_deref(),
+            has_lsp,
+        )
     })
     .await;
 
@@ -205,7 +279,9 @@ async fn resolve_and_emit(
 
     let pos = utf16_point_at_byte(&buffer_snapshot, request.cursor_byte);
     let trigger = match request.trigger_kind {
-        CompletionTriggerKind::Invoked => CompletionTrigger::Invoked,
+        CompletionTriggerKind::Invoked | CompletionTriggerKind::AutoIdentifier => {
+            CompletionTrigger::Invoked
+        }
         CompletionTriggerKind::AutoChar(c) => CompletionTrigger::TriggerCharacter(c),
     };
 
@@ -227,6 +303,7 @@ async fn resolve_and_emit(
                 initial_prefix: ctx.prefix,
                 proposals,
                 is_final: true,
+                is_incomplete: result.is_incomplete,
             }
         }
         _ => CompletionOutcome::Empty { is_final: true },
@@ -242,6 +319,7 @@ fn resolve_level1(
     request: &CompletionRequest,
     jdk: &JdkOnDemandIndex,
     jvm_snapshot: Option<&JvmIndexSnapshot>,
+    deps: Option<&DependencyArchiveIndex>,
     has_lsp: bool,
 ) -> (CompletionOutcome, Option<CompletionContext>, BufferSnapshot) {
     let buffer = Buffer::from_text(&request.source_text);
@@ -254,6 +332,10 @@ fn resolve_level1(
     ) else {
         return (CompletionOutcome::Empty { is_final: !has_lsp }, None, snap);
     };
+    let is_jvm = matches!(
+        ctx.language,
+        SourceLanguageKind::Java | SourceLanguageKind::Kotlin
+    );
 
     let field_resolver =
         |fqcn: &str, field: &str| jdk.resolve_field_type(fqcn, field, jvm_snapshot);
@@ -263,33 +345,57 @@ fn resolve_level1(
         &request.open_buffers,
         request.project_root.as_deref(),
         &request.workspace_files,
-        false,
+        !jdk.has_archives(),
         Some(&field_resolver),
     );
+    let mut is_incomplete = local.is_incomplete;
 
-    if let Some(ReceiverTarget::JdkType { ref fqcn, access }) = local.receiver_target {
-        let static_only = access == ReceiverAccessKind::StaticType;
-        let bytecode_members = jdk.collect_members(fqcn, static_only, jvm_snapshot);
-        if bytecode_members.is_empty() {
-            local.proposals = lookup_jdk_fallback(fqcn, static_only, ctx.is_method_reference);
-        } else {
-            local.proposals = bytecode_members
-                .into_iter()
-                .map(|m| map_jvm_member(m, ctx.is_method_reference))
-                .collect();
-        }
-    } else if ctx.separator.is_none()
-        && matches!(
-            ctx.language,
-            SourceLanguageKind::Java | SourceLanguageKind::Kotlin
-        )
-    {
-        let mut seen: HashSet<String> = local.proposals.iter().map(|p| p.label.clone()).collect();
-        for prop in builtin_jdk_type_proposals() {
-            if seen.insert(prop.label.clone()) {
-                local.proposals.push(prop);
+    match local.receiver_target.clone() {
+        Some(ReceiverTarget::JdkType { fqcn, access }) => {
+            let static_only = access == ReceiverAccessKind::StaticType;
+            let bytecode_members = jdk.collect_members(&fqcn, static_only, jvm_snapshot);
+            if bytecode_members.is_empty() {
+                local.proposals = lookup_jdk_fallback(&fqcn, static_only, ctx.is_method_reference);
+            } else {
+                local.proposals = bytecode_members
+                    .into_iter()
+                    .map(|m| map_jvm_member(m, ctx.is_method_reference))
+                    .collect();
             }
         }
+        Some(ReceiverTarget::ProjectType { type_name, access })
+            if is_jvm && local.proposals.is_empty() =>
+        {
+            // Not declared in the project: JDK class outside the built-in list or a dependency type.
+            let static_only = access == ReceiverAccessKind::StaticType;
+            local.proposals =
+                external_type_members(&ctx, &type_name, static_only, jdk, jvm_snapshot, deps);
+        }
+        _ => {}
+    }
+
+    if ctx.separator.is_none() && is_jvm && !ctx.prefix.is_empty() {
+        let mut seen: HashSet<String> = local
+            .proposals
+            .iter()
+            .filter_map(|p| p.fqcn.clone())
+            .collect();
+        let mut candidates = Vec::new();
+        if jdk.has_archives() {
+            candidates.extend(jdk_type_candidates(jdk, &ctx.prefix));
+        }
+        if let Some(deps) = deps.filter(|d| d.is_warm()) {
+            candidates.extend(dependency_type_candidates(deps, &ctx.prefix));
+        }
+        let (types, truncated) = build_type_proposals(
+            &ctx,
+            &request.source_text,
+            candidates,
+            &mut seen,
+            TYPE_COMPLETION_LIMIT,
+        );
+        is_incomplete |= truncated;
+        local.proposals.extend(types);
     }
 
     let outcome = if local.proposals.is_empty() {
@@ -301,10 +407,153 @@ fn resolve_level1(
             initial_prefix: ctx.prefix.clone(),
             proposals: local.proposals,
             is_final: !has_lsp,
+            is_incomplete,
         }
     };
 
     (outcome, Some(ctx), snap)
+}
+
+/// Pre-filters `names` by `prefix` and keeps the best `TYPE_COMPLETION_LIMIT + 1` matches.
+fn best_type_name_matches<'a>(names: impl Iterator<Item = &'a str>, prefix: &str) -> Vec<&'a str> {
+    let mut matched: Vec<(u32, &str)> = names
+        .filter_map(|fqcn| {
+            let simple = fqcn.rsplit('.').next()?;
+            if !type_name_matches(simple, prefix) {
+                return None;
+            }
+            score_completion_match(simple, prefix).map(|(score, _)| (score, fqcn))
+        })
+        .collect();
+    matched.sort_by(|(sa, a), (sb, b)| {
+        sb.cmp(sa)
+            .then_with(|| {
+                a.rsplit('.')
+                    .next()
+                    .map(str::len)
+                    .cmp(&b.rsplit('.').next().map(str::len))
+            })
+            .then_with(|| a.cmp(b))
+    });
+    matched.truncate(TYPE_COMPLETION_LIMIT + 1);
+    matched.into_iter().map(|(_, fqcn)| fqcn).collect()
+}
+
+fn summary_to_candidate(
+    summary: JvmTypeSummary,
+    source: CompletionSource,
+) -> Option<TypeCandidate> {
+    if !summary.is_public {
+        return None;
+    }
+    let kind = match summary.kind {
+        JvmSymbolKind::Interface => CompletionProposalKind::Interface,
+        JvmSymbolKind::Enum => CompletionProposalKind::Enum,
+        JvmSymbolKind::Record => CompletionProposalKind::Record,
+        JvmSymbolKind::Annotation => CompletionProposalKind::Annotation,
+        _ => CompletionProposalKind::Class,
+    };
+    let mut cand = TypeCandidate::new(&summary.fqcn, kind, source);
+    cand.type_params = summary.type_params;
+    cand.is_deprecated = summary.is_deprecated;
+    Some(cand)
+}
+
+/// Public JDK types (`.jmod` / `rt.jar`) whose simple name matches `prefix`.
+fn jdk_type_candidates(jdk: &JdkOnDemandIndex, prefix: &str) -> Vec<TypeCandidate> {
+    let names = best_type_name_matches(jdk.type_names(), prefix);
+    jdk.type_summaries(&names)
+        .into_iter()
+        .filter_map(|s| summary_to_candidate(s, CompletionSource::JdkBytecode))
+        .collect()
+}
+
+/// Maximum dependency class headers read per request (each may open a `.jar`).
+const MAX_DEPENDENCY_SUMMARIES: usize = 60;
+
+/// Public dependency `.jar` types whose simple name matches `prefix`.
+fn dependency_type_candidates(deps: &DependencyArchiveIndex, prefix: &str) -> Vec<TypeCandidate> {
+    best_type_name_matches(deps.type_names().iter().map(String::as_str), prefix)
+        .into_iter()
+        .take(MAX_DEPENDENCY_SUMMARIES)
+        .filter_map(|fqcn| deps.type_summary(fqcn))
+        .filter_map(|s| summary_to_candidate(s, CompletionSource::Library))
+        .collect()
+}
+
+/// Members of a type that is neither declared in the project nor in the built-in JDK list:
+/// resolved through an explicit import, `java.lang`, or the JDK / dependency type-name tables.
+fn external_type_members(
+    ctx: &CompletionContext,
+    type_name: &str,
+    static_only: bool,
+    jdk: &JdkOnDemandIndex,
+    jvm_snapshot: Option<&JvmIndexSnapshot>,
+    deps: Option<&DependencyArchiveIndex>,
+) -> Vec<CompletionProposal> {
+    let imported = ctx
+        .imports
+        .iter()
+        .find(|imp| !imp.is_static && imp.local_name() == Some(type_name))
+        .map(|imp| imp.path.clone());
+    let fqcn = imported.or_else(|| {
+        let java_lang = format!("java.lang.{type_name}");
+        jdk.type_names()
+            .any(|n| n == java_lang)
+            .then_some(java_lang)
+    });
+    let Some(fqcn) = fqcn else {
+        return Vec::new();
+    };
+
+    let jdk_members = jdk.collect_members(&fqcn, static_only, jvm_snapshot);
+    if !jdk_members.is_empty() {
+        return jdk_members
+            .into_iter()
+            .map(|m| map_jvm_member(m, ctx.is_method_reference))
+            .collect();
+    }
+    let Some(deps) = deps.filter(|d| d.is_warm()) else {
+        return Vec::new();
+    };
+    let opts = BytecodeScanOptions {
+        include_members: true,
+        include_private_members: false,
+        include_package_private_classes: true,
+        ..BytecodeScanOptions::default()
+    };
+    // Walk the dependency superclass chain into a throwaway snapshot so inherited members show up.
+    let mut units = Vec::new();
+    let mut next = Some(fqcn.clone());
+    while let Some(current) = next.take() {
+        if units.len() >= 8 {
+            break;
+        }
+        let Some(located) = deps.locate_class_bytes(&current) else {
+            break;
+        };
+        let origin = JvmSourceOrigin::JarEntry {
+            jar_path: located.archive_path,
+            entry_name: located.entry_name,
+        };
+        let Ok(Some(unit)) = parse_class_bytes(&located.bytes, origin, &opts) else {
+            break;
+        };
+        next.clone_from(&unit.ty.super_fqcn);
+        units.push(unit);
+    }
+    if units.is_empty() {
+        return Vec::new();
+    }
+    let snapshot = JvmIndexSnapshot::from_units(&units);
+    jdk.collect_members(&fqcn, static_only, Some(&snapshot))
+        .into_iter()
+        .map(|m| {
+            let mut p = map_jvm_member(m, ctx.is_method_reference);
+            p.source = CompletionSource::Library;
+            p
+        })
+        .collect()
 }
 
 fn map_jvm_member(member: JvmCompletionMember, is_method_reference: bool) -> CompletionProposal {
@@ -336,6 +585,9 @@ fn map_jvm_member(member: JvmCompletionMember, is_method_reference: bool) -> Com
         source: CompletionSource::JdkBytecode,
         is_deprecated: member.is_deprecated,
         sort_priority: member.sort_priority,
+        is_static: member.is_static,
+        type_params: None,
+        fqcn: None,
     }
 }
 
@@ -369,6 +621,9 @@ pub fn map_lsp_candidate(
         kind,
         CompletionProposalKind::Method | CompletionProposalKind::Constructor
     );
+    if kind.is_type() {
+        return map_lsp_type_candidate(candidate, kind, is_method_reference);
+    }
     let (label_name, label_params, label_ret) = parse_lsp_label_or_detail(&candidate.label);
     let (_, detail_params, detail_ret) = candidate
         .detail
@@ -410,6 +665,71 @@ pub fn map_lsp_candidate(
         source: CompletionSource::Lsp,
         is_deprecated: false,
         sort_priority: 1,
+        is_static: false,
+        type_params: None,
+        fqcn: None,
+    }
+}
+
+/// Maps a `jdt.ls` type item (`label: "Objects - java.util"`, `detail: "java.util.Objects"`) into
+/// an FQCN-identified type proposal so it merges with Level-1 rows instead of duplicating them.
+fn map_lsp_type_candidate(
+    candidate: &CompletionCandidate,
+    kind: CompletionProposalKind,
+    is_method_reference: bool,
+) -> CompletionProposal {
+    let (name, label_pkg) = candidate
+        .label
+        .split_once(" - ")
+        .map_or((candidate.label.trim(), None), |(n, p)| {
+            (n.trim(), Some(p.trim()))
+        });
+    let (name, type_params) = name.split_once('<').map_or((name, None), |(n, rest)| {
+        (n.trim(), Some(format!("<{rest}")))
+    });
+    let fqcn = candidate
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| d.ends_with(name) && d.contains('.') && !d.contains(' '))
+        .map(str::to_owned)
+        .or_else(|| label_pkg.map(|pkg| format!("{pkg}.{name}")));
+    let package = fqcn
+        .as_deref()
+        .and_then(|f| f.rsplit_once('.'))
+        .map(|(pkg, _)| pkg.to_owned());
+    let (insert_text, _) = normalize_lsp_insert_text(&candidate.insert_text);
+    CompletionProposal {
+        label: name.to_owned(),
+        kind,
+        params_signature: None,
+        return_type: None,
+        detail_right: package,
+        insert_text: if insert_text.is_empty() {
+            name.to_owned()
+        } else {
+            insert_text
+        },
+        is_callable: false,
+        has_params: false,
+        is_method_reference,
+        additional_text_edits: candidate
+            .additional_text_edits
+            .iter()
+            .map(|edit| CompletionTextEdit {
+                start_utf16_line: edit.range.start.row,
+                start_utf16_col: edit.range.start.column,
+                end_utf16_line: edit.range.end.row,
+                end_utf16_col: edit.range.end.column,
+                new_text: edit.new_text.clone(),
+            })
+            .collect(),
+        source: CompletionSource::Lsp,
+        is_deprecated: false,
+        sort_priority: 3,
+        is_static: false,
+        type_params,
+        fqcn,
     }
 }
 
@@ -674,6 +994,240 @@ mod tests {
         );
     }
 
+    fn request(
+        id: u64,
+        text: &str,
+        cursor_byte: usize,
+        trigger_kind: CompletionTriggerKind,
+    ) -> CompletionRequest {
+        CompletionRequest {
+            request_id: id,
+            project_root: None,
+            source_path: PathBuf::from("src/main/java/demo/App.java"),
+            source_text: text.to_owned(),
+            cursor_byte,
+            trigger_kind,
+            open_buffers: vec![],
+            workspace_files: vec![],
+        }
+    }
+
+    /// KOVA-074 flow: type `Obj` → `Objects (java.util)` → Tab inserts `Objects` +
+    /// `import java.util.Objects;` → `.` lists `requireNonNull`, `checkIndex`, `isNull`.
+    #[test]
+    fn as_you_type_obj_accept_adds_import_then_dot_lists_objects_methods() {
+        let runtime = build_io_runtime().expect("runtime");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let backend = CompletionBackend::with_jdk_index(Arc::new(JdkOnDemandIndex::empty()));
+        let sink = completion_sink_with_backend(runtime.handle().clone(), tx, backend);
+
+        let mut editor = kova_ui::editor::state::EditorState::from_text(
+            "package demo;\n\npublic class App {\n    void run() {\n        \n    }\n}\n",
+        );
+        let start = editor.snapshot().text().find("        \n    }").unwrap() + 8;
+        editor.set_caret(start);
+        for ch in ["O", "b", "j"] {
+            assert!(editor.insert_text(ch));
+        }
+        let snap = editor.snapshot();
+        assert!(
+            kova_core::completion::should_auto_trigger_identifier_completion(
+                &snap,
+                SourceLanguageKind::Java,
+                editor.primary_head()
+            )
+        );
+
+        sink(request(
+            20,
+            &snap.text(),
+            editor.primary_head(),
+            CompletionTriggerKind::AutoIdentifier,
+        ));
+        let (anchor, is_ref, prefix, proposals) = recv_ready(&runtime, &mut rx, 20);
+        assert_eq!(prefix, "Obj");
+        let mut popup = kova_ui::editor::completion::CompletionPopupState::new();
+        popup.open_with(20, anchor, is_ref, prefix, proposals);
+        let rows: Vec<(String, Option<String>)> = popup
+            .filtered()
+            .iter()
+            .map(|i| (i.proposal.label.clone(), i.proposal.detail_right.clone()))
+            .collect();
+        assert_eq!(rows[0].0, "Object");
+        assert!(rows.contains(&("Objects".to_owned(), Some("java.util".to_owned()))));
+        assert!(!rows.iter().any(|(l, _)| l == "Obj"));
+
+        // Down to `Objects`, then Tab.
+        while popup.filtered()[popup.selected()].proposal.label != "Objects" {
+            popup.move_selection(1);
+        }
+        assert!(!popup.selected_insertion_is_noop());
+        let insertion = popup.selected_insertion().unwrap();
+        let composed = kova_core::completion::compose_completion_edits(
+            &editor.snapshot(),
+            popup.anchor_byte()..editor.primary_head(),
+            &insertion.text,
+            insertion.cursor_offset_in_text,
+            &insertion.additional_text_edits,
+        );
+        assert!(editor.apply_edits(&composed.edits, kova_buffer::EditOrigin::Compound));
+        editor.set_caret(composed.caret_after);
+        popup.close();
+        let text = editor.snapshot().text();
+        assert_eq!(
+            text,
+            "package demo;\n\nimport java.util.Objects;\n\npublic class App {\n    void run() {\n        Objects\n    }\n}\n"
+        );
+        assert_eq!(
+            &text[..editor.primary_head()],
+            text[..text.find("Objects\n    }").unwrap() + "Objects".len()].to_owned()
+        );
+
+        // `.` → static methods of `Objects` with named parameters.
+        assert!(editor.insert_text("."));
+        sink(request(
+            21,
+            &editor.snapshot().text(),
+            editor.primary_head(),
+            CompletionTriggerKind::AutoChar('.'),
+        ));
+        let (_, _, prefix, proposals) = recv_ready(&runtime, &mut rx, 21);
+        assert_eq!(prefix, "");
+        for name in ["requireNonNull", "checkIndex", "isNull"] {
+            let p = proposals
+                .iter()
+                .find(|p| p.label == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert!(p.is_static);
+        }
+        let check = proposals.iter().find(|p| p.label == "checkIndex").unwrap();
+        assert_eq!(
+            check.params_signature.as_deref(),
+            Some("(int index, int length)")
+        );
+        let ins = kova_ui::editor::completion::build_insertion(check, false);
+        assert_eq!(ins.text, "checkIndex()");
+        assert_eq!(ins.cursor_offset_in_text, "checkIndex(".len());
+    }
+
+    #[test]
+    fn as_you_type_reads_jdk_type_names_and_kinds_from_mock_jmod() {
+        let runtime = build_io_runtime().expect("runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jmods_dir = dir.path().join("jdk/jmods");
+        std::fs::create_dir_all(&jmods_dir).unwrap();
+        let file = std::fs::File::create(jmods_dir.join("java.base.jmod")).unwrap();
+        let mut writer = ZipWriter::new(file);
+        for (entry, bytes) in [
+            (
+                "classes/java/util/Objects.class",
+                build_minimal_objects_class(),
+            ),
+            (
+                "classes/java/util/function/ObjIntConsumer.class",
+                build_interface_class("java/util/function/ObjIntConsumer"),
+            ),
+        ] {
+            writer
+                .start_file(entry, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        let jdk = Arc::new(JdkOnDemandIndex::from_jdk_home(&dir.path().join("jdk")));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = completion_sink_with_backend(
+            runtime.handle().clone(),
+            tx,
+            CompletionBackend::with_jdk_index(jdk),
+        );
+
+        let src = "package demo;\nclass App { void f() { Obj } }\n";
+        let pos = src.find("Obj }").unwrap() + 3;
+        sink(request(30, src, pos, CompletionTriggerKind::AutoIdentifier));
+        let (_, _, _, proposals) = recv_ready(&runtime, &mut rx, 30);
+        let consumer = proposals
+            .iter()
+            .find(|p| p.label == "ObjIntConsumer")
+            .expect("ObjIntConsumer from jmod");
+        assert_eq!(consumer.kind, CompletionProposalKind::Interface);
+        assert_eq!(consumer.source, CompletionSource::JdkBytecode);
+        assert_eq!(
+            consumer.fqcn.as_deref(),
+            Some("java.util.function.ObjIntConsumer")
+        );
+        assert_eq!(consumer.additional_text_edits.len(), 1);
+        assert_eq!(
+            consumer.additional_text_edits[0].new_text,
+            "\nimport java.util.function.ObjIntConsumer;\n"
+        );
+        let objects: Vec<_> = proposals.iter().filter(|p| p.label == "Objects").collect();
+        assert_eq!(objects.len(), 1, "FQCN de-duplication");
+
+        let src2 = "class App { void f() { Objects. } }\n";
+        let pos2 = src2.find("Objects.").unwrap() + "Objects.".len();
+        sink(request(
+            31,
+            src2,
+            pos2,
+            CompletionTriggerKind::AutoChar('.'),
+        ));
+        let (_, _, _, members) = recv_ready(&runtime, &mut rx, 31);
+        let req = members
+            .iter()
+            .find(|p| p.label == "requireNonNull")
+            .unwrap();
+        assert!(req.is_static);
+        assert_eq!(req.source, CompletionSource::JdkBytecode);
+    }
+
+    #[test]
+    fn lsp_type_items_are_normalized_to_fqcn_identified_rows() {
+        let candidate = CompletionCandidate {
+            label: "Objects - java.util".to_owned(),
+            kind: Some(CompletionItemKind::CLASS),
+            detail: Some("java.util.Objects".to_owned()),
+            documentation: None,
+            sort_text: None,
+            filter_text: None,
+            insert_text: "Objects".to_owned(),
+            is_snippet: false,
+            primary_edit: None,
+            additional_text_edits: Vec::new(),
+            raw_item: serde_json::Value::Null,
+        };
+        let p = map_lsp_candidate(&candidate, false);
+        assert_eq!(p.label, "Objects");
+        assert_eq!(p.fqcn.as_deref(), Some("java.util.Objects"));
+        assert_eq!(p.detail_right.as_deref(), Some("java.util"));
+        assert_eq!(p.inline_detail().as_deref(), Some("java.util"));
+        assert!(!p.is_callable);
+    }
+
+    fn build_interface_class(internal: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0xCAFE_BABEu32.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        buf.extend_from_slice(&65u16.to_be_bytes());
+        buf.extend_from_slice(&5u16.to_be_bytes()); // 4 constant-pool entries + 1
+        let push_utf8 = |buf: &mut Vec<u8>, s: &str| {
+            buf.push(1);
+            buf.extend_from_slice(&u16::try_from(s.len()).unwrap().to_be_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        };
+        push_utf8(&mut buf, internal); // #1
+        buf.push(7);
+        buf.extend_from_slice(&1u16.to_be_bytes()); // #2 Class #1
+        push_utf8(&mut buf, "java/lang/Object"); // #3
+        buf.push(7);
+        buf.extend_from_slice(&3u16.to_be_bytes()); // #4 Class #3
+        buf.extend_from_slice(&0x0601u16.to_be_bytes()); // PUBLIC | INTERFACE | ABSTRACT
+        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&[0; 8]); // interfaces, fields, methods, attributes
+        buf
+    }
+
     fn spawn_mock_completion_server(
         server_read: tokio::io::DuplexStream,
         mut writer: tokio::io::DuplexStream,
@@ -727,7 +1281,7 @@ mod tests {
         })
     }
 
-    fn setup_mock_jmod_app(root: &std::path::Path) -> (PathBuf, String, Arc<JdkOnDemandIndex>) {
+    fn setup_mock_jmod_app(root: &Path) -> (PathBuf, String, Arc<JdkOnDemandIndex>) {
         let app_rel = PathBuf::from("src/App.java");
         let app_abs = root.join(&app_rel);
         std::fs::create_dir_all(app_abs.parent().unwrap()).unwrap();
@@ -743,9 +1297,9 @@ mod tests {
             &objects_class,
         );
         assert!(
-            kova_jvm_index::parse_class_bytes(
+            parse_class_bytes(
                 &objects_class,
-                kova_jvm_index::JvmSourceOrigin::ClassFile {
+                JvmSourceOrigin::ClassFile {
                     path: PathBuf::from("Objects.class")
                 },
                 &BytecodeScanOptions::default(),
@@ -857,7 +1411,7 @@ mod tests {
         });
     }
 
-    fn write_mock_jmod(path: &std::path::Path, entry_name: &str, class_bytes: &[u8]) {
+    fn write_mock_jmod(path: &Path, entry_name: &str, class_bytes: &[u8]) {
         let mut file = std::fs::File::create(path).unwrap();
         file.write_all(&[0x4A, 0x4D, 0x01, 0x00]).unwrap();
         let mut writer = ZipWriter::new(file);

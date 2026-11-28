@@ -140,7 +140,8 @@ pub enum EditorEvent {
         /// Byte offset of the clicked identifier.
         byte: usize,
     },
-    /// User typed `.` or `:` in editable text mode; shell may trigger completion (`KOVA-052`).
+    /// User typed `.`, `:` or one identifier character in editable text mode; shell may trigger
+    /// completion (`KOVA-052`, as-you-type `KOVA-074`).
     CompletionAutoTrigger {
         /// Typed trigger character (`'.'` or `':'`).
         ch: char,
@@ -1033,68 +1034,24 @@ impl EditorView {
         self.state.sync_external_edits();
 
         let snap = self.state.snapshot();
-        let len = snap.len_bytes();
-        let clamped_replace = snap.clamp_byte_to_char_boundary(replace_range.start.min(len))
-            ..snap.clamp_byte_to_char_boundary(replace_range.end.min(len));
         let lines_before = snap.len_lines();
         let row_before = snap
-            .byte_to_point(clamped_replace.start)
+            .byte_to_point(replace_range.start.min(snap.len_bytes()))
             .map_or(0, |p| p.row);
-
-        let mut extra_edits = Vec::new();
-        for edit in &insertion.additional_text_edits {
-            let start = utf16_line_col_to_byte(&snap, edit.start_utf16_line, edit.start_utf16_col);
-            let end = utf16_line_col_to_byte(&snap, edit.end_utf16_line, edit.end_utf16_col);
-            let range = start.min(end)..start.max(end);
-            let overlaps_primary =
-                range.start < clamped_replace.end && range.end > clamped_replace.start;
-            let touches_empty_primary = clamped_replace.is_empty()
-                && range.start <= clamped_replace.start
-                && range.end >= clamped_replace.start;
-            if overlaps_primary
-                || (clamped_replace.is_empty() && range == clamped_replace)
-                || touches_empty_primary
-            {
-                continue;
-            }
-            extra_edits.push(TextEdit::new(range, edit.new_text.as_str()));
-        }
-        extra_edits.sort_by_key(|e| (e.range.start, e.range.end));
-
-        // Deduplicate/remove any overlapping extra edits to satisfy History::record_and_apply.
-        let mut disjoint_extra: Vec<TextEdit> = Vec::with_capacity(extra_edits.len());
-        for edit in extra_edits {
-            if let Some(prev) = disjoint_extra.last()
-                && edit.range.start < prev.range.end
-            {
-                continue;
-            }
-            disjoint_extra.push(edit);
-        }
-
-        let mut delta_before: isize = 0;
-        for edit in &disjoint_extra {
-            if edit.range.end <= clamped_replace.start {
-                let new_len = isize::try_from(edit.replacement.len()).unwrap_or(0);
-                let old_len = isize::try_from(edit.range.end - edit.range.start).unwrap_or(0);
-                delta_before += new_len - old_len;
-            }
-        }
-
-        let mut all_edits = disjoint_extra;
-        all_edits.push(TextEdit::new(
-            clamped_replace.clone(),
-            insertion.text.as_str(),
-        ));
-        all_edits.sort_by_key(|e| (e.range.start, e.range.end));
+        let composed = kova_core::completion::compose_completion_edits(
+            &snap,
+            replace_range,
+            &insertion.text,
+            insertion.cursor_offset_in_text,
+            &insertion.additional_text_edits,
+        );
+        let all_edits = composed.edits;
 
         let changed = self
             .state
             .apply_edits(&all_edits, kova_buffer::EditOrigin::Compound);
         if changed {
-            let shifted_start = clamped_replace.start.saturating_add_signed(delta_before);
-            let new_caret = shifted_start.saturating_add(insertion.cursor_offset_in_text);
-            self.state.set_caret(new_caret);
+            self.state.set_caret(composed.caret_after);
 
             let lines_after = self.state.snapshot().len_lines();
             if lines_after != lines_before {
@@ -2276,19 +2233,6 @@ impl EditorView {
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
-
-fn utf16_line_col_to_byte(snap: &BufferSnapshot, line: usize, col_utf16: usize) -> usize {
-    let total_lines = snap.len_lines().max(1);
-    let clamped_line = line.min(total_lines.saturating_sub(1));
-    let line_start_byte = snap.rope().line_to_byte(clamped_line);
-    let line_len_bytes = snap.line_len_bytes(clamped_line).unwrap_or(0);
-    let line_start_utf16 = snap.byte_to_utf16(line_start_byte).unwrap_or(0);
-    let line_end_utf16 = snap
-        .byte_to_utf16(line_start_byte + line_len_bytes)
-        .unwrap_or(line_start_utf16);
-    let target_utf16 = (line_start_utf16 + col_utf16).min(line_end_utf16);
-    snap.utf16_to_byte(target_utf16).unwrap_or(line_start_byte)
-}
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {

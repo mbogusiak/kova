@@ -4,6 +4,7 @@
 //! `java.nio.file`, `java.time`, and `java.util.stream` classes even when no local JDK is
 //! installed or `.jmod` archives have not been loaded yet.
 
+use crate::completion::types::TypeCandidate;
 use crate::completion::{CompletionProposal, CompletionProposalKind, CompletionSource};
 use crate::navigation::resolver::ImportEntry;
 
@@ -1111,20 +1112,215 @@ pub fn fallback_member_type(fqcn_or_simple: &str, member_name: &str) -> Option<S
     None
 }
 
-/// Returns well-known JDK class proposals for unqualified `Ctrl+Space` completion.
+/// Kind and generic parameters of catalog types that are not plain classes (`KOVA-074`).
+const CATALOG_TYPE_SHAPES: &[(&str, CompletionProposalKind, &str)] = &[
+    (
+        "java.lang.CharSequence",
+        CompletionProposalKind::Interface,
+        "",
+    ),
+    ("java.lang.Runnable", CompletionProposalKind::Interface, ""),
+    (
+        "java.lang.Iterable",
+        CompletionProposalKind::Interface,
+        "<T>",
+    ),
+    (
+        "java.lang.Comparable",
+        CompletionProposalKind::Interface,
+        "<T>",
+    ),
+    (
+        "java.lang.AutoCloseable",
+        CompletionProposalKind::Interface,
+        "",
+    ),
+    ("java.lang.Class", CompletionProposalKind::Class, "<T>"),
+    (
+        "java.lang.Deprecated",
+        CompletionProposalKind::Annotation,
+        "",
+    ),
+    ("java.lang.Override", CompletionProposalKind::Annotation, ""),
+    (
+        "java.lang.FunctionalInterface",
+        CompletionProposalKind::Annotation,
+        "",
+    ),
+    ("java.lang.Record", CompletionProposalKind::Class, ""),
+    ("java.util.List", CompletionProposalKind::Interface, "<E>"),
+    ("java.util.ArrayList", CompletionProposalKind::Class, "<E>"),
+    ("java.util.LinkedList", CompletionProposalKind::Class, "<E>"),
+    ("java.util.Map", CompletionProposalKind::Interface, "<K, V>"),
+    ("java.util.HashMap", CompletionProposalKind::Class, "<K, V>"),
+    (
+        "java.util.LinkedHashMap",
+        CompletionProposalKind::Class,
+        "<K, V>",
+    ),
+    ("java.util.TreeMap", CompletionProposalKind::Class, "<K, V>"),
+    ("java.util.Set", CompletionProposalKind::Interface, "<E>"),
+    ("java.util.HashSet", CompletionProposalKind::Class, "<E>"),
+    ("java.util.TreeSet", CompletionProposalKind::Class, "<E>"),
+    (
+        "java.util.Collection",
+        CompletionProposalKind::Interface,
+        "<E>",
+    ),
+    ("java.util.Optional", CompletionProposalKind::Class, "<T>"),
+    (
+        "java.util.Comparator",
+        CompletionProposalKind::Interface,
+        "<T>",
+    ),
+    (
+        "java.util.Iterator",
+        CompletionProposalKind::Interface,
+        "<E>",
+    ),
+    (
+        "java.util.stream.Stream",
+        CompletionProposalKind::Interface,
+        "<T>",
+    ),
+    (
+        "java.util.stream.IntStream",
+        CompletionProposalKind::Interface,
+        "",
+    ),
+    (
+        "java.util.stream.Collectors",
+        CompletionProposalKind::Class,
+        "",
+    ),
+    ("java.nio.file.Path", CompletionProposalKind::Interface, ""),
+    (
+        "java.util.concurrent.CompletableFuture",
+        CompletionProposalKind::Class,
+        "<T>",
+    ),
+    (
+        "java.util.function.Function",
+        CompletionProposalKind::Interface,
+        "<T, R>",
+    ),
+    (
+        "java.util.function.Supplier",
+        CompletionProposalKind::Interface,
+        "<T>",
+    ),
+    (
+        "java.util.function.Consumer",
+        CompletionProposalKind::Interface,
+        "<T>",
+    ),
+    (
+        "java.util.function.Predicate",
+        CompletionProposalKind::Interface,
+        "<T>",
+    ),
+    (
+        "java.util.function.ObjDoubleConsumer",
+        CompletionProposalKind::Interface,
+        "<T>",
+    ),
+    (
+        "java.util.function.ObjIntConsumer",
+        CompletionProposalKind::Interface,
+        "<T>",
+    ),
+    (
+        "java.util.function.ObjLongConsumer",
+        CompletionProposalKind::Interface,
+        "<T>",
+    ),
+    ("java.io.ObjectInput", CompletionProposalKind::Interface, ""),
+    (
+        "java.io.ObjectInputFilter",
+        CompletionProposalKind::Interface,
+        "",
+    ),
+    (
+        "java.io.ObjectInputStream",
+        CompletionProposalKind::Class,
+        "",
+    ),
+    (
+        "java.io.ObjectOutput",
+        CompletionProposalKind::Interface,
+        "",
+    ),
+    (
+        "java.io.ObjectOutputStream",
+        CompletionProposalKind::Class,
+        "",
+    ),
+    (
+        "java.io.Serializable",
+        CompletionProposalKind::Interface,
+        "",
+    ),
+    (
+        "java.lang.runtime.ObjectMethods",
+        CompletionProposalKind::Class,
+        "",
+    ),
+    (
+        "javax.naming.event.ObjectChangeListener",
+        CompletionProposalKind::Interface,
+        "",
+    ),
+    ("java.time.DayOfWeek", CompletionProposalKind::Enum, ""),
+    ("java.time.Month", CompletionProposalKind::Enum, ""),
+    (
+        "java.util.concurrent.TimeUnit",
+        CompletionProposalKind::Enum,
+        "",
+    ),
+];
+
+/// Returns the built-in JDK type catalog (well-known names plus interface/enum/generic shapes) as
+/// [`TypeCandidate`]s for as-you-type class completion when no `.jmod` is available (`KOVA-074`).
+#[must_use]
+pub fn builtin_jdk_type_candidates() -> Vec<TypeCandidate> {
+    let mut out: Vec<TypeCandidate> = Vec::new();
+    let mut push = |fqcn: &str| {
+        if out.iter().any(|c| c.fqcn == fqcn) {
+            return;
+        }
+        let shape = CATALOG_TYPE_SHAPES.iter().find(|(f, _, _)| *f == fqcn);
+        let kind = shape.map_or(CompletionProposalKind::Class, |(_, k, _)| *k);
+        let mut cand = TypeCandidate::new(fqcn, kind, CompletionSource::JdkBuiltin);
+        cand.type_params = shape
+            .map(|(_, _, tp)| *tp)
+            .filter(|tp| !tp.is_empty())
+            .map(str::to_owned);
+        out.push(cand);
+    };
+    for (_, fqcn) in KNOWN_JDK_FQCNS {
+        push(fqcn);
+    }
+    for (fqcn, _, _) in CATALOG_TYPE_SHAPES {
+        push(fqcn);
+    }
+    out
+}
+
+/// Returns well-known JDK class proposals for unqualified `Ctrl+Space` completion (no prefix
+/// filtering, no auto-import; see [`builtin_jdk_type_candidates`] for the as-you-type path).
 #[must_use]
 pub fn builtin_jdk_type_proposals() -> Vec<CompletionProposal> {
-    KNOWN_JDK_FQCNS
-        .iter()
-        .map(|(simple, fqcn)| {
-            let pkg = fqcn.rsplit_once('.').map_or("", |(p, _)| p);
+    builtin_jdk_type_candidates()
+        .into_iter()
+        .map(|cand| {
+            let pkg = cand.package().to_owned();
             CompletionProposal {
-                label: (*simple).to_owned(),
-                kind: CompletionProposalKind::Class,
+                label: cand.simple_name.clone(),
+                kind: cand.kind,
                 params_signature: None,
                 return_type: None,
-                detail_right: Some(pkg.to_owned()),
-                insert_text: (*simple).to_owned(),
+                detail_right: Some(pkg),
+                insert_text: cand.simple_name,
                 is_callable: false,
                 has_params: false,
                 is_method_reference: false,
@@ -1132,6 +1328,9 @@ pub fn builtin_jdk_type_proposals() -> Vec<CompletionProposal> {
                 source: CompletionSource::JdkBuiltin,
                 is_deprecated: false,
                 sort_priority: 4,
+                is_static: false,
+                type_params: cand.type_params,
+                fqcn: Some(cand.fqcn),
             }
         })
         .collect()
@@ -1187,6 +1386,9 @@ fn collect_from_fallback_class(
             } else {
                 base_priority
             },
+            is_static: member.is_static,
+            type_params: None,
+            fqcn: None,
         });
     }
 }

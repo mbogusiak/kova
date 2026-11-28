@@ -21,7 +21,8 @@ pub mod source;
 
 pub use bytecode::{
     ArchiveScanResult, ArchiveScanStats, BytecodeScanOptions, DEFAULT_MAX_CLASS_BYTES,
-    DEFAULT_TARGET_JAVA_VERSION, parse_class_bytes, scan_jar_archive,
+    DEFAULT_TARGET_JAVA_VERSION, JvmTypeSummary, parse_class_bytes, scan_jar_archive,
+    summarize_class_bytes, type_parameter_names,
 };
 pub use classpath::{
     ClasspathDiscoveryConfig, ClasspathEntry, ClasspathOrigin, DEFAULT_MAX_JAR_COUNT,
@@ -38,7 +39,8 @@ pub use indexer::{
     IndexCancelToken, IndexStats, IndexerConfig, JvmWorkspaceIndex, WorkspaceIndexer,
 };
 pub use jdk_lookup::{
-    JdkOnDemandIndex, JvmCompletionMember, LocatedClassBytes, split_display_signature,
+    JdkOnDemandIndex, JvmCompletionMember, LocatedClassBytes, SourceParamTableView,
+    is_completable_type_name, is_public_api_type_name, split_display_signature,
 };
 pub use model::{
     JvmMemberEntry, JvmModifiers, JvmSourceOrigin, JvmSymbolKind, JvmTypeEntry, JvmVisibility,

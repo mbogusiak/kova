@@ -70,8 +70,12 @@ impl EntityInputHandler for EditorView {
             .state
             .replace_text_in_range(range_utf16.as_ref(), new_text);
         self.finish_input(started, true, cx);
-        if self.state.cursor_count() == 1 && (new_text == "." || new_text == ":") {
-            let ch = if new_text == "." { '.' } else { ':' };
+        // One typed character: `.` / `::` member access or an identifier char (as-you-type).
+        let mut chars = new_text.chars();
+        if self.state.cursor_count() == 1
+            && let (Some(ch), None) = (chars.next(), chars.next())
+            && (ch == '.' || ch == ':' || ch == '_' || ch.is_alphanumeric())
+        {
             cx.emit(EditorEvent::CompletionAutoTrigger {
                 ch,
                 cursor_byte: self.state.primary_head(),

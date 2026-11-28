@@ -8,15 +8,18 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::UNIX_EPOCH;
 
 use zip::ZipArchive;
 
-use crate::bytecode::{DEFAULT_MAX_CLASS_BYTES, DEFAULT_TARGET_JAVA_VERSION};
+use crate::bytecode::{
+    DEFAULT_MAX_CLASS_BYTES, DEFAULT_TARGET_JAVA_VERSION, JvmTypeSummary, summarize_class_bytes,
+};
 use crate::classpath::ClasspathOrigin;
 use crate::jdk_lookup::{
-    JdkOnDemandIndex, LocatedClassBytes, fqcn_entry_candidates, read_zip_entry_bounded,
+    JdkOnDemandIndex, LocatedClassBytes, fqcn_entry_candidates, is_completable_type_name,
+    read_zip_entry_bounded,
 };
 use crate::model::is_ignored_internal_name;
 
@@ -103,6 +106,8 @@ struct DiscoveredJar {
 pub struct DependencyArchiveIndex {
     config: DependencyArchiveConfig,
     entries: OnceLock<HashMap<String, ArchiveClassRef>>,
+    type_names: OnceLock<Vec<String>>,
+    summaries: RwLock<HashMap<String, Option<JvmTypeSummary>>>,
 }
 
 impl DependencyArchiveIndex {
@@ -119,8 +124,57 @@ impl DependencyArchiveIndex {
     pub fn new(config: DependencyArchiveConfig) -> Self {
         Self {
             config,
-            entries: OnceLock::new(),
+            ..Self::default()
         }
+    }
+
+    /// Whether the `.jar` central directories have already been scanned (lookups won't block).
+    #[must_use]
+    pub fn is_warm(&self) -> bool {
+        self.entries.get().is_some()
+    }
+
+    /// Scans the configured `.jar` central directories now (call from a background thread).
+    pub fn warm(&self) {
+        let _ = self.get_or_init_entries();
+    }
+
+    /// Top-level completable type FQCNs found in the dependency `.jar`s (`org.javers.core.Javers`),
+    /// initializing the index if needed.
+    #[must_use]
+    pub fn type_names(&self) -> &[String] {
+        self.type_names.get_or_init(|| {
+            let mut names: Vec<String> = self
+                .get_or_init_entries()
+                .keys()
+                .filter_map(|k| k.strip_suffix(".class"))
+                .map(|internal| internal.replace('/', "."))
+                .filter(|fqcn| is_completable_type_name(fqcn))
+                .collect();
+            names.sort_unstable();
+            names
+        })
+    }
+
+    /// Cached class-header summary of `fqcn` from the dependency `.jar`s.
+    #[must_use]
+    pub fn type_summary(&self, fqcn: &str) -> Option<JvmTypeSummary> {
+        if let Some(hit) = self
+            .summaries
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(fqcn)
+        {
+            return hit.clone();
+        }
+        let summary = self
+            .locate_class_bytes(fqcn)
+            .and_then(|located| summarize_class_bytes(&located.bytes));
+        self.summaries
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(fqcn.to_owned(), summary.clone());
+        summary
     }
 
     /// Returns the number of indexed `.class` entries, initializing the index if needed.
@@ -568,6 +622,39 @@ mod tests {
         assert_eq!(inner.fqcn, "org.sample.Outer$Inner");
         assert_eq!(inner.outer_entry_name, "org/sample/Outer.class");
         assert_eq!(inner.bytes, b"INNER");
+    }
+
+    #[test]
+    fn dependency_type_names_skip_nested_and_warm_flag_tracks_scan() {
+        let dir = TempDir::new().expect("tempdir");
+        let project = dir.path().join("proj");
+        write_test_archive(
+            &project.join("libs/javers-core.jar"),
+            &[
+                ("org/javers/core/graph/ObjectAccessHook.class", b"X"),
+                ("org/javers/core/graph/ObjectAccessor$1.class", b"X"),
+                ("org/javers/core/package-info.class", b"X"),
+            ],
+        );
+        let dep_idx = DependencyArchiveIndex::new(DependencyArchiveConfig {
+            project_root: Some(project),
+            gradle_cache_dir: None,
+            maven_repo_dir: None,
+            ..DependencyArchiveConfig::default()
+        });
+        assert!(!dep_idx.is_warm());
+        dep_idx.warm();
+        assert!(dep_idx.is_warm());
+        assert_eq!(
+            dep_idx.type_names(),
+            ["org.javers.core.graph.ObjectAccessHook".to_owned()]
+        );
+        // Not a valid classfile: no summary, cached as `None`.
+        assert!(
+            dep_idx
+                .type_summary("org.javers.core.graph.ObjectAccessHook")
+                .is_none()
+        );
     }
 
     #[test]
