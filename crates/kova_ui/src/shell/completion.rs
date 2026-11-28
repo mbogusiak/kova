@@ -3,23 +3,27 @@
 use std::ops::Range;
 
 use gpui::{
-    ClickEvent, Context, Div, FontWeight, HighlightStyle, Hsla, InteractiveElement as _,
-    MouseButton, MouseDownEvent, ParentElement as _, ScrollStrategy, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled, StyledText, Window, div, px, uniform_list,
+    AnyElement, ClickEvent, Context, Div, FontWeight, HighlightStyle, Hsla,
+    InteractiveElement as _, IntoElement as _, MouseButton, MouseDownEvent, ParentElement as _,
+    PathBuilder, ScrollStrategy, SharedString, Stateful, StatefulInteractiveElement as _, Styled,
+    StyledText, Window, div, px, rgb, uniform_list,
 };
 use kova_core::completion::{
-    CompletionProposalKind, CompletionTriggerKind, extract_completion_context,
-    resolve_local_completion,
+    CompletionTriggerKind, extract_completion_context, resolve_local_completion,
+    should_auto_trigger_completion, should_auto_trigger_identifier_completion,
 };
 
 use super::WorkspaceShell;
 use crate::controls::ControlPalette;
+use crate::dock::project_icons::{
+    paint_outlined_rounded_rect, paint_rounded_rect, pt, vector_icon,
+};
 use crate::document::{CompletionOutcome, CompletionRequest};
 use crate::editor::EditorView;
 use crate::editor::completion::{
     COMPLETION_LIST_PADDING_Y_PX, COMPLETION_MAX_VISIBLE_ROWS, COMPLETION_POPUP_WIDTH_PX,
     COMPLETION_ROW_HEIGHT_PX, CompletionKeyOutcome, FilteredCompletionItem, PopupBounds,
-    classify_completion_key, compute_completion_popup_bounds,
+    classify_completion_key, completion_icon_rgb, compute_completion_popup_bounds,
 };
 use crate::search::char_indices_to_byte_ranges;
 use crate::theme::{KovaTheme, hsla_from_rgba};
@@ -46,12 +50,16 @@ impl WorkspaceShell {
                 initial_prefix,
                 proposals,
                 is_final,
+                is_incomplete,
             } => {
                 if self.completion_popup.is_open()
                     && self.completion_popup.request_id() == request_id
                 {
                     self.completion_popup
                         .merge_lsp_proposals(request_id, proposals);
+                    if is_incomplete {
+                        self.completion_popup.set_incomplete(true);
+                    }
                     self.completion_scroll
                         .scroll_to_item(self.completion_popup.selected(), ScrollStrategy::Top);
                 } else if !proposals.is_empty() {
@@ -75,6 +83,14 @@ impl WorkspaceShell {
                         live_prefix,
                         proposals,
                     );
+                    self.completion_popup.set_incomplete(is_incomplete);
+                    // As-you-type popups never show an empty "No suggestions" list.
+                    if self.completion_popup.filtered().is_empty()
+                        && self.pending_completion_trigger
+                            == Some(CompletionTriggerKind::AutoIdentifier)
+                    {
+                        self.completion_popup.close();
+                    }
                     self.completion_scroll
                         .scroll_to_item(0, ScrollStrategy::Top);
                 }
@@ -123,6 +139,7 @@ impl WorkspaceShell {
         let request_id = self.next_completion_request_id;
         self.next_completion_request_id = self.next_completion_request_id.wrapping_add(1);
         self.pending_completion_request_id = Some(request_id);
+        self.pending_completion_trigger = Some(trigger_kind);
         self.completion_origin = Some((self.active_pane, active_tab_id));
 
         let open_buffers: Vec<(std::path::PathBuf, String)> = self
@@ -172,6 +189,7 @@ impl WorkspaceShell {
                             initial_prefix: ctx.prefix,
                             proposals: local.proposals,
                             is_final: true,
+                            is_incomplete: local.is_incomplete,
                         }
                     }
                 },
@@ -186,9 +204,46 @@ impl WorkspaceShell {
         {
             self.completion_popup.close();
             self.pending_completion_request_id = None;
+            self.pending_completion_trigger = None;
             self.completion_origin = None;
             cx.notify();
         }
+    }
+
+    /// Handles one typed `.`, `:` or identifier character from the active editor (`KOVA-052`,
+    /// as-you-type `KOVA-074`).
+    pub(super) fn on_completion_auto_trigger(
+        &mut self,
+        editor: &gpui::Entity<EditorView>,
+        ch: char,
+        cursor_byte: usize,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.active_editor().is_none_or(|active| active != editor) {
+            return;
+        }
+        let (snapshot, lang) = {
+            let ed = editor.read(cx);
+            (ed.snapshot(), ed.language_hint())
+        };
+        if ch == '.' || ch == ':' {
+            if should_auto_trigger_completion(&snapshot, lang, cursor_byte, ch) {
+                self.trigger_completion(CompletionTriggerKind::AutoChar(ch), cx);
+            }
+        } else if self.should_requery_identifier_completion()
+            && should_auto_trigger_identifier_completion(&snapshot, lang, cursor_byte)
+        {
+            self.trigger_completion(CompletionTriggerKind::AutoIdentifier, cx);
+        }
+    }
+
+    /// Whether a typed identifier character should send a new as-you-type request: nothing is open
+    /// or pending, or the open result was capped by the host (`KOVA-074`).
+    pub(super) fn should_requery_identifier_completion(&self) -> bool {
+        if self.completion_popup.is_open() {
+            return self.completion_popup.is_incomplete();
+        }
+        self.pending_completion_request_id.is_none()
     }
 
     pub(super) fn sync_completion_popup_after_edit(
@@ -227,6 +282,11 @@ impl WorkspaceShell {
             return;
         }
         self.completion_popup.set_prefix(&slice);
+        if self.completion_popup.filtered().is_empty() {
+            // Nothing matches any more (`IntelliJ` hides the popup); a capped result re-queries.
+            self.close_completion_popup(cx);
+            return;
+        }
         self.completion_scroll
             .scroll_to_item(self.completion_popup.selected(), ScrollStrategy::Top);
         cx.notify();
@@ -256,6 +316,11 @@ impl WorkspaceShell {
                 true
             }
             CompletionKeyOutcome::Accept => {
+                if self.completion_popup.selected_insertion_is_noop() {
+                    // `else`⏎ must still insert the newline: dismiss and let the editor handle it.
+                    self.close_completion_popup(cx);
+                    return false;
+                }
                 if self.completion_popup.selected_insertion().is_some() {
                     self.accept_completion_selection(window, cx);
                     cx.stop_propagation();
@@ -445,18 +510,60 @@ impl WorkspaceShell {
     }
 }
 
-fn badge_color(kind: CompletionProposalKind, p: &ControlPalette) -> Hsla {
-    match kind {
-        CompletionProposalKind::Method | CompletionProposalKind::Constructor => p.primary.subtle_fg,
-        CompletionProposalKind::Field | CompletionProposalKind::Variable => p.warning.subtle_fg,
-        CompletionProposalKind::Class
-        | CompletionProposalKind::Interface
-        | CompletionProposalKind::Enum
-        | CompletionProposalKind::Struct
-        | CompletionProposalKind::Trait
-        | CompletionProposalKind::Module => p.accent.subtle_fg,
-        CompletionProposalKind::Keyword => p.muted.subtle_fg,
+/// Renders the `IntelliJ`-style round kind icon (`C`, `I`, `m`, ...) with an optional static
+/// diamond badge as a crisp `16×16` vector (`KOVA-074`).
+fn render_kind_icon(
+    kind: kova_core::completion::CompletionProposalKind,
+    is_static: bool,
+) -> AnyElement {
+    let tone: Hsla = rgb(completion_icon_rgb(kind)).into();
+    let fill_tone = tone.opacity(0.18);
+    let letter = kind.icon_letter().to_string();
+    let circle = vector_icon(16.0, 16.0, move |ox, oy, window| {
+        paint_rounded_rect(window, (ox, oy), (1.0, 1.0, 14.0, 14.0), 7.0, fill_tone);
+        paint_outlined_rounded_rect(window, (ox, oy), (1.0, 1.0, 14.0, 14.0), 7.0, 1.2, tone);
+    });
+    let mut icon = div()
+        .relative()
+        .w(px(16.0))
+        .h(px(16.0))
+        .flex_none()
+        .child(div().absolute().top_0().left_0().child(circle))
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .w(px(16.0))
+                .h(px(16.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(9.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(tone)
+                .child(letter),
+        );
+    if is_static {
+        let badge_fill: Hsla = rgb(0x00DF_E1E5).into();
+        let badge_edge: Hsla = rgb(0x001E_1F22).into();
+        let diamond = vector_icon(16.0, 16.0, move |ox, oy, window| {
+            for (half, color) in [(3.4_f32, badge_edge), (2.4_f32, badge_fill)] {
+                let (cx, cy) = (3.6, 12.4);
+                let mut builder = PathBuilder::fill();
+                builder.move_to(pt(ox, oy, cx, cy - half));
+                builder.line_to(pt(ox, oy, cx + half, cy));
+                builder.line_to(pt(ox, oy, cx, cy + half));
+                builder.line_to(pt(ox, oy, cx - half, cy));
+                builder.close();
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, color);
+                }
+            }
+        });
+        icon = icon.child(div().absolute().top_0().left_0().child(diamond));
     }
+    icon.into_any_element()
 }
 
 fn render_completion_row(
@@ -512,8 +619,7 @@ fn render_completion_row_content(
     p: &ControlPalette,
 ) -> (Div, Option<Div>) {
     let proposal = &item.proposal;
-    let badge = proposal.kind.badge().to_string();
-    let badge_fg = badge_color(proposal.kind, p);
+    let match_color: Hsla = rgb(0x0054_8AF7).into();
 
     let highlights: Vec<_> =
         char_indices_to_byte_ranges(&proposal.label, &item.matched_char_indices)
@@ -522,8 +628,7 @@ fn render_completion_row_content(
                 (
                     range,
                     HighlightStyle {
-                        color: Some(p.primary.subtle_fg),
-                        font_weight: Some(FontWeight::BOLD),
+                        color: Some(match_color),
                         ..HighlightStyle::default()
                     },
                 )
@@ -531,7 +636,9 @@ fn render_completion_row_content(
             .collect();
 
     let mut label_el = div()
-        .text_size(px(12.5))
+        .flex_none()
+        .text_size(px(13.0))
+        .font_weight(FontWeight::BOLD)
         .text_color(if proposal.is_deprecated {
             p.text_muted
         } else {
@@ -543,20 +650,23 @@ fn render_completion_row_content(
         label_el = label_el.line_through();
     }
 
-    let params_el = proposal.params_signature.as_deref().map(|params| {
+    // `<T> java.util.function` for types, `(int index, int length)` for methods.
+    let inline_el = proposal.inline_detail().map(|detail| {
         div()
+            .min_w(px(0.0))
             .overflow_hidden()
             .whitespace_nowrap()
-            .text_size(px(12.0))
+            .text_ellipsis()
+            .text_size(px(12.5))
             .text_color(p.text_muted)
-            .child(SharedString::from(params.to_owned()))
+            .child(SharedString::from(detail))
     });
 
     let right_el = proposal.right_label().map(|right| {
         div()
             .flex_none()
-            .pl(px(8.0))
-            .text_size(px(11.0))
+            .pl(px(12.0))
+            .text_size(px(12.0))
             .text_color(p.text_muted)
             .whitespace_nowrap()
             .child(SharedString::from(right.to_owned()))
@@ -569,23 +679,18 @@ fn render_completion_row_content(
         .items_center()
         .gap(px(6.0))
         .overflow_hidden()
+        .child(render_kind_icon(proposal.kind, proposal.is_static))
         .child(
             div()
-                .w(px(17.0))
-                .h(px(17.0))
-                .flex_none()
+                .flex_1()
+                .min_w(px(0.0))
                 .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(4.0))
-                .bg(p.input)
-                .text_size(px(10.0))
-                .font_weight(FontWeight::BOLD)
-                .text_color(badge_fg)
-                .child(badge),
-        )
-        .child(label_el)
-        .children(params_el);
+                .items_baseline()
+                .gap(px(6.0))
+                .overflow_hidden()
+                .child(label_el)
+                .children(inline_el),
+        );
 
     (left_el, right_el)
 }

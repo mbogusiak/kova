@@ -28,7 +28,7 @@ use gpui::{
 };
 use kova_buffer::{Buffer, BufferSnapshot};
 use kova_core::builtin_actions::builtin_action_registry_ref;
-use kova_core::completion::{CompletionTriggerKind, should_auto_trigger_completion};
+use kova_core::completion::CompletionTriggerKind;
 use kova_core::jetbrains_keymap_layer_ref;
 use kova_core::markdown::{MarkdownViewMode, is_markdown_path};
 use kova_core::navigation::{
@@ -659,6 +659,7 @@ pub struct WorkspaceShell {
     completion_sink: Option<CompletionSink>,
     next_completion_request_id: u64,
     pending_completion_request_id: Option<u64>,
+    pending_completion_trigger: Option<CompletionTriggerKind>,
     completion_origin: Option<(PaneId, TabId)>,
     /// Whether the cursor is currently hovering the left `Project` island (`KOVA-055`).
     project_dock_hovered: bool,
@@ -810,6 +811,7 @@ impl WorkspaceShell {
             completion_sink: None,
             next_completion_request_id: 1,
             pending_completion_request_id: None,
+            pending_completion_trigger: None,
             completion_origin: None,
             project_dock_hovered: false,
             hovered_stripe_tool: None,
@@ -1198,15 +1200,7 @@ impl WorkspaceShell {
                 }
             }
             EditorEvent::CompletionAutoTrigger { ch, cursor_byte } => {
-                if self.active_editor().is_some_and(|active| active == editor) {
-                    let (snapshot, lang) = {
-                        let ed = editor.read(cx);
-                        (ed.snapshot(), ed.language_hint())
-                    };
-                    if should_auto_trigger_completion(&snapshot, lang, *cursor_byte, *ch) {
-                        self.trigger_completion(CompletionTriggerKind::AutoChar(*ch), cx);
-                    }
-                }
+                self.on_completion_auto_trigger(editor, *ch, *cursor_byte, cx);
             }
             EditorEvent::ContextMenuRequested {
                 position,

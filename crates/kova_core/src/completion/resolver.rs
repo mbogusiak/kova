@@ -5,7 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::completion::jdk_fallback::{
-    builtin_jdk_type_proposals, fallback_member_type, lookup_jdk_fallback, resolve_builtin_jdk_fqcn,
+    builtin_jdk_type_candidates, builtin_jdk_type_proposals, fallback_member_type,
+    lookup_jdk_fallback, resolve_builtin_jdk_fqcn,
+};
+use crate::completion::types::{
+    TYPE_COMPLETION_LIMIT, build_type_proposals, project_type_candidates,
 };
 use crate::completion::{
     CompletionContext, CompletionProposal, CompletionProposalKind, CompletionSeparator,
@@ -59,6 +63,8 @@ pub struct LocalCompletionResult {
     pub proposals: Vec<CompletionProposal>,
     /// Classified receiver target when `ctx.separator.is_some()`.
     pub receiver_target: Option<ReceiverTarget>,
+    /// Whether type proposals were capped at [`TYPE_COMPLETION_LIMIT`] (re-query on next keystroke).
+    pub is_incomplete: bool,
 }
 
 /// Resolves completion proposals using only `source_text`, `open_buffers`, `workspace_files`,
@@ -96,7 +102,7 @@ pub fn resolve_local_completion_with_options(
     jdk_field_resolver: Option<JdkFieldResolver<'_>>,
 ) -> LocalCompletionResult {
     if ctx.separator.is_none() {
-        let proposals = collect_unqualified_proposals(
+        let (proposals, is_incomplete) = collect_unqualified_proposals(
             ctx,
             source_text,
             open_buffers,
@@ -107,6 +113,7 @@ pub fn resolve_local_completion_with_options(
         return LocalCompletionResult {
             proposals,
             receiver_target: None,
+            is_incomplete,
         };
     }
 
@@ -161,6 +168,7 @@ pub fn resolve_local_completion_with_options(
     LocalCompletionResult {
         proposals,
         receiver_target: Some(target),
+        is_incomplete: false,
     }
 }
 
@@ -831,6 +839,9 @@ fn scan_rust_pub_items(
             source: CompletionSource::Workspace,
             is_deprecated: false,
             sort_priority: 0,
+            is_static: false,
+            type_params: None,
+            fqcn: None,
         });
     }
 }
@@ -1273,6 +1284,9 @@ fn extract_kotlin_primary_ctor_fields(
                 source,
                 is_deprecated: false,
                 sort_priority: 1,
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
     }
@@ -1343,6 +1357,9 @@ fn parse_java_member_line(
                 source: ctx.source,
                 is_deprecated: ctx.is_deprecated,
                 sort_priority: u16::from(!is_static),
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
         return;
@@ -1373,6 +1390,9 @@ fn parse_java_member_line(
                     source: ctx.source,
                     is_deprecated: ctx.is_deprecated,
                     sort_priority: u16::from(!is_static),
+                    is_static: false,
+                    type_params: None,
+                    fqcn: None,
                 });
             }
         }
@@ -1406,11 +1426,18 @@ fn parse_java_enum_constants(
                 source: ctx.source,
                 is_deprecated: ctx.is_deprecated,
                 sort_priority: 0,
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "single linear Kotlin member parser; splitting would obscure the field/fun/val cases"
+)]
 fn parse_kotlin_member_line(
     trimmed: &str,
     ctx: MemberParseCtx,
@@ -1443,6 +1470,9 @@ fn parse_kotlin_member_line(
                 source: ctx.source,
                 is_deprecated: ctx.is_deprecated,
                 sort_priority: 0,
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
         return;
@@ -1483,6 +1513,9 @@ fn parse_kotlin_member_line(
                 source: ctx.source,
                 is_deprecated: ctx.is_deprecated,
                 sort_priority: u16::from(ctx.access != ReceiverAccessKind::StaticType),
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
         return;
@@ -1512,6 +1545,9 @@ fn parse_kotlin_member_line(
                 source: ctx.source,
                 is_deprecated: ctx.is_deprecated,
                 sort_priority: 1,
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
     }
@@ -1580,6 +1616,9 @@ fn parse_rust_member_line(
                 source: ctx.source,
                 is_deprecated: ctx.is_deprecated,
                 sort_priority: u16::from(!want_static),
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
         return;
@@ -1617,6 +1656,9 @@ fn parse_rust_const_or_field(
                 source: ctx.source,
                 is_deprecated: ctx.is_deprecated,
                 sort_priority: 0,
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
         return;
@@ -1647,6 +1689,9 @@ fn parse_rust_const_or_field(
                 source: ctx.source,
                 is_deprecated: ctx.is_deprecated,
                 sort_priority: 1,
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
     }
@@ -1682,6 +1727,9 @@ fn parse_rust_enum_variant(
             source: ctx.source,
             is_deprecated: ctx.is_deprecated,
             sort_priority: 0,
+            is_static: false,
+            type_params: None,
+            fqcn: None,
         });
     }
 }
@@ -1771,7 +1819,7 @@ fn collect_unqualified_proposals(
     _project_root: Option<&Path>,
     workspace_files: &[PathBuf],
     include_jdk_fallback: bool,
-) -> Vec<CompletionProposal> {
+) -> (Vec<CompletionProposal>, bool) {
     let mut out = Vec::new();
     let mut seen_labels: HashSet<(String, Option<String>)> = HashSet::new();
 
@@ -1791,6 +1839,9 @@ fn collect_unqualified_proposals(
                 source: CompletionSource::LocalScope,
                 is_deprecated: false,
                 sort_priority: 0,
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
     }
@@ -1808,7 +1859,7 @@ fn collect_unqualified_proposals(
         }
     }
 
-    collect_scope_types_and_keywords(
+    let is_incomplete = collect_scope_types_and_keywords(
         ctx,
         source_text,
         open_buffers,
@@ -1818,7 +1869,7 @@ fn collect_unqualified_proposals(
         &mut out,
     );
 
-    out
+    (out, is_incomplete)
 }
 
 fn collect_scope_types_and_keywords(
@@ -1829,15 +1880,22 @@ fn collect_scope_types_and_keywords(
     include_jdk_fallback: bool,
     seen_labels: &mut HashSet<(String, Option<String>)>,
     out: &mut Vec<CompletionProposal>,
-) {
+) -> bool {
+    let is_jvm = matches!(
+        ctx.language,
+        SourceLanguageKind::Java | SourceLanguageKind::Kotlin
+    );
+    let mut seen_fqcns: HashSet<String> = HashSet::new();
     for imp in &ctx.imports {
         if let Some(local) = imp.local_name()
+            && !imp.is_static
             && seen_labels.insert((local.to_owned(), None))
         {
             let pkg = imp
                 .path
                 .rsplit_once(['.', ':'])
                 .map(|(p, _)| p.trim_end_matches(':').to_owned());
+            seen_fqcns.insert(imp.path.clone());
             out.push(CompletionProposal {
                 label: local.to_owned(),
                 kind: CompletionProposalKind::Class,
@@ -1852,10 +1910,55 @@ fn collect_scope_types_and_keywords(
                 source: CompletionSource::LocalScope,
                 is_deprecated: false,
                 sort_priority: 2,
+                is_static: false,
+                type_params: None,
+                fqcn: is_jvm.then(|| imp.path.clone()),
             });
         }
     }
 
+    let mut is_incomplete = false;
+    if is_jvm && !ctx.prefix.is_empty() {
+        // As-you-type (`KOVA-074`): FQCN-identified project + JDK catalog types with auto-import.
+        let mut candidates = project_type_candidates(ctx.language, open_buffers, workspace_files);
+        if include_jdk_fallback {
+            candidates.extend(builtin_jdk_type_candidates());
+        }
+        let (types, truncated) = build_type_proposals(
+            ctx,
+            source_text,
+            candidates,
+            &mut seen_fqcns,
+            TYPE_COMPLETION_LIMIT,
+        );
+        is_incomplete = truncated;
+        for proposal in types {
+            seen_labels.insert((proposal.label.clone(), None));
+            out.push(proposal);
+        }
+    } else {
+        collect_type_names_without_prefix(
+            ctx,
+            open_buffers,
+            workspace_files,
+            include_jdk_fallback && is_jvm,
+            seen_labels,
+            out,
+        );
+    }
+
+    collect_keywords_and_identifiers(ctx, source_text, seen_labels, out);
+    is_incomplete
+}
+
+fn collect_type_names_without_prefix(
+    ctx: &CompletionContext,
+    open_buffers: &[(PathBuf, String)],
+    workspace_files: &[PathBuf],
+    include_jdk_fallback: bool,
+    seen_labels: &mut HashSet<(String, Option<String>)>,
+    out: &mut Vec<CompletionProposal>,
+) {
     for path in open_buffers
         .iter()
         .map(|(p, _)| p)
@@ -1882,32 +1985,29 @@ fn collect_scope_types_and_keywords(
                 source: CompletionSource::Workspace,
                 is_deprecated: false,
                 sort_priority: 4,
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
     }
 
-    if include_jdk_fallback
-        && matches!(
-            ctx.language,
-            SourceLanguageKind::Java | SourceLanguageKind::Kotlin
-        )
-    {
+    if include_jdk_fallback {
         for proposal in builtin_jdk_type_proposals() {
             if seen_labels.insert((proposal.label.clone(), None)) {
                 out.push(proposal);
             }
         }
     }
-
-    collect_keywords_and_identifiers(ctx.language, source_text, seen_labels, out);
 }
 
 fn collect_keywords_and_identifiers(
-    lang: SourceLanguageKind,
+    ctx: &CompletionContext,
     source_text: &str,
     seen_labels: &mut HashSet<(String, Option<String>)>,
     out: &mut Vec<CompletionProposal>,
 ) {
+    let lang = ctx.language;
     let keywords: &[&str] = match lang {
         SourceLanguageKind::Java => JAVA_KEYWORDS,
         SourceLanguageKind::Kotlin => KOTLIN_KEYWORDS,
@@ -1930,11 +2030,14 @@ fn collect_keywords_and_identifiers(
                 source: CompletionSource::Keyword,
                 is_deprecated: false,
                 sort_priority: 5,
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
     }
 
-    for ident in collect_file_identifiers(source_text, lang) {
+    for ident in collect_file_identifiers(source_text, lang, ctx.anchor_byte) {
         if seen_labels.insert((ident.clone(), None)) {
             out.push(CompletionProposal {
                 label: ident.clone(),
@@ -1950,6 +2053,9 @@ fn collect_keywords_and_identifiers(
                 source: CompletionSource::LocalScope,
                 is_deprecated: false,
                 sort_priority: 4,
+                is_static: false,
+                type_params: None,
+                fqcn: None,
             });
         }
     }
@@ -2105,7 +2211,12 @@ fn extract_params_from_line(
     }
 }
 
-fn collect_file_identifiers(source_text: &str, lang: SourceLanguageKind) -> Vec<String> {
+/// Collects identifiers used in `source_text`, skipping the token being typed at `skip_start`.
+fn collect_file_identifiers(
+    source_text: &str,
+    lang: SourceLanguageKind,
+    skip_start: usize,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut i = 0usize;
@@ -2124,7 +2235,7 @@ fn collect_file_identifiers(source_text: &str, lang: SourceLanguageKind) -> Vec<
                 SourceLanguageKind::Rust => RUST_KEYWORDS.contains(&word),
                 SourceLanguageKind::Unknown => false,
             };
-            if word.len() >= 2 && !is_kw && seen.insert(word.to_owned()) {
+            if start != skip_start && word.len() >= 2 && !is_kw && seen.insert(word.to_owned()) {
                 out.push(word.to_owned());
             }
         } else {

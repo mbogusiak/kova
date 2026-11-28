@@ -3,10 +3,31 @@
 //! No GPUI windowing calls live here, so navigation, live prefix filtering, `Enter`/`Tab`
 //! insertion, `Esc` dismissal, and viewport edge-flipping are 100% unit-tested headless.
 
-use kova_core::completion::{CompletionProposal, CompletionTextEdit, filter_and_rank_proposals};
+use kova_core::completion::{
+    CompletionProposal, CompletionProposalKind, CompletionTextEdit, filter_and_rank_proposals,
+};
 
-/// Default popup width in logical pixels.
-pub const COMPLETION_POPUP_WIDTH_PX: f32 = 380.0;
+/// Default popup width in logical pixels (wide enough for `name(params)  package  type`).
+pub const COMPLETION_POPUP_WIDTH_PX: f32 = 560.0;
+
+/// `IntelliJ` New UI kind-icon tint (`0xRRGGBB`) for `kind` (`KOVA-074`): blue `C` class/record,
+/// green `I` interface/annotation, orange `E` enum, red `m` method, purple `f` field, grey otherwise.
+#[must_use]
+pub const fn completion_icon_rgb(kind: CompletionProposalKind) -> u32 {
+    match kind {
+        CompletionProposalKind::Class
+        | CompletionProposalKind::Record
+        | CompletionProposalKind::Struct => 0x0054_8AF7,
+        CompletionProposalKind::Interface
+        | CompletionProposalKind::Annotation
+        | CompletionProposalKind::Trait => 0x005F_B865,
+        CompletionProposalKind::Enum => 0x00E0_8855,
+        CompletionProposalKind::Method | CompletionProposalKind::Constructor => 0x00F7_5464,
+        CompletionProposalKind::Field => 0x00C7_7DBB,
+        CompletionProposalKind::Variable => 0x0056_A8F5,
+        CompletionProposalKind::Module | CompletionProposalKind::Keyword => 0x0086_8A91,
+    }
+}
 /// Fixed row height in logical pixels (`uniform_list` requirement).
 pub const COMPLETION_ROW_HEIGHT_PX: f32 = 24.0;
 /// Maximum number of visible rows before scrolling.
@@ -196,6 +217,7 @@ pub struct CompletionPopupState {
     all_proposals: Vec<CompletionProposal>,
     filtered: Vec<FilteredCompletionItem>,
     selected: usize,
+    is_incomplete: bool,
 }
 
 impl CompletionPopupState {
@@ -241,6 +263,25 @@ impl CompletionPopupState {
         self.selected
     }
 
+    /// Whether the host capped the result (re-query on the next typed character, `KOVA-074`).
+    #[must_use]
+    pub const fn is_incomplete(&self) -> bool {
+        self.is_incomplete
+    }
+
+    /// Marks the open result as incomplete (capped by the host).
+    pub const fn set_incomplete(&mut self, is_incomplete: bool) {
+        self.is_incomplete = is_incomplete;
+    }
+
+    /// Whether accepting the selected row would change nothing (it equals the typed prefix and has
+    /// no extra edits), so `Enter` / `Tab` should fall through to the editor (`KOVA-074`).
+    #[must_use]
+    pub fn selected_insertion_is_noop(&self) -> bool {
+        self.selected_insertion()
+            .is_none_or(|ins| ins.text == self.prefix && ins.additional_text_edits.is_empty())
+    }
+
     /// Opens the popup with `proposals` anchored at `anchor_byte` (does not open if `proposals` is empty).
     pub fn open_with(
         &mut self,
@@ -261,6 +302,7 @@ impl CompletionPopupState {
         self.prefix = prefix;
         self.all_proposals = proposals;
         self.selected = 0;
+        self.is_incomplete = false;
         self.refilter();
     }
 
@@ -270,17 +312,18 @@ impl CompletionPopupState {
         if !self.open || self.request_id != request_id || lsp_proposals.is_empty() {
             return;
         }
-        let prev_selected_key = self.filtered.get(self.selected).map(|item| {
-            (
-                item.proposal.label.clone(),
-                item.proposal.params_signature.clone(),
-            )
-        });
+        let prev_selected_key = self
+            .filtered
+            .get(self.selected)
+            .map(|item| item.proposal.identity_key());
 
         for incoming in lsp_proposals {
-            if let Some(existing) = self.all_proposals.iter_mut().find(|p| {
-                p.label == incoming.label && p.params_signature == incoming.params_signature
-            }) {
+            let incoming_key = incoming.identity_key();
+            if let Some(existing) = self
+                .all_proposals
+                .iter_mut()
+                .find(|p| p.identity_key() == incoming_key)
+            {
                 if !incoming.additional_text_edits.is_empty() {
                     existing.additional_text_edits = incoming.additional_text_edits;
                 }
@@ -292,7 +335,9 @@ impl CompletionPopupState {
                     existing.has_params = incoming.has_params;
                 }
             } else if let Some(existing_by_name) = self.all_proposals.iter_mut().find(|p| {
-                p.label == incoming.label
+                !p.kind.is_type()
+                    && !incoming.kind.is_type()
+                    && p.label == incoming.label
                     && (p.params_signature.is_none() || incoming.params_signature.is_none())
             }) {
                 if !incoming.additional_text_edits.is_empty() {
@@ -304,11 +349,11 @@ impl CompletionPopupState {
         }
 
         self.refilter();
-        if let Some((label, params)) = prev_selected_key
+        if let Some(key) = prev_selected_key
             && let Some(idx) = self
                 .filtered
                 .iter()
-                .position(|i| i.proposal.label == label && i.proposal.params_signature == params)
+                .position(|i| i.proposal.identity_key() == key)
         {
             self.selected = idx;
         }
@@ -361,6 +406,7 @@ impl CompletionPopupState {
         self.all_proposals.clear();
         self.filtered.clear();
         self.selected = 0;
+        self.is_incomplete = false;
     }
 
     fn refilter(&mut self) {
@@ -414,6 +460,9 @@ mod tests {
             source: CompletionSource::JdkBuiltin,
             is_deprecated: false,
             sort_priority: 0,
+            is_static: false,
+            type_params: None,
+            fqcn: None,
         }
     }
 
@@ -673,5 +722,132 @@ mod tests {
         popup.close();
         assert!(!popup.is_open());
         assert!(popup.selected_insertion().is_none());
+    }
+
+    fn type_proposal(label: &str, fqcn: &str, kind: CompletionProposalKind) -> CompletionProposal {
+        let mut p = sample_proposal(label, kind, None, None, false);
+        p.fqcn = Some(fqcn.to_owned());
+        p.detail_right = fqcn.rsplit_once('.').map(|(pkg, _)| pkg.to_owned());
+        p
+    }
+
+    #[test]
+    fn enter_passes_through_when_selection_equals_typed_text_and_popup_tracks_incomplete() {
+        let mut popup = CompletionPopupState::new();
+        let keyword = sample_proposal("else", CompletionProposalKind::Keyword, None, None, false);
+        popup.open_with(1, 0, false, "else".to_owned(), vec![keyword]);
+        assert!(popup.selected_insertion_is_noop());
+
+        let mut import = type_proposal(
+            "Objects",
+            "java.util.Objects",
+            CompletionProposalKind::Class,
+        );
+        import.additional_text_edits.push(CompletionTextEdit {
+            start_utf16_line: 1,
+            start_utf16_col: 0,
+            end_utf16_line: 1,
+            end_utf16_col: 0,
+            new_text: "import java.util.Objects;\n".to_owned(),
+        });
+        popup.open_with(2, 0, false, "Objects".to_owned(), vec![import]);
+        assert!(
+            !popup.selected_insertion_is_noop(),
+            "accepting still adds the import"
+        );
+        assert!(!popup.is_incomplete());
+        popup.set_incomplete(true);
+        assert!(popup.is_incomplete());
+        popup.close();
+        assert!(!popup.is_incomplete());
+    }
+
+    #[test]
+    fn lsp_merge_keeps_same_named_types_from_different_packages_apart() {
+        let mut popup = CompletionPopupState::new();
+        popup.open_with(
+            7,
+            0,
+            false,
+            "Obj".to_owned(),
+            vec![type_proposal(
+                "Objects",
+                "java.util.Objects",
+                CompletionProposalKind::Class,
+            )],
+        );
+        let mut lsp_same = type_proposal(
+            "Objects",
+            "java.util.Objects",
+            CompletionProposalKind::Class,
+        );
+        lsp_same.additional_text_edits.push(CompletionTextEdit {
+            start_utf16_line: 0,
+            start_utf16_col: 0,
+            end_utf16_line: 0,
+            end_utf16_col: 0,
+            new_text: "import java.util.Objects;\n".to_owned(),
+        });
+        let lsp_other = type_proposal(
+            "Objects",
+            "com.google.common.base.Objects",
+            CompletionProposalKind::Class,
+        );
+        popup.merge_lsp_proposals(7, vec![lsp_same, lsp_other]);
+        let pkgs: Vec<Option<&str>> = popup
+            .filtered()
+            .iter()
+            .map(|i| i.proposal.detail_right.as_deref())
+            .collect();
+        assert_eq!(pkgs.len(), 2);
+        assert!(pkgs.contains(&Some("java.util")));
+        assert!(pkgs.contains(&Some("com.google.common.base")));
+        let util = popup
+            .filtered()
+            .iter()
+            .find(|i| i.proposal.fqcn.as_deref() == Some("java.util.Objects"))
+            .unwrap();
+        assert_eq!(util.proposal.additional_text_edits.len(), 1);
+    }
+
+    #[test]
+    fn kind_icons_follow_intellij_letters_and_tints() {
+        assert_eq!(CompletionProposalKind::Class.icon_letter(), 'C');
+        assert_eq!(CompletionProposalKind::Interface.icon_letter(), 'I');
+        assert_eq!(CompletionProposalKind::Method.icon_letter(), 'm');
+        assert_eq!(CompletionProposalKind::Enum.icon_letter(), 'E');
+        assert_eq!(
+            completion_icon_rgb(CompletionProposalKind::Class),
+            0x0054_8AF7
+        );
+        assert_eq!(
+            completion_icon_rgb(CompletionProposalKind::Interface),
+            0x005F_B865
+        );
+        assert_eq!(
+            completion_icon_rgb(CompletionProposalKind::Method),
+            0x00F7_5464
+        );
+        let mut m = sample_proposal(
+            "checkIndex",
+            CompletionProposalKind::Method,
+            Some("(int index, int length)"),
+            Some("int"),
+            true,
+        );
+        m.is_static = true;
+        assert_eq!(
+            m.inline_detail().as_deref(),
+            Some("(int index, int length)")
+        );
+        assert_eq!(m.right_label(), Some("int"));
+        let mut t = type_proposal(
+            "ObjIntConsumer",
+            "java.util.function.ObjIntConsumer",
+            CompletionProposalKind::Interface,
+        );
+        t.type_params = Some("<T>".to_owned());
+        assert_eq!(t.inline_detail().as_deref(), Some("<T> java.util.function"));
+        assert_eq!(t.right_label(), None);
     }
 }

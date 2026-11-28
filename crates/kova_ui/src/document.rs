@@ -163,6 +163,9 @@ pub enum CompletionOutcome {
         proposals: Vec<CompletionProposal>,
         /// `true` when no further asynchronous stage (e.g. `jdt.ls`) will follow.
         is_final: bool,
+        /// `true` when the host capped the result, so the popup must re-query on the next typed
+        /// character instead of only refiltering locally (`KOVA-074`).
+        is_incomplete: bool,
     },
     /// No proposals found for this stage.
     Empty {
